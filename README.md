@@ -98,6 +98,10 @@ a pin only together with its matching checksum.
 
 ## Production
 
+Audio objects live in S3 (Garage): `infra/garage/` builds an image with the static config baked in
+that reads `GARAGE_RPC_SECRET`, `GARAGE_ADMIN_TOKEN`, `GARAGE_METRICS_TOKEN`, and the default
+access/bucket keys from the environment at runtime.
+
 The target topology and environment contract live in the
 [design document](docs/superpowers/specs/2026-11-06-discord-music-bot-design.md). Production
 expects real Authentik OIDC credentials, `SESSION_COOKIE_SECURE=true`, `AUTH_DEV_BYPASS` unset, and
