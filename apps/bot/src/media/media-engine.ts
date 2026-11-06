@@ -114,7 +114,7 @@ export class YtdlpMediaEngine implements MediaEngine {
     track: { url: string; title?: string },
     options: { startSec?: number } = {},
   ): Promise<OpenedStream> {
-    const ytdlp = openAudioStream(track, {
+    const ytdlp = await openAudioStream(track, {
       startSec: options.startSec ?? 0,
       options: this.ytdlpOptions,
     });

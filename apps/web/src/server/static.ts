@@ -1,6 +1,7 @@
 import { existsSync, statSync } from "node:fs";
 import { extname, join, resolve, sep } from "node:path";
 import type { Context } from "hono";
+import { config } from "./config.js";
 import { failure } from "./envelope.js";
 
 /**
@@ -28,8 +29,16 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   ".ico": "image/x-icon",
   ".woff": "font/woff",
   ".woff2": "font/woff2",
-  ".map": "application/json; charset=utf-8",
 };
+
+/**
+ * Source maps are build artefacts: never expose them from the production
+ * server, and keep `.map` out of the MIME table so a dev-only serve cannot be
+ * cached as a JavaScript asset.
+ */
+export function isBlockedAssetPath(pathname: string, isProduction: boolean): boolean {
+  return isProduction && pathname.toLowerCase().endsWith(".map");
+}
 
 let distDir: string | null | undefined;
 
@@ -64,10 +73,15 @@ function cacheControlFor(pathname: string): string {
   return pathname.startsWith("/assets/") ? ASSET_CACHE : STATIC_CACHE;
 }
 
+/** Content type for a served file; unknown extensions are opaque bytes. */
+export function contentTypeFor(path: string): string {
+  return MIME_BY_EXTENSION[extname(path).toLowerCase()] ?? "application/octet-stream";
+}
+
 function fileResponse(path: string, pathname: string): Response {
   const headers = new Headers({
     "cache-control": cacheControlFor(pathname),
-    "content-type": MIME_BY_EXTENSION[extname(path).toLowerCase()] ?? "application/octet-stream",
+    "content-type": contentTypeFor(path),
   });
   return new Response(Bun.file(path), { headers });
 }
@@ -99,6 +113,9 @@ export async function serveSpa(c: Context): Promise<Response> {
 
   const segments = pathname.split("/");
   if (pathname.includes("\0") || segments.includes("..")) {
+    return c.json(failure("NOT_FOUND", "Not found"), 404);
+  }
+  if (isBlockedAssetPath(pathname, config.isProduction)) {
     return c.json(failure("NOT_FOUND", "Not found"), 404);
   }
 

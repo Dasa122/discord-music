@@ -1,10 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { installTestEnv } from "./test-env.js";
 
 installTestEnv();
 
-const { botErrorStatus, errorFromFetchFailure, errorFromHttpResponse, isBotErrorShape } =
-  await import("./bot-client.js");
+const {
+  BOT_TIMEOUTS,
+  botClient,
+  botErrorStatus,
+  errorFromFetchFailure,
+  errorFromHttpResponse,
+  isBotErrorShape,
+} = await import("./bot-client.js");
 
 describe("errorFromFetchFailure", () => {
   test("maps an aborted timeout to BOT_TIMEOUT", () => {
@@ -72,6 +78,50 @@ describe("botErrorStatus", () => {
     expect(botErrorStatus("BOT_TIMEOUT")).toBe(504);
     expect(botErrorStatus("BOT_UNAVAILABLE")).toBe(503);
     expect(botErrorStatus("BOT_ERROR")).toBe(502);
-    expect(botErrorStatus("INVALID_ACTION")).toBe(400);
+    expect(botErrorStatus("GUILD_NOT_FOUND")).toBe(404);
+    expect(botErrorStatus("PLAYBACK_BUSY")).toBe(409);
+    expect(botErrorStatus("NOT_CONNECTED")).toBe(409);
+    expect(botErrorStatus("COOLDOWN")).toBe(409);
+    expect(botErrorStatus("VALIDATION")).toBe(400);
+    expect(botErrorStatus("MEDIA_ERROR")).toBe(400);
+  });
+
+  test("unknown codes are bad-gateway, never a client error", () => {
+    expect(botErrorStatus("SOMETHING_NEW")).toBe(502);
+    expect(botErrorStatus("")).toBe(502);
+  });
+});
+
+describe("request timeouts", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test("actions wait 90s while state stays at 5s", async () => {
+    const timeoutSpy = spyOn(AbortSignal, "timeout");
+    const seen: number[] = [];
+    timeoutSpy.mockImplementation((ms: number) => {
+      seen.push(ms);
+      return new AbortController().signal;
+    });
+
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ ok: true, data: {} }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+
+    try {
+      await botClient.action("guild-1", { type: "pause" });
+      await botClient.state("guild-1");
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+
+    expect(seen).toEqual([BOT_TIMEOUTS.action, BOT_TIMEOUTS.state]);
+    expect(BOT_TIMEOUTS.action).toBe(90_000);
+    expect(BOT_TIMEOUTS.state).toBe(5_000);
   });
 });

@@ -4,15 +4,20 @@ import { config } from "./config.js";
 /**
  * Typed client for the bot's internal control API.
  *
- * Every call carries `x-control-secret` and is bounded by a 5 second timeout so
- * a hung bot cannot pin web requests. Failures are returned as values, never
- * thrown, because every route has to decide its own HTTP status.
+ * Every call carries `x-control-secret`. Read-only calls are bounded by a 5
+ * second timeout; playback actions get 90 seconds because yt-dlp resolution
+ * and prebuffering can legitimately take that long. Failures are returned as
+ * values, never thrown, because every route has to decide its own HTTP status.
  */
 
 export type BotError = { code: string; message: string };
 export type BotResult<T> = { ok: true; data: T } | { ok: false; error: BotError };
 
-const REQUEST_TIMEOUT_MS = 5_000;
+export const BOT_TIMEOUTS = {
+  state: 5_000,
+  health: 5_000,
+  action: 90_000,
+} as const;
 
 function isTimeoutError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
@@ -42,20 +47,38 @@ export function errorFromHttpResponse(status: number, body: unknown): BotError {
 }
 
 /** HTTP status the web API should answer with for a bot-side failure. */
-export function botErrorStatus(code: string): 400 | 502 | 503 | 504 {
+export function botErrorStatus(code: string): 400 | 404 | 409 | 502 | 503 | 504 {
   switch (code) {
     case "BOT_TIMEOUT":
       return 504;
     case "BOT_UNAVAILABLE":
       return 503;
-    case "BOT_ERROR":
-      return 502;
-    default:
+    case "GUILD_NOT_FOUND":
+    case "PLAYLIST_NOT_FOUND":
+      return 404;
+    case "PLAYBACK_BUSY":
+    case "NOT_CONNECTED":
+    case "COOLDOWN":
+      return 409;
+    case "VALIDATION":
+    case "MEDIA_ERROR":
+    case "EXTRACTOR_FAILED":
+    case "NOT_FOUND":
+    case "SPAWN_FAILED":
+    case "INVALID_URL":
+    case "INVALID_INDEX":
+    case "NOTHING_PLAYING":
       return 400;
+    default:
+      return 502;
   }
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<BotResult<T>> {
+async function request<T>(
+  path: string,
+  init: RequestInit = {},
+  timeoutMs: number = BOT_TIMEOUTS.state,
+): Promise<BotResult<T>> {
   const headers = new Headers(init.headers);
   headers.set("accept", "application/json");
   headers.set("x-control-secret", config.botControlSecret);
@@ -65,7 +88,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<BotResu
     response = await fetch(`${config.botInternalUrl}${path}`, {
       ...init,
       headers,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (error) {
     return { ok: false, error: errorFromFetchFailure(error) };
@@ -93,7 +116,7 @@ export const botClient = {
     try {
       const response = await fetch(`${config.botInternalUrl}/health`, {
         headers: { "x-control-secret": config.botControlSecret },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: AbortSignal.timeout(BOT_TIMEOUTS.health),
       });
       return response.ok;
     } catch {
@@ -114,7 +137,11 @@ export const botClient = {
   },
 
   async state(guildId: string): Promise<BotResult<PlayerState>> {
-    return request<PlayerState>(`/guilds/${encodeURIComponent(guildId)}/state`);
+    return request<PlayerState>(
+      `/guilds/${encodeURIComponent(guildId)}/state`,
+      {},
+      BOT_TIMEOUTS.state,
+    );
   },
 
   async action(guildId: string, action: ControlAction): Promise<BotResult<PlayerState>> {
@@ -125,6 +152,7 @@ export const botClient = {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(action),
       },
+      BOT_TIMEOUTS.action,
     );
     if (!result.ok) return result;
 

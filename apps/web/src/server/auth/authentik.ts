@@ -286,6 +286,27 @@ async function verifyIdToken(
 
 type TokenResponse = { id_token?: unknown; access_token?: unknown };
 
+/**
+ * OIDC requires an ID token from the code exchange. Falling back to userinfo
+ * would accept a response that never proved the nonce, so a missing
+ * `id_token` is a hard failure.
+ */
+export function requireIdToken(tokenResponse: unknown): string {
+  const record =
+    typeof tokenResponse === "object" && tokenResponse !== null
+      ? (tokenResponse as Record<string, unknown>)
+      : null;
+  const idToken = record?.id_token;
+  if (typeof idToken !== "string" || idToken === "") {
+    throw new AuthError(
+      "MISSING_ID_TOKEN",
+      "The identity provider did not return an ID token",
+      401,
+    );
+  }
+  return idToken;
+}
+
 export async function exchangeCode(
   code: string,
   verifier: string,
@@ -336,19 +357,9 @@ export async function exchangeCode(
   }
 
   const token = body as TokenResponse;
-  if (typeof token.id_token === "string" && token.id_token !== "") {
-    const accessToken = typeof token.access_token === "string" ? token.access_token : undefined;
-    return verifyIdToken(token.id_token, discovery, expectedNonce, accessToken);
-  }
-  if (typeof token.access_token === "string" && token.access_token !== "") {
-    return fetchUserInfo(discovery, token.access_token);
-  }
-
-  throw new AuthError(
-    "TOKEN_RESPONSE_INVALID",
-    "The identity provider returned an invalid token response",
-    502,
-  );
+  const idToken = requireIdToken(token);
+  const accessToken = typeof token.access_token === "string" ? token.access_token : undefined;
+  return verifyIdToken(idToken, discovery, expectedNonce, accessToken);
 }
 
 function oauthCookieOptions() {

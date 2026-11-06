@@ -12,9 +12,8 @@ export function ForbiddenPage() {
           You do not have access
         </h1>
         <p className="mt-2 text-sm leading-relaxed text-muted">
-          This dashboard requires membership in the Authentik group{" "}
-          <code className="rounded bg-white/5 px-1">music-admins</code>. Ask an administrator to add
-          your account, then sign in again.
+          This dashboard requires membership in an administrator group configured by the server
+          operator. Ask an administrator to add your account, then sign in again.
         </p>
 
         <div className="mt-5 flex flex-col gap-2">

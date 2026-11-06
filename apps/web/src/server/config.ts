@@ -21,8 +21,15 @@ const booleanEnv = (fallback: boolean) =>
 
 const stripTrailingSlash = (value: string) => value.replace(/\/+$/, "");
 
+/** Only the three environments the app actually branches on are accepted. */
+export const NODE_ENVIRONMENTS = ["production", "development", "test"] as const;
+export type NodeEnvironment = (typeof NODE_ENVIRONMENTS)[number];
+
+/** Sessions default to one day; group membership is re-checked on re-login. */
+export const DEFAULT_SESSION_TTL_DAYS = 1;
+
 const envSchema = z.object({
-  NODE_ENV: z.string().min(1).default("development"),
+  NODE_ENV: z.string().trim().toLowerCase().pipe(z.enum(NODE_ENVIRONMENTS)).default("development"),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   DATABASE_URL: z.string().min(1),
   PUBLIC_BASE_URL: z.url().transform(stripTrailingSlash),
@@ -33,13 +40,13 @@ const envSchema = z.object({
   AUTHENTIK_CLIENT_SECRET: z.string().min(1),
   AUTHENTIK_REDIRECT_URI: z.url(),
   AUTHENTIK_ADMIN_GROUP: z.string().min(1).default("music-admins"),
-  SESSION_TTL_DAYS: z.coerce.number().int().min(1).max(365).default(7),
+  SESSION_TTL_DAYS: z.coerce.number().int().min(1).max(365).default(DEFAULT_SESSION_TTL_DAYS),
   SESSION_COOKIE_SECURE: booleanEnv(true),
   AUTH_DEV_BYPASS: booleanEnv(false),
 });
 
 export type Config = {
-  readonly nodeEnv: string;
+  readonly nodeEnv: NodeEnvironment;
   readonly isProduction: boolean;
   readonly port: number;
   readonly databaseUrl: string;
@@ -56,7 +63,7 @@ export type Config = {
   readonly authDevBypass: boolean;
 };
 
-function loadConfig(env: NodeJS.ProcessEnv): Config {
+export function loadConfig(env: NodeJS.ProcessEnv): Config {
   const parsed = envSchema.safeParse(env);
   if (!parsed.success) {
     const details = parsed.error.issues
@@ -68,6 +75,9 @@ function loadConfig(env: NodeJS.ProcessEnv): Config {
   const value = parsed.data;
   if (value.AUTH_DEV_BYPASS && value.NODE_ENV === "production") {
     throw new Error("AUTH_DEV_BYPASS must not be enabled when NODE_ENV=production");
+  }
+  if (value.NODE_ENV === "production" && !value.SESSION_COOKIE_SECURE) {
+    throw new Error("SESSION_COOKIE_SECURE must not be disabled when NODE_ENV=production");
   }
 
   return Object.freeze({

@@ -18,6 +18,7 @@ export function mapControlError(error: unknown): ControlErrorResult {
       case "NOT_CONNECTED":
         return { status: 409, body };
       case "GUILD_NOT_FOUND":
+      case "PLAYLIST_NOT_FOUND":
         return { status: 404, body };
       default:
         return { status: 400, body };

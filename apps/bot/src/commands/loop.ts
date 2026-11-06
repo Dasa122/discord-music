@@ -25,7 +25,7 @@ export const loopCommand: Command = {
 
       const value = interaction.options.getString("mode", true);
       const mode = value === "track" || value === "queue" ? value : "off";
-      player.setLoop(mode);
+      await player.setLoop(mode);
       await respondInfo(interaction, `Loop mode set to **${mode}**.`);
     } catch (error) {
       await respondError(interaction, commandErrorMessage(error));

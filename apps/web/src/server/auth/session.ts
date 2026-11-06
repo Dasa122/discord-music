@@ -52,6 +52,12 @@ export function setSessionStore(next: SessionStore | null): void {
   store = next ?? dbSessionStore;
 }
 
+/**
+ * Sessions are opaque, server-side rows. The stored group snapshot is trusted
+ * for at most `SESSION_TTL_DAYS` (one day by default); the callback re-checks
+ * Authentik group membership on every sign-in, so removing a user from the
+ * admin group takes effect once their session expires or they sign in again.
+ */
 function sessionTtlSeconds(): number {
   return config.sessionTtlDays * 24 * 60 * 60;
 }
@@ -61,6 +67,16 @@ export async function createSession(user: SessionUser): Promise<string> {
   const expiresAt = new Date(Date.now() + sessionTtlSeconds() * 1000);
   await store.insert({ id, sub: user.sub, name: user.name, groups: user.groups, expiresAt });
   return id;
+}
+
+/**
+ * Issue a fresh session and drop whatever row the current `sid` cookie points
+ * at, so logging out/in never leaves a second live session behind.
+ */
+export async function replaceSession(c: Context, user: SessionUser): Promise<string> {
+  const existingId = getCookie(c, SESSION_COOKIE);
+  if (existingId) await store.delete(existingId);
+  return createSession(user);
 }
 
 export async function getSession(c: Context): Promise<Session | null> {

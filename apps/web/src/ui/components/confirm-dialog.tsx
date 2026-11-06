@@ -1,5 +1,6 @@
 import { type ReactNode, useEffect, useId, useRef } from "react";
 import { cn } from "../lib/cn";
+import { DIALOG_FOCUSABLE_SELECTOR, nextDialogFocusIndex } from "../lib/focus";
 import { XIcon } from "./icons";
 
 type ConfirmDialogProps = {
@@ -14,7 +15,10 @@ type ConfirmDialogProps = {
   onCancel: () => void;
 };
 
-/** Keyboard-operable confirmation dialog. Escape cancels; focus stays on the safe action. */
+/**
+ * Keyboard-operable confirmation dialog. Escape cancels; focus stays on the
+ * safe action and is restored (and Tab trapped) when the dialog closes.
+ */
 export function ConfirmDialog({
   open,
   title,
@@ -29,18 +33,51 @@ export function ConfirmDialog({
   const titleId = useId();
   const descriptionId = useId();
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const previouslyFocusedRef = useRef<HTMLElement | null>(null);
+  const onCancelRef = useRef(onCancel);
+
+  // Callers pass an inline callback; keeping it in a ref stops the focus
+  // effect below from re-running (and stealing focus) on every parent render.
+  useEffect(() => {
+    onCancelRef.current = onCancel;
+  }, [onCancel]);
 
   useEffect(() => {
     if (!open) {
+      const previous = previouslyFocusedRef.current;
+      previouslyFocusedRef.current = null;
+      previous?.focus();
       return;
     }
 
+    if (!previouslyFocusedRef.current && document.activeElement instanceof HTMLElement) {
+      previouslyFocusedRef.current = document.activeElement;
+    }
     cancelRef.current?.focus();
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !pending) {
         event.preventDefault();
-        onCancel();
+        onCancelRef.current();
+        return;
+      }
+      if (event.key === "Tab") {
+        const container = dialogRef.current;
+        if (!container) return;
+        const focusable = Array.from(
+          container.querySelectorAll<HTMLElement>(DIALOG_FOCUSABLE_SELECTOR),
+        );
+        const currentIndex = focusable.indexOf(document.activeElement as HTMLElement);
+        const next = nextDialogFocusIndex({
+          count: focusable.length,
+          currentIndex,
+          shiftKey: event.shiftKey,
+        });
+        if (next !== null) {
+          event.preventDefault();
+          focusable[next]?.focus();
+        }
       }
     };
 
@@ -52,7 +89,7 @@ export function ConfirmDialog({
       document.body.style.overflow = previousOverflow;
       document.removeEventListener("keydown", onKeyDown);
     };
-  }, [open, pending, onCancel]);
+  }, [open, pending]);
 
   if (!open) {
     return null;
@@ -69,6 +106,7 @@ export function ConfirmDialog({
         className="absolute inset-0 cursor-default bg-black/70 backdrop-blur-sm"
       />
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}

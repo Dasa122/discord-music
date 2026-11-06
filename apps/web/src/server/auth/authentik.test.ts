@@ -11,6 +11,7 @@ const {
   discoveryUrl,
   pkceChallenge,
   randomToken,
+  requireIdToken,
   stateMatches,
 } = await import("./authentik.js");
 
@@ -95,6 +96,31 @@ describe("state and nonce", () => {
       } catch (error) {
         expect(error).toBeInstanceOf(AuthError);
         expect((error as InstanceType<typeof AuthError>).code).toBe("INVALID_NONCE");
+      }
+    }
+  });
+});
+
+describe("requireIdToken", () => {
+  test("returns the ID token from a valid response", () => {
+    expect(requireIdToken({ id_token: "header.payload.signature" })).toBe(
+      "header.payload.signature",
+    );
+  });
+
+  test("rejects a response without an ID token instead of using userinfo", () => {
+    for (const body of [
+      { access_token: "access-only" },
+      { id_token: "" },
+      { id_token: 42 },
+      null,
+      "not-an-object",
+    ]) {
+      expect(() => requireIdToken(body)).toThrow(AuthError);
+      try {
+        requireIdToken(body);
+      } catch (error) {
+        expect((error as InstanceType<typeof AuthError>).code).toBe("MISSING_ID_TOKEN");
       }
     }
   });

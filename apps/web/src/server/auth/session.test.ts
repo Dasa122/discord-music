@@ -6,9 +6,8 @@ import type { SessionStore } from "./session.js";
 
 installTestEnv();
 
-const { SESSION_COOKIE, createSession, requireAdmin, setSessionStore } = await import(
-  "./session.js"
-);
+const { SESSION_COOKIE, createSession, replaceSession, requireAdmin, setSessionStore } =
+  await import("./session.js");
 
 type MemoryStore = SessionStore & { rows: Map<string, Session> };
 
@@ -43,7 +42,7 @@ function adminApp() {
 }
 
 describe("createSession", () => {
-  test("stores a 64 character hex id and a future expiry", async () => {
+  test("stores a 64 character hex id and a 24 hour default expiry", async () => {
     const before = Date.now();
     const id = await createSession({ sub: "user-1", name: "Ada", groups: ["music-admins"] });
 
@@ -55,7 +54,39 @@ describe("createSession", () => {
     expect(row.name).toBe("Ada");
     expect(row.groups).toEqual(["music-admins"]);
     expect(row.expiresAt.getTime()).toBeGreaterThan(before);
-    expect(row.expiresAt.getTime()).toBeLessThanOrEqual(before + 7 * 24 * 60 * 60 * 1000 + 1_000);
+    expect(row.expiresAt.getTime()).toBeLessThanOrEqual(before + 24 * 60 * 60 * 1000 + 1_000);
+  });
+});
+
+function sessionApp() {
+  const app = new Hono<AppEnv>();
+  app.post("/session", async (c) => {
+    const id = await replaceSession(c, { sub: "user-9", name: "Nia", groups: ["music-admins"] });
+    return c.json({ id });
+  });
+  return app;
+}
+
+describe("replaceSession", () => {
+  test("deletes the session the sid cookie points at", async () => {
+    const previous = await createSession({ sub: "user-8", name: "Old", groups: ["music-admins"] });
+
+    const response = await sessionApp().request("/session", {
+      method: "POST",
+      headers: { cookie: `${SESSION_COOKIE}=${previous}` },
+    });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { id: string };
+    expect(body.id).not.toBe(previous);
+    expect(store.rows.has(previous)).toBe(false);
+    expect(store.rows.size).toBe(1);
+  });
+
+  test("creates a session when no cookie is present", async () => {
+    const response = await sessionApp().request("/session", { method: "POST" });
+    expect(response.status).toBe(200);
+    expect(store.rows.size).toBe(1);
   });
 });
 

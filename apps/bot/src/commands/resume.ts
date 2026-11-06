@@ -1,5 +1,5 @@
 import { SlashCommandBuilder } from "discord.js";
-import { commandErrorMessage, getPlayerFor, respondError, respondInfo } from "./shared.js";
+import { commandErrorMessage, getPlayerFor, guardDj, respondError, respondInfo } from "./shared.js";
 import type { Command } from "./types.js";
 
 export const resumeCommand: Command = {
@@ -8,6 +8,7 @@ export const resumeCommand: Command = {
   async execute(interaction) {
     try {
       const player = await getPlayerFor(interaction);
+      if (!(await guardDj(interaction, player))) return;
       player.resume();
       await respondInfo(interaction, "Resumed playback.");
     } catch (error) {

@@ -1,7 +1,7 @@
 import type { PlayerState } from "@music/shared";
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } from "discord.js";
 import { COLORS } from "./colors.js";
-import { formatDuration, truncate } from "./format.js";
+import { escapeMarkdown, formatDuration, truncate } from "./format.js";
 
 export const QUEUE_PAGE_SIZE = 10;
 
@@ -28,7 +28,7 @@ export function buildQueueEmbed(
 
   const lines = visible.map((track, index) => {
     const position = start + index + 1;
-    return `**${position}.** [${truncate(track.title, 80)}](${track.url}) · \`${formatDuration(
+    return `**${position}.** [${truncate(escapeMarkdown(track.title), 80)}](${track.url}) · \`${formatDuration(
       track.durationSec,
     )}\` · <@${track.requestedBy.id}>`;
   });
@@ -44,7 +44,9 @@ export function buildQueueEmbed(
     .setTitle("Queue")
     .setDescription(truncate(description, 4096))
     .setFooter({
-      text: state.current ? `Now playing: ${state.current.title}` : "Nothing is playing",
+      text: state.current
+        ? `Now playing: ${truncate(escapeMarkdown(state.current.title), 100)}`
+        : "Nothing is playing",
     })
     .setTimestamp(new Date(state.updatedAt));
 }

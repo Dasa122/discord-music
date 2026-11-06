@@ -1,4 +1,10 @@
-export type MediaErrorCode = "EXTRACTOR_FAILED" | "NOT_FOUND" | "SPAWN_FAILED";
+export type MediaErrorCode =
+  | "EXTRACTOR_FAILED"
+  | "NOT_FOUND"
+  | "SPAWN_FAILED"
+  | "INVALID_URL"
+  | "EXTRACTION_BUSY"
+  | "OUTPUT_TOO_LARGE";
 
 export class MediaError extends Error {
   readonly code: MediaErrorCode;
@@ -18,6 +24,7 @@ export type PlayerErrorCode =
   | "NOTHING_PLAYING"
   | "INVALID_INDEX"
   | "GUILD_NOT_FOUND"
+  | "PLAYLIST_NOT_FOUND"
   | "COOLDOWN"
   | "VOICE_CONNECT_FAILED";
 
@@ -34,4 +41,21 @@ export class PlayerError extends Error {
 export function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message;
   return "Something went wrong.";
+}
+
+export function isTransientPlaybackError(error: unknown): boolean {
+  return (
+    error instanceof PlayerError && (error.code === "PLAYBACK_BUSY" || error.code === "COOLDOWN")
+  );
+}
+
+const GENERIC_ERROR_MESSAGE = "Something went wrong. Please try again.";
+
+/**
+ * Errors shown in Discord must never leak raw Postgres/driver or unexpected
+ * internal text. Only our own typed errors carry a message intended for users.
+ */
+export function userFacingErrorMessage(error: unknown): string {
+  if (error instanceof PlayerError || error instanceof MediaError) return error.message;
+  return GENERIC_ERROR_MESSAGE;
 }

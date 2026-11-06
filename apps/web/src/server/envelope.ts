@@ -51,6 +51,22 @@ export function unauthorizedFailure(message = "Authentication required"): ApiFai
   return failure("UNAUTHORIZED", message);
 }
 
+/** Mutating JSON bodies larger than this are rejected before they are buffered. */
+export const MAX_JSON_BODY_BYTES = 256 * 1024;
+
+/** True when a `Content-Length` header announces a body over the limit. */
+export function jsonBodyTooLarge(contentLength: string | null | undefined): boolean {
+  if (contentLength === null || contentLength === undefined || contentLength.trim() === "") {
+    return false;
+  }
+  const bytes = Number(contentLength);
+  return Number.isFinite(bytes) && bytes > MAX_JSON_BODY_BYTES;
+}
+
+export function payloadTooLargeFailure(): ApiFailure {
+  return failure("PAYLOAD_TOO_LARGE", "Request body is too large");
+}
+
 /** Parse a request body without letting malformed JSON throw out of the handler. */
 export async function readJsonBody(request: Request): Promise<unknown> {
   try {

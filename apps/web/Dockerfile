@@ -45,6 +45,11 @@ COPY apps/web/package.json ./apps/web/package.json
 COPY apps/web/tsconfig.json ./apps/web/tsconfig.json
 COPY apps/web/src/server ./apps/web/src/server
 
+# The runtime only reads from /app and writes nothing to disk (migrations run
+# against Postgres), so the image runs as the `bun` user shipped by the base
+# image instead of root.
+USER bun
+
 EXPOSE 3000
 
 CMD ["bun", "apps/web/src/server/index.ts"]

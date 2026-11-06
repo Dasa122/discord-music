@@ -1,6 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
-import { failure, issueFromZod, readJsonBody, success, validationFailure } from "./envelope.js";
+import {
+  failure,
+  issueFromZod,
+  jsonBodyTooLarge,
+  MAX_JSON_BODY_BYTES,
+  payloadTooLargeFailure,
+  readJsonBody,
+  success,
+  validationFailure,
+} from "./envelope.js";
 
 describe("envelope helpers", () => {
   test("success wraps data", () => {
@@ -51,5 +60,23 @@ describe("envelope helpers", () => {
     expect(
       await readJsonBody(new Request("https://example.test", { method: "POST", body: '{"a":1}' })),
     ).toEqual({ a: 1 });
+  });
+
+  test("rejects declared bodies over 256 KB", () => {
+    expect(MAX_JSON_BODY_BYTES).toBe(262_144);
+    expect(jsonBodyTooLarge(null)).toBe(false);
+    expect(jsonBodyTooLarge(undefined)).toBe(false);
+    expect(jsonBodyTooLarge("")).toBe(false);
+    expect(jsonBodyTooLarge("1024")).toBe(false);
+    expect(jsonBodyTooLarge(String(MAX_JSON_BODY_BYTES))).toBe(false);
+    expect(jsonBodyTooLarge(String(MAX_JSON_BODY_BYTES + 1))).toBe(true);
+    expect(jsonBodyTooLarge("not-a-number")).toBe(false);
+  });
+
+  test("payloadTooLargeFailure is a 413 envelope", () => {
+    expect(payloadTooLargeFailure()).toEqual({
+      success: false,
+      error: { code: "PAYLOAD_TOO_LARGE", message: "Request body is too large" },
+    });
   });
 });

@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { isSameIdSet, newId, withRequestedByActor } from "./lib.js";
+import {
+  isPlaylistVisible,
+  isSameIdSet,
+  newId,
+  nextPosition,
+  withRequestedByActor,
+} from "./lib.js";
 
 describe("newId", () => {
   test("returns 16 URL-safe characters", () => {
@@ -52,9 +58,15 @@ describe("withRequestedByActor", () => {
     });
   });
 
-  test("keeps an explicit requestedBy", () => {
+  test("always replaces a client-supplied requestedBy", () => {
+    const actor = { id: "user-1", name: "Ada" };
     const body = { type: "play", query: "lofi", requestedBy: { id: "x", name: "X" } };
-    expect(withRequestedByActor(body, { id: "user-1", name: "Ada" })).toBe(body);
+    expect(withRequestedByActor(body, actor)).toEqual({
+      type: "play",
+      query: "lofi",
+      requestedBy: actor,
+    });
+    expect(body.requestedBy).toEqual({ id: "x", name: "X" });
   });
 
   test("leaves non-playback actions and non-objects untouched", () => {
@@ -62,5 +74,31 @@ describe("withRequestedByActor", () => {
     expect(withRequestedByActor(pause, { id: "u", name: "U" })).toBe(pause);
     expect(withRequestedByActor(null, { id: "u", name: "U" })).toBeNull();
     expect(withRequestedByActor("play", { id: "u", name: "U" })).toBe("play");
+  });
+});
+
+describe("isPlaylistVisible", () => {
+  test("owners always see their playlist", () => {
+    expect(isPlaylistVisible({ ownerDiscordId: "me", isShared: false }, "me")).toBe(true);
+  });
+
+  test("shared playlists are visible to other admins", () => {
+    expect(isPlaylistVisible({ ownerDiscordId: "other", isShared: true }, "me")).toBe(true);
+  });
+
+  test("private playlists are invisible to other admins", () => {
+    expect(isPlaylistVisible({ ownerDiscordId: "other", isShared: false }, "me")).toBe(false);
+  });
+});
+
+describe("nextPosition", () => {
+  test("starts an empty playlist at zero", () => {
+    expect(nextPosition(null)).toBe(0);
+    expect(nextPosition(undefined)).toBe(0);
+  });
+
+  test("appends after the current maximum", () => {
+    expect(nextPosition(0)).toBe(1);
+    expect(nextPosition(41)).toBe(42);
   });
 });

@@ -10,7 +10,7 @@ export const shuffleCommand: Command = {
       const player = await getPlayerFor(interaction);
       if (!(await guardDj(interaction, player))) return;
 
-      player.shuffle();
+      await player.shuffle();
       const size = player.getState().queue.length;
       await respondInfo(
         interaction,

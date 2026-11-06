@@ -2,7 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildCommonArgs, type YtdlpOptions } from "./ytdlp.js";
+import {
+  buildCommonArgs,
+  buildResolveArgs,
+  MAX_EXTRACTION_STDOUT_BYTES,
+  MAX_PLAYLIST_ENTRIES,
+  stdoutExceedsLimit,
+  type YtdlpOptions,
+} from "./ytdlp.js";
 
 function baseOptions(overrides: Partial<YtdlpOptions> = {}): YtdlpOptions {
   return {
@@ -59,5 +66,49 @@ describe("buildCommonArgs", () => {
     expect(args).not.toContain("--cookies");
     expect(args).not.toContain("--proxy");
     expect(args).not.toContain("--extractor-args");
+  });
+});
+
+describe("buildResolveArgs", () => {
+  test("bounds playlist resolutions to 50 entries", () => {
+    const args = buildResolveArgs("https://www.youtube.com/playlist?list=PL123", baseOptions());
+    expect(args).toContain("--yes-playlist");
+    expect(args).toContain("--flat-playlist");
+    expect(args).toContain("--playlist-end");
+    expect(args[args.indexOf("--playlist-end") + 1]).toBe(String(MAX_PLAYLIST_ENTRIES));
+    expect(MAX_PLAYLIST_ENTRIES).toBe(50);
+  });
+
+  test("leaves single-track and search resolutions unbounded", () => {
+    for (const target of ["https://youtu.be/abc", "ytsearch1:lofi"]) {
+      const args = buildResolveArgs(target, baseOptions());
+      expect(args).not.toContain("--yes-playlist");
+      expect(args).not.toContain("--playlist-end");
+    }
+  });
+
+  test("always terminates options before the target", () => {
+    const args = buildResolveArgs("ytsearch1:lofi", baseOptions());
+    expect(args[args.length - 1]).toBe("ytsearch1:lofi");
+    expect(args[args.length - 2]).toBe("--");
+  });
+});
+
+describe("stdoutExceedsLimit", () => {
+  test("the cap is 8 MiB and the boundary is exclusive", () => {
+    expect(MAX_EXTRACTION_STDOUT_BYTES).toBe(8 * 1024 * 1024);
+    expect(stdoutExceedsLimit(0)).toBe(false);
+    expect(stdoutExceedsLimit(MAX_EXTRACTION_STDOUT_BYTES - 1)).toBe(false);
+    expect(stdoutExceedsLimit(MAX_EXTRACTION_STDOUT_BYTES)).toBe(false);
+    expect(stdoutExceedsLimit(MAX_EXTRACTION_STDOUT_BYTES + 1)).toBe(true);
+  });
+
+  test("accumulated multi-byte output is measured in bytes, not characters", () => {
+    const emoji = Buffer.byteLength("🎵", "utf8");
+    expect(emoji).toBe(4);
+    // A whole number of emoji fills the cap exactly: allowed. One more byte is not.
+    const emojiAtCap = MAX_EXTRACTION_STDOUT_BYTES / emoji;
+    expect(stdoutExceedsLimit(emojiAtCap * emoji)).toBe(false);
+    expect(stdoutExceedsLimit(emojiAtCap * emoji + 1)).toBe(true);
   });
 });

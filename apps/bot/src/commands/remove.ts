@@ -20,7 +20,7 @@ export const removeCommand: Command = {
       if (!(await guardDj(interaction, player))) return;
 
       const position = interaction.options.getInteger("position", true);
-      const removed = player.remove(position - 1);
+      const removed = await player.remove(position - 1);
       await respondInfo(interaction, `Removed **${removed.title}** from the queue.`);
     } catch (error) {
       await respondError(interaction, commandErrorMessage(error));

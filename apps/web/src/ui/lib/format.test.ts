@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { clamp, formatDuration, formatNumber, formatRelativeTime } from "./format";
+import {
+  clamp,
+  formatActorLabel,
+  formatDuration,
+  formatNumber,
+  formatRelativeTime,
+} from "./format";
 
 describe("formatDuration", () => {
   const cases: Array<[number | null, string]> = [
@@ -73,5 +79,17 @@ describe("clamp", () => {
     expect(clamp(5, 0, 10)).toBe(5);
     expect(clamp(-1, 0, 10)).toBe(0);
     expect(clamp(11, 0, 10)).toBe(10);
+  });
+});
+
+describe("formatActorLabel", () => {
+  test("identifies the viewer without exposing the Authentik subject", () => {
+    expect(formatActorLabel("auth0|abc", "auth0|abc")).toBe("You");
+  });
+
+  test("labels any other admin generically", () => {
+    expect(formatActorLabel("auth0|abc", "auth0|def")).toBe("Another admin");
+    expect(formatActorLabel("auth0|abc", undefined)).toBe("Another admin");
+    expect(formatActorLabel("auth0|abc", null)).toBe("Another admin");
   });
 });

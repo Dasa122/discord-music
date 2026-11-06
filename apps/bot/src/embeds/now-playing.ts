@@ -1,7 +1,7 @@
 import type { PlayerState, QueueTrack } from "@music/shared";
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } from "discord.js";
 import { COLORS } from "./colors.js";
-import { capitalize, formatDuration, truncate } from "./format.js";
+import { capitalize, escapeMarkdown, formatDuration, truncate } from "./format.js";
 
 export interface NowPlayingMeta {
   botName?: string;
@@ -21,7 +21,7 @@ export function buildNowPlayingEmbed(
 
   const embed = new EmbedBuilder()
     .setColor(colour)
-    .setTitle(truncate(track.title, 256))
+    .setTitle(truncate(escapeMarkdown(track.title), 256))
     .setURL(track.url)
     .setDescription(`Requested by <@${track.requestedBy.id}>`)
     .addFields(
@@ -56,21 +56,22 @@ export function buildNowPlayingComponents(
 ): ActionRowBuilder<ButtonBuilder> {
   const disabled = options.disabled === true;
   const hasTrack = state.current !== null;
+  const trackId = state.current?.id ?? "none";
 
   const pause = new ButtonBuilder()
-    .setCustomId("player:pause")
+    .setCustomId(`player:pause:${trackId}`)
     .setLabel(state.paused ? "Resume" : "Pause")
     .setStyle(ButtonStyle.Secondary)
     .setDisabled(disabled || !hasTrack);
 
   const skip = new ButtonBuilder()
-    .setCustomId("player:skip")
+    .setCustomId(`player:skip:${trackId}`)
     .setLabel("Skip")
     .setStyle(ButtonStyle.Secondary)
     .setDisabled(disabled || !hasTrack);
 
   const stop = new ButtonBuilder()
-    .setCustomId("player:stop")
+    .setCustomId(`player:stop:${trackId}`)
     .setLabel("Stop")
     .setStyle(ButtonStyle.Danger)
     .setDisabled(disabled || !hasTrack);
@@ -82,7 +83,7 @@ export function buildNowPlayingComponents(
     .setDisabled(disabled || state.queue.length === 0);
 
   const shuffle = new ButtonBuilder()
-    .setCustomId("player:shuffle")
+    .setCustomId(`player:shuffle:${trackId}`)
     .setLabel("Shuffle")
     .setStyle(ButtonStyle.Secondary)
     .setDisabled(disabled || state.queue.length < 2);
@@ -93,7 +94,7 @@ export function buildNowPlayingComponents(
 export function buildFinishedEmbed(track: QueueTrack, reason = "Finished playing."): EmbedBuilder {
   const embed = new EmbedBuilder()
     .setColor(COLORS.idle)
-    .setTitle(truncate(track.title, 256))
+    .setTitle(truncate(escapeMarkdown(track.title), 256))
     .setURL(track.url)
     .setDescription(reason)
     .setFooter({ text: "Music Bot" })

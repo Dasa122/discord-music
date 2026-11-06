@@ -81,11 +81,11 @@ describe("buildNowPlayingComponents", () => {
     });
 
     expect(ids).toEqual([
-      "player:pause",
-      "player:skip",
-      "player:stop",
+      "player:pause:abc123",
+      "player:skip:abc123",
+      "player:stop:abc123",
       "player:queue",
-      "player:shuffle",
+      "player:shuffle:abc123",
     ]);
 
     const paused = buildNowPlayingComponents(state({ paused: true, playing: false })).toJSON();

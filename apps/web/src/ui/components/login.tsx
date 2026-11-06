@@ -27,8 +27,7 @@ export function Login() {
           Authentik account to continue.
         </p>
         <p className="mt-2 text-sm leading-relaxed text-muted">
-          Access requires membership in the{" "}
-          <code className="rounded bg-white/5 px-1">music-admins</code> group.
+          Access requires membership in an administrator group configured by the server operator.
         </p>
 
         {error ? (

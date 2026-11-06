@@ -72,7 +72,8 @@ export function QueueList({
       <ol className="divide-y divide-border">
         {visibleTracks.map((track, index) => (
           <li
-            key={track.id}
+            // biome-ignore lint/suspicious/noArrayIndexKey: the same video can be queued twice; the position disambiguates.
+            key={`${track.id}:${index}`}
             className={cn(
               "flex items-center gap-3 px-3 py-2.5 sm:px-4",
               action.isPending && "opacity-70",

@@ -19,13 +19,30 @@ export function isSameIdSet(left: readonly string[], right: readonly string[]): 
 }
 
 /**
- * Attribute playback actions to the authenticated admin. The dashboard omits
- * `requestedBy`; the shared control schema still validates the completed body.
+ * A playlist is visible to an admin when they own it or its owner shared it
+ * with the guild. Playlist ids are not secrets, so hidden rows must 404.
+ */
+export function isPlaylistVisible(
+  playlist: { ownerDiscordId: string; isShared: boolean },
+  viewerSub: string,
+): boolean {
+  return playlist.ownerDiscordId === viewerSub || playlist.isShared;
+}
+
+/** Next append position for a playlist whose current maximum may be unknown. */
+export function nextPosition(maxPosition: number | null | undefined): number {
+  return (maxPosition ?? -1) + 1;
+}
+
+/**
+ * Attribute playback actions to the authenticated admin. The dashboard
+ * omits `requestedBy`, but a client-supplied value is never trusted: it is
+ * always replaced with the session identity so attribution cannot be spoofed.
  */
 export function withRequestedByActor(body: unknown, actor: { id: string; name: string }): unknown {
   if (typeof body !== "object" || body === null) return body;
   const candidate = body as Record<string, unknown>;
   const isPlayback = candidate.type === "play" || candidate.type === "playPlaylist";
-  if (!isPlayback || candidate.requestedBy !== undefined) return body;
+  if (!isPlayback) return body;
   return { ...candidate, requestedBy: actor };
 }

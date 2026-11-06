@@ -21,7 +21,7 @@ export const volumeCommand: Command = {
       if (!(await guardDj(interaction, player))) return;
 
       const level = interaction.options.getInteger("level", true);
-      const applied = player.setVolume(level);
+      const applied = await player.setVolume(level);
       await respondInfo(interaction, `Volume set to ${applied}%.`);
     } catch (error) {
       await respondError(interaction, commandErrorMessage(error));

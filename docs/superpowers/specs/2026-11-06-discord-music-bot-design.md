@@ -72,7 +72,7 @@ discord-music/
 ├── bun.lock
 ├── tsconfig.base.json
 ├── biome.json
-├── docker-compose.yml            # local dev only
+├── compose.dev.yml               # local dev only
 ├── .env.example
 ├── apps/bot/                     # Node 22
 │   ├── Dockerfile

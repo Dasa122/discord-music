@@ -6,6 +6,14 @@ export type TrackEndAction =
   | { type: "empty" };
 
 /**
+ * Play history only records real advances: a loop=track replay or a loop=queue
+ * repeat of the same track is not a new play.
+ */
+export function isRealAdvance(previousId: string | null, nextId: string | null): boolean {
+  return nextId !== null && nextId !== previousId;
+}
+
+/**
  * Pure queue state machine. GuildPlayer owns the audio plumbing; everything
  * that can be decided from the list of tracks lives here so it stays testable.
  */

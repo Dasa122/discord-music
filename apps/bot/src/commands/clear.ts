@@ -10,7 +10,7 @@ export const clearCommand: Command = {
       const player = await getPlayerFor(interaction);
       if (!(await guardDj(interaction, player))) return;
 
-      const cleared = player.clear();
+      const cleared = await player.clear();
       await respondInfo(
         interaction,
         cleared === 0 ? "The queue was already empty." : `Cleared ${cleared} tracks.`,

@@ -15,9 +15,9 @@ import {
 import type { SessionUser } from "../auth/session.js";
 import {
   clearSessionCookie,
-  createSession,
   destroySession,
   getSession,
+  replaceSession,
   requireAdmin,
   setSessionCookie,
 } from "../auth/session.js";
@@ -36,6 +36,11 @@ const DEV_USER: SessionUser = {
   name: "Dev Admin",
   groups: [config.authentikAdminGroup],
 };
+
+/** Re-check the provider's group claim before any session is created or reused. */
+function isAdminUser(user: SessionUser): boolean {
+  return user.groups.includes(config.authentikAdminGroup);
+}
 
 function escapeHtml(value: string): string {
   return value
@@ -70,7 +75,11 @@ function errorPage(
 
 authRoutes.get("/login", async (c) => {
   if (config.authDevBypass) {
-    const id = await createSession(DEV_USER);
+    // Reuse a valid session instead of inserting a second row on every visit.
+    const existing = await getSession(c);
+    if (existing) return c.redirect("/", 302);
+
+    const id = await replaceSession(c, DEV_USER);
     setSessionCookie(c, id);
     return c.redirect("/", 302);
   }
@@ -148,7 +157,7 @@ authRoutes.get("/callback", async (c) => {
     throw error;
   }
 
-  if (!user.groups.includes(config.authentikAdminGroup)) {
+  if (!isAdminUser(user)) {
     return errorPage(
       c,
       403,
@@ -157,7 +166,7 @@ authRoutes.get("/callback", async (c) => {
     );
   }
 
-  const id = await createSession(user);
+  const id = await replaceSession(c, user);
   setSessionCookie(c, id);
   return c.redirect("/", 302);
 });

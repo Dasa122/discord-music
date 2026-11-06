@@ -13,10 +13,20 @@ import {
   VoiceConnectionStatus,
 } from "@discordjs/voice";
 import type { GuildSettings, LoopMode, PlayerState, QueueTrack } from "@music/shared";
-import { MediaError, PlayerError } from "../errors.js";
-import { logger } from "../logger.js";
+import { isTransientPlaybackError, MediaError, PlayerError } from "../errors.js";
+import { logger, sanitizeProcessOutput } from "../logger.js";
 import type { MediaEngine, OpenedStream } from "../media/media-engine.js";
-import { QueueController } from "./queue-ops.js";
+import {
+  failureNotice,
+  isSettingsStale,
+  isSuppressedIdle,
+  SETTINGS_TTL_MS,
+  shouldIdleDisconnect,
+  startBlocker,
+  VOICE_DISCONNECT_GRACE_MS,
+  voiceTransitionAction,
+} from "./lifecycle.js";
+import { isRealAdvance, QueueController } from "./queue-ops.js";
 
 export class StreamSemaphore {
   private active = 0;
@@ -36,12 +46,53 @@ export class StreamSemaphore {
     if (this.active > 0) this.active -= 1;
   }
 
+  hasCapacity(): boolean {
+    return this.active < this.limit;
+  }
+
   setLimit(limit: number): void {
     this.limit = Math.max(1, Math.trunc(limit));
   }
 
   get inUse(): number {
     return this.active;
+  }
+}
+
+/**
+ * Generation-tagged ownership of one global stream slot. A stream that was
+ * already torn down holds a stale token, so its late release cannot free the
+ * slot that a newer stream acquired.
+ */
+export class SlotLease {
+  private readonly semaphore: StreamSemaphore;
+  private generation = 0;
+  private held: number | null = null;
+
+  constructor(semaphore: StreamSemaphore) {
+    this.semaphore = semaphore;
+  }
+
+  acquire(): number | null {
+    if (this.held !== null) return this.held;
+    if (!this.semaphore.tryAcquire()) return null;
+    this.generation += 1;
+    this.held = this.generation;
+    return this.held;
+  }
+
+  release(generation: number | null = this.held): void {
+    if (generation === null || generation !== this.held) return;
+    this.held = null;
+    this.semaphore.release();
+  }
+
+  get current(): number | null {
+    return this.held;
+  }
+
+  get holdsSlot(): boolean {
+    return this.held !== null;
   }
 }
 
@@ -58,7 +109,8 @@ export interface GuildPlayerOptions {
   adapterCreator: DiscordGatewayAdapterCreator;
   loadSettings?: () => Promise<GuildSettings>;
   recordPlay?: (track: QueueTrack) => Promise<void>;
-  getHumanMemberCount?: (channelId: string) => Promise<number>;
+  /** `null` means the member count is unknown (e.g. the channel fetch failed). */
+  getHumanMemberCount?: (channelId: string) => Promise<number | null>;
   onStateChange?: (state: PlayerState) => void;
   onError?: (message: string) => void;
   idleTimeoutSeconds?: number;
@@ -85,10 +137,12 @@ export class GuildPlayer {
   private readonly options: GuildPlayerOptions;
   private readonly queue: QueueController;
   private readonly semaphore: StreamSemaphore;
+  private readonly slotLease: SlotLease;
   private readonly idleTimeoutSeconds: number;
 
   private settings: GuildSettings;
-  private settingsPromise: Promise<void> | null = null;
+  private settingsLoadedAt: number | null = null;
+  private settingsLoad: Promise<void> | null = null;
   private opened: OpenedStream | null = null;
   private resource: AudioResource | null = null;
   private playing = false;
@@ -97,21 +151,25 @@ export class GuildPlayer {
   private basePositionSec = 0;
   private pausedAt: number | null = null;
   private idleTimer: NodeJS.Timeout | null = null;
-  private suppressIdleUntil = 0;
+  private disconnectTimer: NodeJS.Timeout | null = null;
+  /** The resource we stopped on purpose; its Idle event must not advance the queue. */
+  private expectedStopResource: AudioResource | null = null;
   private failureTimes: number[] = [];
   private consecutiveFailures = 0;
   private cooldownUntil = 0;
-  private holdsSlot = false;
   private handlingFailure = false;
   private destroyed = false;
   private volumeValue = DEFAULT_SETTINGS_VOLUME;
   private maxQueueLength = DEFAULT_MAX_QUEUE_LENGTH;
+  /** Serializes every mutating command so two guild actions never interleave. */
+  private pending: Promise<unknown> = Promise.resolve();
 
   constructor(options: GuildPlayerOptions) {
     this.options = options;
     this.guildId = options.guildId;
     this.queue = new QueueController(options.rng);
     this.semaphore = options.semaphore ?? globalStreamSemaphore;
+    this.slotLease = new SlotLease(this.semaphore);
     this.idleTimeoutSeconds = options.idleTimeoutSeconds ?? DEFAULT_IDLE_TIMEOUT_SECONDS;
     this.settings = {
       guildId: options.guildId,
@@ -125,11 +183,12 @@ export class GuildPlayer {
       behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
     });
     this.audioPlayer.on("stateChange", (oldState, newState) => {
-      this.onPlayerStateChange(oldState.status, newState.status);
+      const previousResource = "resource" in oldState ? (oldState.resource ?? null) : null;
+      this.onPlayerStateChange(oldState.status, newState.status, previousResource);
     });
     this.audioPlayer.on("error", (error) => {
       if (!this.queue.current || this.destroyed) return;
-      void this.handlePlaybackFailure(error, true);
+      void this.serialized(() => this.handlePlaybackFailure(error, true));
     });
   }
 
@@ -140,22 +199,30 @@ export class GuildPlayer {
   }
 
   async ensureSettings(): Promise<void> {
-    if (this.settingsPromise) return this.settingsPromise;
     if (!this.options.loadSettings) return;
-    this.settingsPromise = this.options
+    if (this.settingsLoad) return this.settingsLoad;
+    if (!isSettingsStale(this.settingsLoadedAt, Date.now(), SETTINGS_TTL_MS)) return;
+
+    const load = this.options
       .loadSettings()
       .then((settings) => {
         this.settings = settings;
-        this.volumeValue = settings.defaultVolume;
         this.maxQueueLength = settings.maxQueueLength;
+        if (!this.playing) this.volumeValue = settings.defaultVolume;
       })
       .catch((error: unknown) => {
         logger.warn("failed to load guild settings; using defaults", {
           guildId: this.guildId,
           error: error instanceof Error ? error.message : String(error),
         });
+      })
+      .finally(() => {
+        this.settingsLoadedAt = Date.now();
+        this.settingsLoad = null;
       });
-    return this.settingsPromise;
+
+    this.settingsLoad = load;
+    return load;
   }
 
   applySettings(settings: GuildSettings): void {
@@ -190,17 +257,22 @@ export class GuildPlayer {
       return;
     }
 
-    if (this.voiceChannelId !== null && this.voiceChannelId !== channel.id) {
-      // Moving channels kills the existing stream; start clean instead of
-      // pretending the old queue is still playing.
+    if (this.connection !== null || this.voiceChannelId !== null) {
+      // Moving channels — or replacing a connection that died — kills the
+      // existing stream; start clean instead of pretending the old queue is
+      // still playing. This also releases the stream slot it held.
       this.stopInternal();
       this.queue.stop();
+      this.clearIdleTimer();
+      this.clearDisconnectTimer();
     }
 
     if (this.connection) {
-      this.connection.destroy();
+      const previous = this.connection;
       this.connection = null;
+      previous.destroy();
     }
+    this.voiceChannelId = null;
 
     const connection = joinVoiceChannel({
       channelId: channel.id,
@@ -221,8 +293,25 @@ export class GuildPlayer {
     });
 
     connection.on("stateChange", (_oldState, newState) => {
-      if (newState.status === VoiceConnectionStatus.Disconnected) {
+      const action = voiceTransitionAction(newState.status);
+
+      if (action === "teardown") {
+        this.clearDisconnectTimer();
+        if (this.connection === connection) {
+          this.connection = null;
+          this.teardownVoice();
+        }
+        return;
+      }
+
+      if (action === "schedule-teardown") {
         logger.warn("voice connection disconnected", { guildId: this.guildId });
+        this.scheduleDisconnectTeardown(connection);
+        return;
+      }
+
+      if (action === "cancel-teardown") {
+        this.clearDisconnectTimer();
       }
     });
 
@@ -241,22 +330,46 @@ export class GuildPlayer {
 
   // ----------------------------------------------------------------- playback
 
-  async enqueue(tracks: QueueTrack[]): Promise<number> {
+  enqueue(tracks: QueueTrack[]): Promise<number> {
+    return this.serialized(() => this.enqueueInternal(tracks));
+  }
+
+  playNext(): Promise<void> {
+    return this.serialized(() => this.playNextInternal());
+  }
+
+  private async enqueueInternal(tracks: QueueTrack[]): Promise<number> {
     await this.ensureSettings();
+
+    // Cooldown/busy checks run BEFORE the queue is mutated, so a rejected
+    // request cannot leave duplicate tracks behind.
+    const blocker = startBlocker({
+      hasCurrent: this.queue.current !== null,
+      paused: this.paused,
+      coolingDown: this.isCoolingDown(),
+      hasSlot: this.slotLease.holdsSlot || this.semaphore.hasCapacity(),
+    });
+    if (blocker === "cooldown") {
+      throw new PlayerError(
+        "COOLDOWN",
+        "Playback is cooling down after repeated failures. Try again shortly.",
+      );
+    }
+    if (blocker === "busy") {
+      throw new PlayerError(
+        "PLAYBACK_BUSY",
+        "The bot is already streaming the maximum number of tracks. Try again shortly.",
+      );
+    }
+
     const added = this.queue.enqueue(tracks, this.maxQueueLength);
     if (added === 0) return 0;
 
     this.emitState();
 
     if (!this.queue.current && !this.paused) {
-      if (this.isCoolingDown()) {
-        throw new PlayerError(
-          "COOLDOWN",
-          "Playback is cooling down after repeated failures. Try again shortly.",
-        );
-      }
       try {
-        await this.playNext();
+        await this.playNextInternal();
       } catch (error) {
         if (!(error instanceof PlayerError)) this.registerFailure();
         throw error;
@@ -266,7 +379,7 @@ export class GuildPlayer {
     return added;
   }
 
-  async playNext(): Promise<void> {
+  private async playNextInternal(): Promise<void> {
     if (this.queue.current) {
       await this.startCurrent(0);
       return;
@@ -282,10 +395,7 @@ export class GuildPlayer {
       await this.startCurrent(0);
     } catch (error) {
       this.queue.dropCurrent();
-      if (
-        error instanceof PlayerError &&
-        (error.code === "PLAYBACK_BUSY" || error.code === "COOLDOWN")
-      ) {
+      if (isTransientPlaybackError(error)) {
         // Keep the requested track queued so it can start when a slot frees up.
         this.queue.queue.unshift(next);
       }
@@ -315,11 +425,12 @@ export class GuildPlayer {
     this.emitState();
   }
 
-  async skip(count = 1): Promise<number> {
-    this.suppressIdleUntil = Date.now() + 750;
-    if (this.audioPlayer.state.status !== AudioPlayerStatus.Idle) {
-      this.audioPlayer.stop(true);
-    }
+  skip(count = 1): Promise<number> {
+    return this.serialized(() => this.skipInternal(count));
+  }
+
+  private async skipInternal(count: number): Promise<number> {
+    this.stopAudioPlayer();
     this.releaseSlot();
     this.destroyOpened();
     this.playing = false;
@@ -334,7 +445,13 @@ export class GuildPlayer {
       try {
         await this.startCurrent(0);
       } catch (error) {
+        if (isTransientPlaybackError(error)) {
+          // The next track stays at the head; this is not a playback failure.
+          this.emitState();
+          throw error;
+        }
         await this.handlePlaybackFailure(error, true);
+        throw error;
       }
     } else {
       this.scheduleIdle();
@@ -344,34 +461,36 @@ export class GuildPlayer {
     return removed.length;
   }
 
-  async stop(): Promise<void> {
-    this.suppressIdleUntil = Date.now() + 750;
-    if (this.audioPlayer.state.status !== AudioPlayerStatus.Idle) {
-      this.audioPlayer.stop(true);
-    }
+  stop(): Promise<void> {
+    return this.serialized(() => this.performStop());
+  }
+
+  private async performStop(): Promise<void> {
+    this.stopAudioPlayer();
     this.stopInternal();
     this.queue.stop();
-    this.paused = false;
-    this.pausedAt = null;
     this.scheduleIdle();
     this.emitState();
   }
 
-  clear(): number {
-    const cleared = this.queue.clear();
-    if (!this.queue.current) this.scheduleIdle();
-    this.emitState();
-    return cleared;
+  clear(): Promise<number> {
+    return this.serialized(() => {
+      const cleared = this.queue.clear();
+      if (!this.queue.current) this.scheduleIdle();
+      this.emitState();
+      return cleared;
+    });
   }
 
-  async seek(positionSec: number): Promise<void> {
+  seek(positionSec: number): Promise<void> {
+    return this.serialized(() => this.seekInternal(positionSec));
+  }
+
+  private async seekInternal(positionSec: number): Promise<void> {
     if (!this.queue.current) throw new PlayerError("NOTHING_PLAYING", "Nothing is playing.");
     const target = Math.max(0, Math.floor(positionSec));
 
-    this.suppressIdleUntil = Date.now() + 750;
-    if (this.audioPlayer.state.status !== AudioPlayerStatus.Idle) {
-      this.audioPlayer.stop(true);
-    }
+    this.stopAudioPlayer();
     this.releaseSlot();
     this.destroyOpened();
     this.playing = false;
@@ -381,59 +500,75 @@ export class GuildPlayer {
     try {
       await this.startCurrent(target, false);
     } catch (error) {
+      if (isTransientPlaybackError(error)) {
+        // Keep the current track; a busy/cooldown refusal is not a failure.
+        this.emitState();
+        throw error;
+      }
       await this.handlePlaybackFailure(error, true);
       throw error;
     }
   }
 
-  setVolume(volume: number): number {
-    const clamped = Math.max(0, Math.min(200, Math.round(volume)));
-    this.volumeValue = clamped;
-    this.resource?.volume?.setVolume(clamped / 100);
-    this.emitState();
-    return clamped;
+  setVolume(volume: number): Promise<number> {
+    return this.serialized(() => {
+      const clamped = Math.max(0, Math.min(200, Math.round(volume)));
+      this.volumeValue = clamped;
+      this.resource?.volume?.setVolume(clamped / 100);
+      this.emitState();
+      return clamped;
+    });
   }
 
-  setLoop(mode: LoopMode): void {
-    this.queue.setLoop(mode);
-    this.emitState();
+  setLoop(mode: LoopMode): Promise<void> {
+    return this.serialized(() => {
+      this.queue.setLoop(mode);
+      this.emitState();
+    });
   }
 
-  shuffle(): void {
-    this.queue.shuffle();
-    this.emitState();
+  shuffle(): Promise<void> {
+    return this.serialized(() => {
+      this.queue.shuffle();
+      this.emitState();
+    });
   }
 
-  remove(index: number): QueueTrack {
-    const removed = this.queue.remove(index);
-    if (!removed) {
-      throw new PlayerError("INVALID_INDEX", "That queue position does not exist.");
-    }
-    this.emitState();
-    return removed;
+  remove(index: number): Promise<QueueTrack> {
+    return this.serialized(() => {
+      const removed = this.queue.remove(index);
+      if (!removed) {
+        throw new PlayerError("INVALID_INDEX", "That queue position does not exist.");
+      }
+      this.emitState();
+      return removed;
+    });
   }
 
-  move(from: number, to: number): void {
-    if (!this.queue.move(from, to)) {
-      throw new PlayerError("INVALID_INDEX", "Those queue positions do not exist.");
-    }
-    this.emitState();
+  move(from: number, to: number): Promise<void> {
+    return this.serialized(() => {
+      if (!this.queue.move(from, to)) {
+        throw new PlayerError("INVALID_INDEX", "Those queue positions do not exist.");
+      }
+      this.emitState();
+    });
   }
 
-  async disconnect(): Promise<void> {
-    this.suppressIdleUntil = Date.now() + 750;
-    if (this.audioPlayer.state.status !== AudioPlayerStatus.Idle) {
-      this.audioPlayer.stop(true);
-    }
+  disconnect(): Promise<void> {
+    return this.serialized(() => this.performDisconnect());
+  }
+
+  private async performDisconnect(): Promise<void> {
+    this.stopAudioPlayer();
     this.stopInternal();
     this.queue.stop();
-    this.paused = false;
-    this.pausedAt = null;
     this.clearIdleTimer();
-    if (this.connection) {
-      this.connection.destroy();
-      this.connection = null;
-    }
+    this.clearDisconnectTimer();
+
+    const connection = this.connection;
+    this.connection = null;
+    connection?.destroy();
+
     this.voiceChannelId = null;
     this.textChannelId = null;
     this.emitState();
@@ -441,14 +576,18 @@ export class GuildPlayer {
 
   destroy(): void {
     this.destroyed = true;
+    this.stopAudioPlayer();
     this.stopInternal();
     this.queue.stop();
     this.clearIdleTimer();
-    if (this.connection) {
-      this.connection.destroy();
-      this.connection = null;
-    }
+    this.clearDisconnectTimer();
+
+    const connection = this.connection;
+    this.connection = null;
+    connection?.destroy();
+
     this.voiceChannelId = null;
+    this.textChannelId = null;
   }
 
   // ------------------------------------------------------------------ state
@@ -519,7 +658,8 @@ export class GuildPlayer {
       return;
     }
 
-    if (!this.acquireSlot()) {
+    const slot = this.acquireSlot();
+    if (slot === null) {
       throw new PlayerError(
         "PLAYBACK_BUSY",
         "The bot is already streaming the maximum number of tracks. Try again shortly.",
@@ -530,13 +670,15 @@ export class GuildPlayer {
     try {
       opened = await this.options.media.open(track, { startSec });
     } catch (error) {
-      this.releaseSlot();
+      this.releaseSlot(slot);
       throw error;
     }
 
     if (this.destroyed || this.queue.current !== track) {
       opened.stop();
-      this.releaseSlot();
+      // Release only our own generation: a newer stream may already hold the
+      // slot, and a late release must not free it.
+      this.releaseSlot(slot);
       return;
     }
 
@@ -553,7 +695,7 @@ export class GuildPlayer {
       this.audioPlayer.play(resource);
     } catch (error) {
       this.destroyOpened();
-      this.releaseSlot();
+      this.releaseSlot(slot);
       throw error;
     }
 
@@ -574,15 +716,21 @@ export class GuildPlayer {
     }
   }
 
-  private onPlayerStateChange(previous: AudioPlayerStatus, next: AudioPlayerStatus): void {
+  private onPlayerStateChange(
+    previous: AudioPlayerStatus,
+    next: AudioPlayerStatus,
+    previousResource: AudioResource | null,
+  ): void {
     if (next === AudioPlayerStatus.Idle && previous !== AudioPlayerStatus.Idle) {
-      if (Date.now() < this.suppressIdleUntil) {
-        this.suppressIdleUntil = 0;
+      if (this.handlingFailure) return;
+      if (isSuppressedIdle(previousResource, this.expectedStopResource)) {
+        // This Idle was caused by our own stop; it is not the end of a track.
+        this.expectedStopResource = null;
         return;
       }
       if (!this.queue.current) return;
-      void this.advanceAfterEnd().catch((error: unknown) => {
-        void this.handlePlaybackFailure(error, true);
+      void this.serialized(() => this.advanceAfterEnd()).catch((error: unknown) => {
+        void this.serialized(() => this.handlePlaybackFailure(error, true));
       });
       return;
     }
@@ -604,9 +752,18 @@ export class GuildPlayer {
     this.startedAt = null;
     this.basePositionSec = 0;
 
+    const previous = this.queue.current;
     const action = this.queue.onTrackEnd();
-    if (action.type === "replay" || action.type === "play") {
-      await this.startCurrent(0);
+
+    if (action.type === "replay") {
+      // loop=track: the same track replays, so this is not a new play.
+      await this.startCurrent(0, false);
+      return;
+    }
+
+    if (action.type === "play") {
+      const recorded = isRealAdvance(previous?.id ?? null, action.track.id);
+      await this.startCurrent(0, recorded);
       return;
     }
 
@@ -617,7 +774,8 @@ export class GuildPlayer {
   private async handlePlaybackFailure(error: unknown, notify: boolean): Promise<void> {
     if (this.handlingFailure) return;
     this.handlingFailure = true;
-    this.suppressIdleUntil = Date.now() + 1500;
+    const messages: string[] = [];
+    let tripped = false;
 
     try {
       let currentError = error;
@@ -632,18 +790,18 @@ export class GuildPlayer {
         this.pausedAt = null;
 
         const message = currentError instanceof Error ? currentError.message : String(currentError);
+        const stderr =
+          currentError instanceof MediaError
+            ? sanitizeProcessOutput(currentError.stderr)
+            : undefined;
         logger.error("playback failure", {
           guildId: this.guildId,
           error: message,
-          stderr: currentError instanceof MediaError ? currentError.stderr : undefined,
+          ...(stderr ? { stderr } : {}),
         });
+        messages.push(message);
 
-        const tripped = this.registerFailure();
-        if (notify) {
-          this.notifyError(
-            tripped ? `Playback stopped after repeated failures: ${message}` : message,
-          );
-        }
+        tripped = this.registerFailure();
 
         this.queue.dropCurrent();
 
@@ -655,6 +813,7 @@ export class GuildPlayer {
 
         try {
           await this.startCurrent(0);
+          this.emitState();
           return;
         } catch (nextError) {
           currentError = nextError;
@@ -662,6 +821,11 @@ export class GuildPlayer {
       }
     } finally {
       this.handlingFailure = false;
+      if (notify) {
+        // One embed per failure burst, however many retries failed.
+        const notice = failureNotice(messages, tripped);
+        if (notice) this.notifyError(notice);
+      }
     }
   }
 
@@ -680,17 +844,12 @@ export class GuildPlayer {
     return false;
   }
 
-  private acquireSlot(): boolean {
-    if (this.holdsSlot) return true;
-    if (!this.semaphore.tryAcquire()) return false;
-    this.holdsSlot = true;
-    return true;
+  private acquireSlot(): number | null {
+    return this.slotLease.acquire();
   }
 
-  private releaseSlot(): void {
-    if (!this.holdsSlot) return;
-    this.holdsSlot = false;
-    this.semaphore.release();
+  private releaseSlot(generation: number | null = this.slotLease.current): void {
+    this.slotLease.release(generation);
   }
 
   private destroyOpened(): void {
@@ -712,12 +871,63 @@ export class GuildPlayer {
     }
   }
 
+  /** Stop the audio player on purpose, remembering which resource we silenced. */
+  private stopAudioPlayer(): void {
+    if (this.audioPlayer.state.status === AudioPlayerStatus.Idle) return;
+    this.expectedStopResource = this.resource;
+    this.audioPlayer.stop(true);
+  }
+
+  private serialized<T>(operation: () => Promise<T> | T): Promise<T> {
+    const result = this.pending.then(operation, operation);
+    this.pending = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
   private stopInternal(): void {
     this.releaseSlot();
     this.destroyOpened();
     this.playing = false;
+    this.paused = false;
+    this.pausedAt = null;
     this.startedAt = null;
     this.basePositionSec = 0;
+  }
+
+  /** Full teardown after the voice connection is gone for good. */
+  private teardownVoice(): void {
+    this.stopInternal();
+    this.queue.stop();
+    this.voiceChannelId = null;
+    this.clearIdleTimer();
+    this.emitState();
+  }
+
+  private scheduleDisconnectTeardown(connection: VoiceConnection): void {
+    this.clearDisconnectTimer();
+    const timer = setTimeout(() => {
+      this.disconnectTimer = null;
+      if (this.connection !== connection) return;
+      if (connection.state.status === VoiceConnectionStatus.Ready) return;
+      if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
+        connection.destroy();
+      }
+      if (this.connection !== connection) return;
+      this.connection = null;
+      this.teardownVoice();
+    }, VOICE_DISCONNECT_GRACE_MS);
+    timer.unref?.();
+    this.disconnectTimer = timer;
+  }
+
+  private clearDisconnectTimer(): void {
+    if (this.disconnectTimer) {
+      clearTimeout(this.disconnectTimer);
+      this.disconnectTimer = null;
+    }
   }
 
   private handleEmpty(): void {
@@ -750,12 +960,14 @@ export class GuildPlayer {
     if (!this.connection) return;
 
     const emptyQueue = this.queue.current === null && this.queue.queue.length === 0;
-    let noHumans = false;
+    let humanCount: number | null = null;
 
     if (this.voiceChannelId && this.options.getHumanMemberCount) {
       try {
-        noHumans = (await this.options.getHumanMemberCount(this.voiceChannelId)) === 0;
+        humanCount = await this.options.getHumanMemberCount(this.voiceChannelId);
       } catch (error) {
+        // Unknown member count must never be mistaken for an empty channel.
+        humanCount = null;
         logger.warn("failed to inspect voice channel members", {
           guildId: this.guildId,
           error: error instanceof Error ? error.message : String(error),
@@ -763,7 +975,7 @@ export class GuildPlayer {
       }
     }
 
-    if (emptyQueue || noHumans) {
+    if (shouldIdleDisconnect(emptyQueue, humanCount)) {
       await this.disconnect();
       return;
     }

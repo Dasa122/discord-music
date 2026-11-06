@@ -1,6 +1,7 @@
 import {
   ActivityType,
   type ButtonInteraction,
+  type ChatInputCommandInteraction,
   Client,
   Events,
   GatewayIntentBits,
@@ -8,11 +9,15 @@ import {
   MessageFlags,
   type StringSelectMenuInteraction,
 } from "discord.js";
+import { describeAllowedChannels, isChannelAllowed } from "./commands/channel-access.js";
+import { isControlForCurrentTrack, parseControlId } from "./commands/control-id.js";
 import { commandByName, commands } from "./commands/index.js";
+import { canUsePlayerButtons } from "./commands/permissions.js";
 import { getSearchResults } from "./commands/search-cache.js";
-import { commandErrorMessage, requestor, respondError } from "./commands/shared.js";
+import { commandErrorMessage, guildActor, requestor, respondError } from "./commands/shared.js";
 import { config } from "./config.js";
 import { buildQueueComponents, buildQueueEmbed, queuePageCount } from "./embeds/queue.js";
+import { isGuildAllowed } from "./guild-allowlist.js";
 import { logger } from "./logger.js";
 import type { MediaEngine } from "./media/media-engine.js";
 import { toQueueTrack } from "./media/track.js";
@@ -82,12 +87,21 @@ async function onReady(client: Client): Promise<void> {
 
 async function handleInteraction(interaction: Interaction): Promise<void> {
   try {
+    if (!isGuildAllowed(config.allowedGuildIds, interaction.guildId)) {
+      warnIgnoredGuild(interaction.guildId ?? "unknown");
+      if (interaction.isRepliable()) {
+        await respondError(interaction, "This bot is not enabled in this server.");
+      }
+      return;
+    }
+
     if (interaction.isChatInputCommand()) {
       const command = commandByName.get(interaction.commandName);
       if (!command) {
         await respondError(interaction, "Unknown command.");
         return;
       }
+      if (!(await enforceChannelAllowlist(interaction))) return;
       await command.execute(interaction);
       return;
     }
@@ -112,6 +126,34 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
 
 function isExpired(interaction: ButtonInteraction): boolean {
   return Date.now() - interaction.message.createdTimestamp > INTERACTION_MAX_AGE_MS;
+}
+
+/** Warn once per ignored guild so a busy server cannot flood the log. */
+const warnedGuilds = new Set<string>();
+
+function warnIgnoredGuild(guildId: string): void {
+  if (warnedGuilds.has(guildId)) return;
+  warnedGuilds.add(guildId);
+  logger.warn("ignoring interactions from a guild outside DISCORD_ALLOWED_GUILD_IDS", { guildId });
+}
+
+/**
+ * `allowed_channel_ids` is enforced before any command runs. An empty list means
+ * the guild has not restricted commands.
+ */
+async function enforceChannelAllowlist(interaction: ChatInputCommandInteraction): Promise<boolean> {
+  if (!interaction.inCachedGuild()) return true;
+
+  const player = await getPlayer(interaction.guildId);
+  await player.ensureSettings();
+  const allowed = player.getSettings().allowedChannelIds;
+  if (isChannelAllowed(allowed, interaction.channelId)) return true;
+
+  await respondError(
+    interaction,
+    `This command only works in ${describeAllowedChannels(allowed)}.`,
+  );
+  return false;
 }
 
 async function handleButton(interaction: ButtonInteraction): Promise<void> {
@@ -162,29 +204,65 @@ async function handleButton(interaction: ButtonInteraction): Promise<void> {
     return;
   }
 
+  const parsed = parseControlId(customId);
+  if (!parsed) {
+    await respondError(interaction, "That control is not supported.");
+    return;
+  }
+
+  if (!isControlForCurrentTrack(parsed.trackId, player.getState().current?.id ?? null)) {
+    await respondError(
+      interaction,
+      "This control is out of date. Run /nowplaying for fresh controls.",
+    );
+    return;
+  }
+
+  if (!interaction.inCachedGuild()) {
+    await respondError(interaction, "This control only works in a server.");
+    return;
+  }
+
+  await player.ensureSettings();
+  const djRoleId = player.getSettings().djRoleId;
+  const allowed = canUsePlayerButtons(
+    {
+      ...guildActor(interaction.member, djRoleId),
+      voiceChannelId: interaction.member.voice.channelId,
+    },
+    djRoleId,
+    player.voiceChannelId,
+  );
+  if (!allowed) {
+    await respondError(
+      interaction,
+      "You need the DJ role and to be in the bot's voice channel to use these controls.",
+    );
+    return;
+  }
+
+  // Acknowledge before any player mutation: a slow prebuffer must not let the
+  // 3 s interaction window expire underneath us.
+  await interaction.deferUpdate().catch(() => undefined);
+
   try {
-    switch (customId) {
-      case "player:pause":
+    switch (parsed.action) {
+      case "pause":
         if (player.getState().paused) player.resume();
         else player.pause();
         break;
-      case "player:skip":
+      case "skip":
         await player.skip(1);
         break;
-      case "player:stop":
+      case "stop":
         await player.stop();
         break;
-      case "player:shuffle":
-        player.shuffle();
+      case "shuffle":
+        await player.shuffle();
         break;
       default:
         await respondError(interaction, "That control is not supported.");
-        return;
     }
-
-    // The player emits a state change; the now-playing manager edits the live
-    // message. Acknowledge the click so Discord doesn't show a failure.
-    await interaction.deferUpdate().catch(() => undefined);
   } catch (error) {
     await respondError(interaction, commandErrorMessage(error));
   }

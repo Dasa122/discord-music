@@ -1,4 +1,5 @@
 import { MessageFlags, SlashCommandBuilder } from "discord.js";
+import { checkCommandRateLimit } from "../media/limits.js";
 import { toQueueTracks } from "../media/track.js";
 import { getMedia, getPlayer } from "../player/registry.js";
 import { commandErrorMessage, getMemberVoiceChannel, requestor, respondError } from "./shared.js";
@@ -19,6 +20,12 @@ export const playCommand: Command = {
   async execute(interaction) {
     if (!interaction.inCachedGuild()) {
       await respondError(interaction, "This command only works in a server.");
+      return;
+    }
+
+    const waitSeconds = checkCommandRateLimit(interaction.guildId, interaction.user.id);
+    if (waitSeconds > 0) {
+      await respondError(interaction, `You're doing that too often. Try again in ${waitSeconds}s.`);
       return;
     }
 

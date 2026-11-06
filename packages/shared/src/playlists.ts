@@ -1,10 +1,22 @@
 import { z } from "zod";
 
+/**
+ * Playlist URLs are rendered as masked links and eventually handed to yt-dlp,
+ * so only `http(s)` is acceptable — `javascript:`/`data:`/`file:` must never
+ * round-trip through the API.
+ */
+export const playlistUrlSchema = z
+  .url()
+  .max(2048)
+  .refine((value) => /^https?:\/\//i.test(value), {
+    message: "Playlist URLs must use http or https",
+  });
+
 export const playlistSchema = z.object({
   id: z.string().min(1),
   guildId: z.string().min(1),
   ownerDiscordId: z.string().min(1),
-  name: z.string().min(1),
+  name: z.string().min(1).max(100),
   isShared: z.boolean(),
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
@@ -15,10 +27,10 @@ export const playlistItemSchema = z.object({
   id: z.string().min(1),
   playlistId: z.string().min(1),
   position: z.number().int().nonnegative(),
-  title: z.string().min(1),
-  url: z.url(),
+  title: z.string().min(1).max(300),
+  url: playlistUrlSchema,
   durationSec: z.number().int().nonnegative().nullable(),
-  thumbnailUrl: z.url().nullable(),
+  thumbnailUrl: playlistUrlSchema.nullable(),
   addedBy: z.string().min(1),
   createdAt: z.iso.datetime(),
 });
@@ -39,10 +51,10 @@ export type UpdatePlaylistInput = z.infer<typeof updatePlaylistSchema>;
 
 export const insertPlaylistItemSchema = z.object({
   playlistId: z.string().min(1),
-  title: z.string().min(1),
-  url: z.url(),
+  title: z.string().min(1).max(300),
+  url: playlistUrlSchema,
   durationSec: z.number().int().nonnegative().nullable().optional(),
-  thumbnailUrl: z.url().nullable().optional(),
+  thumbnailUrl: playlistUrlSchema.nullable().optional(),
 });
 export type InsertPlaylistItemInput = z.infer<typeof insertPlaylistItemSchema>;
 

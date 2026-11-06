@@ -1,6 +1,6 @@
 import { MessageFlags, SlashCommandBuilder } from "discord.js";
 import { countPlayHistory, listPlayHistory } from "../db/client.js";
-import { buildHistoryEmbed } from "../embeds/history.js";
+import { buildHistoryEmbed, clampHistoryPage } from "../embeds/history.js";
 import { commandErrorMessage, respondError } from "./shared.js";
 import type { Command } from "./types.js";
 
@@ -22,7 +22,7 @@ export const historyCommand: Command = {
 
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
-      const page = interaction.options.getInteger("page") ?? 1;
+      const page = clampHistoryPage(interaction.options.getInteger("page") ?? 1);
       const offset = (page - 1) * PAGE_SIZE;
       const [entries, total] = await Promise.all([
         listPlayHistory(interaction.guildId, PAGE_SIZE, offset),

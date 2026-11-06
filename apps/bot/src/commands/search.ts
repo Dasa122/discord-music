@@ -1,5 +1,6 @@
 import { MessageFlags, SlashCommandBuilder } from "discord.js";
 import { buildSearchComponents, buildSearchEmbed } from "../embeds/search.js";
+import { checkCommandRateLimit } from "../media/limits.js";
 import { getMedia } from "../player/registry.js";
 import { setSearchResults } from "./search-cache.js";
 import { commandErrorMessage, respondError } from "./shared.js";
@@ -19,6 +20,13 @@ export const searchCommand: Command = {
 
   async execute(interaction) {
     const query = interaction.options.getString("query", true);
+
+    const waitSeconds = checkCommandRateLimit(interaction.guildId ?? "dm", interaction.user.id);
+    if (waitSeconds > 0) {
+      await respondError(interaction, `You're doing that too often. Try again in ${waitSeconds}s.`);
+      return;
+    }
+
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     try {

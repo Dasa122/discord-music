@@ -13,10 +13,12 @@ import {
   buildPlaylistLoadedEmbed,
   buildPlaylistSavedEmbed,
 } from "../embeds/playlist.js";
+import { canDeletePlaylist, canLoadPlaylist, canManagePlaylists } from "./permissions.js";
 import {
   commandErrorMessage,
   getMemberVoiceChannel,
   getPlayerFor,
+  guildActor,
   requestor,
   respondError,
 } from "./shared.js";
@@ -27,6 +29,14 @@ async function save(interaction: Parameters<Command["execute"]>[0]): Promise<voi
   const name = interaction.options.getString("name", true).trim();
 
   const player = await getPlayerFor(interaction);
+  await player.ensureSettings();
+
+  const actor = guildActor(interaction.member, player.getSettings().djRoleId);
+  if (!canManagePlaylists(actor)) {
+    await respondError(interaction, "You need the DJ role (or Manage Server) to save playlists.");
+    return;
+  }
+
   const state = player.getState();
 
   // The playing track is deliberately excluded; a saved playlist is the queue.
@@ -80,7 +90,15 @@ async function load(interaction: Parameters<Command["execute"]>[0]): Promise<voi
     return;
   }
 
-  const loaded = await getPlaylistWithItems(playlist.id);
+  if (!canLoadPlaylist({ userId: interaction.user.id }, playlist)) {
+    await respondError(
+      interaction,
+      "You can only load your own playlists, or playlists shared with the server.",
+    );
+    return;
+  }
+
+  const loaded = await getPlaylistWithItems(playlist.id, interaction.guildId);
   if (!loaded || loaded.items.length === 0) {
     await respondError(interaction, `**${name}** is empty.`);
     return;
@@ -126,6 +144,30 @@ async function list(interaction: Parameters<Command["execute"]>[0]): Promise<voi
 async function remove(interaction: Parameters<Command["execute"]>[0]): Promise<void> {
   if (!interaction.inCachedGuild()) return;
   const name = interaction.options.getString("name", true).trim();
+
+  const player = await getPlayerFor(interaction);
+  await player.ensureSettings();
+
+  const actor = guildActor(interaction.member, player.getSettings().djRoleId);
+  if (!canManagePlaylists(actor)) {
+    await respondError(interaction, "You need the DJ role (or Manage Server) to delete playlists.");
+    return;
+  }
+
+  const playlist = await getPlaylistByName(interaction.guildId, name);
+  if (!playlist) {
+    await respondError(interaction, `No playlist named **${name}** exists.`);
+    return;
+  }
+
+  if (!canDeletePlaylist({ ...actor, userId: interaction.user.id }, playlist)) {
+    await respondError(
+      interaction,
+      "You can only delete playlists you own, unless you have Manage Server.",
+    );
+    return;
+  }
+
   const deleted = await deletePlaylistByName(interaction.guildId, name);
   if (!deleted) {
     await respondError(interaction, `No playlist named **${name}** exists.`);

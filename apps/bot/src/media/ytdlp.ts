@@ -2,6 +2,25 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { Readable } from "node:stream";
 import { MediaError } from "../errors.js";
+import { QueuedSemaphore } from "./limits.js";
+import { assertSafeMediaQuery } from "./url-guard.js";
+
+/** Hard limits for one metadata extraction. */
+export const MAX_EXTRACTION_CONCURRENCY = 3;
+export const EXTRACTION_WAIT_MS = 120_000;
+export const MAX_EXTRACTION_STDOUT_BYTES = 8 * 1024 * 1024;
+export const MAX_PLAYLIST_ENTRIES = 50;
+
+/** Shared by `resolve` and `resolveSearch`; `openAudioStream` is a stream, not an extraction. */
+export const extractionSemaphore = new QueuedSemaphore(
+  MAX_EXTRACTION_CONCURRENCY,
+  EXTRACTION_WAIT_MS,
+);
+
+/** True when accumulated yt-dlp stdout has crossed the 8 MB ceiling. */
+export function stdoutExceedsLimit(byteLength: number): boolean {
+  return byteLength > MAX_EXTRACTION_STDOUT_BYTES;
+}
 
 export interface YtdlpOptions {
   path: string;
@@ -174,6 +193,7 @@ function runYtdlp(args: string[], options: YtdlpOptions): Promise<string> {
     const stderrLines: string[] = [];
     let stderrRemainder = "";
     let stdout = "";
+    let stdoutBytes = 0;
     let settled = false;
 
     const timer = setTimeout(() => {
@@ -188,7 +208,21 @@ function runYtdlp(args: string[], options: YtdlpOptions): Promise<string> {
     child.stderr.setEncoding("utf8");
 
     child.stdout.on("data", (chunk: string) => {
+      if (settled) return;
       stdout += chunk;
+      stdoutBytes += Buffer.byteLength(chunk, "utf8");
+      if (!stdoutExceedsLimit(stdoutBytes)) return;
+
+      // Stop the extractor instead of buffering an unbounded playlist dump.
+      settled = true;
+      clearTimeout(timer);
+      child.kill("SIGKILL");
+      reject(
+        new MediaError(
+          "OUTPUT_TOO_LARGE",
+          "The extractor returned too much data. Try a more specific link.",
+        ),
+      );
     });
     child.stderr.on("data", (chunk: string) => {
       const parts = `${stderrRemainder}${chunk}`.split(/\r?\n/);
@@ -240,6 +274,31 @@ function runYtdlp(args: string[], options: YtdlpOptions): Promise<string> {
   });
 }
 
+/** Args for one metadata extraction; exported so the playlist bound is testable. */
+export function buildResolveArgs(target: string, options: YtdlpOptions): string[] {
+  const playlistRequest = isPlaylistUrl(target);
+  return [
+    ...buildCommonArgs(options),
+    "--dump-single-json",
+    ...(playlistRequest
+      ? ["--yes-playlist", "--flat-playlist", "--playlist-end", String(MAX_PLAYLIST_ENTRIES)]
+      : []),
+    "--",
+    target,
+  ];
+}
+
+async function withExtractionSlot<T>(run: () => Promise<T>): Promise<T> {
+  const release = await extractionSemaphore.acquire(
+    () => new MediaError("EXTRACTION_BUSY", "The media extractor is busy. Try again in a moment."),
+  );
+  try {
+    return await run();
+  } finally {
+    release();
+  }
+}
+
 export async function resolve(
   query: string,
   options: YtdlpOptions = ytdlpOptionsFromEnv(),
@@ -247,23 +306,23 @@ export async function resolve(
   const trimmed = query.trim();
   if (!trimmed) throw new MediaError("NOT_FOUND", "The search query is empty.");
 
-  const playlistRequest = isPlaylistUrl(trimmed);
-  const target = isHttpUrl(trimmed) ? trimmed : `ytsearch1:${trimmed}`;
-  const args = [
-    ...buildCommonArgs(options),
-    "--dump-single-json",
-    ...(playlistRequest ? ["--yes-playlist", "--flat-playlist"] : []),
-    "--",
-    target,
-  ];
+  const target = await assertSafeMediaQuery(trimmed);
+  const playlistRequest = isPlaylistUrl(target);
+  const ytdlpTarget = /^ytsearch\d*:/i.test(target)
+    ? target
+    : isHttpUrl(target)
+      ? target
+      : `ytsearch1:${target}`;
+  const args = buildResolveArgs(ytdlpTarget, options);
 
-  const stdout = await runYtdlp(args, options);
+  const stdout = await withExtractionSlot(() => runYtdlp(args, options));
   const raw = parseJsonOutput(stdout);
   const type = stringValue(raw._type);
 
   if (type === "playlist") {
     const entriesRaw = Array.isArray(raw.entries) ? raw.entries : [];
     const entries = entriesRaw
+      .slice(0, MAX_PLAYLIST_ENTRIES)
       .map(mapEntry)
       .filter((entry): entry is ResolvedTrack => entry !== null);
 
@@ -274,7 +333,7 @@ export async function resolve(
     }
 
     const title = stringValue(raw.title) ?? "Playlist";
-    const webpageUrl = stringValue(raw.webpage_url) ?? trimmed;
+    const webpageUrl = stringValue(raw.webpage_url) ?? target;
     return {
       videoId: stringValue(raw.id),
       title,
@@ -299,6 +358,10 @@ export async function resolveSearch(
   const trimmed = query.trim();
   if (!trimmed) throw new MediaError("NOT_FOUND", "The search query is empty.");
 
+  // The query is always wrapped in `ytsearchN:` below, but a scheme it would
+  // never accept is still rejected here so both spawn paths share one gate.
+  await assertSafeMediaQuery(trimmed);
+
   const bounded = Math.max(1, Math.min(10, Math.trunc(limit)));
   const args = [
     ...buildCommonArgs(options),
@@ -308,13 +371,14 @@ export async function resolveSearch(
     `ytsearch${bounded}:${trimmed}`,
   ];
 
-  const stdout = await runYtdlp(args, options);
+  const stdout = await withExtractionSlot(() => runYtdlp(args, options));
   const raw = parseJsonOutput(stdout);
   const type = stringValue(raw._type);
 
   if (type === "playlist") {
     const entriesRaw = Array.isArray(raw.entries) ? raw.entries : [];
     return entriesRaw
+      .slice(0, bounded)
       .map(mapEntry)
       .filter((entry): entry is ResolvedTrack => entry !== null)
       .slice(0, bounded);
@@ -324,10 +388,14 @@ export async function resolveSearch(
   return single ? [single] : [];
 }
 
-export function openAudioStream(
+export async function openAudioStream(
   track: { url: string; title?: string },
   options: OpenAudioStreamOptions = {},
-): OpenAudioStreamResult {
+): Promise<OpenAudioStreamResult> {
+  // Every path that reaches yt-dlp (searches, playlist rows, direct URLs) passes
+  // through here, so the URL allow-list is enforced at the spawn point.
+  await assertSafeMediaQuery(track.url);
+
   const ytdlpOptions = options.options ?? ytdlpOptionsFromEnv();
   const args = [...buildCommonArgs(ytdlpOptions), "-f", "bestaudio/best", "-o", "-"];
 

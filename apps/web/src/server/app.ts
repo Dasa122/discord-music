@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { requireAdmin, requireSameOrigin } from "./auth/session.js";
-import { failure } from "./envelope.js";
+import { failure, jsonBodyTooLarge, payloadTooLargeFailure } from "./envelope.js";
 import { authRoutes, meRoutes } from "./routes/auth.js";
 import { guildRoutes } from "./routes/guilds.js";
 import { healthRoutes } from "./routes/health.js";
@@ -61,6 +61,24 @@ app.use("*", async (c, next) => {
   c.header("Referrer-Policy", "no-referrer");
   c.header("X-Frame-Options", "DENY");
   c.header("Content-Security-Policy", CONTENT_SECURITY_POLICY);
+  c.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  c.header("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+
+  // API responses carry session-scoped data and must never be cached.
+  const path = new URL(c.req.url).pathname;
+  if (path === "/api" || path.startsWith("/api/")) {
+    c.header("Cache-Control", "no-store");
+  }
+});
+
+/** Reject oversized JSON bodies before Hono buffers them for `c.req.json()`. */
+app.use("/api/*", async (c, next) => {
+  const method = c.req.method.toUpperCase();
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") return next();
+  if (jsonBodyTooLarge(c.req.header("content-length"))) {
+    return c.json(payloadTooLargeFailure(), 413);
+  }
+  return next();
 });
 
 /** CSRF guard for every mutating `/api/*` call except the OIDC callback. */

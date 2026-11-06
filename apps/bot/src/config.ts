@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { parseAllowedGuildIds } from "./guild-allowlist.js";
 
 const blankToUndefined = (value: unknown): unknown =>
   typeof value === "string" && value.trim() === "" ? undefined : value;
@@ -7,6 +8,8 @@ const envSchema = z.object({
   DISCORD_TOKEN: z.string().min(1),
   DISCORD_CLIENT_ID: z.string().min(1),
   DISCORD_GUILD_ID: z.string().min(1).optional(),
+  /** Optional comma-separated allow-list; empty means every guild. */
+  DISCORD_ALLOWED_GUILD_IDS: z.string().optional(),
   BOT_CONTROL_PORT: z.coerce.number().int().min(1).max(65_535).default(3001),
   BOT_CONTROL_HOST: z.string().min(1).default("127.0.0.1"),
   BOT_CONTROL_SECRET: z.string().min(16),
@@ -33,6 +36,7 @@ export interface AppConfig {
   discordToken: string;
   discordClientId: string;
   discordGuildId: string | undefined;
+  allowedGuildIds: readonly string[];
   controlPort: number;
   controlHost: string;
   controlSecret: string;
@@ -77,6 +81,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     discordToken: value.DISCORD_TOKEN,
     discordClientId: value.DISCORD_CLIENT_ID,
     discordGuildId: value.DISCORD_GUILD_ID,
+    allowedGuildIds: parseAllowedGuildIds(value.DISCORD_ALLOWED_GUILD_IDS),
     controlPort: value.BOT_CONTROL_PORT,
     controlHost: value.BOT_CONTROL_HOST,
     controlSecret: value.BOT_CONTROL_SECRET,

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { QueueTrack } from "@music/shared";
-import { QueueController } from "./queue-ops.js";
+import { isRealAdvance, QueueController } from "./queue-ops.js";
 
 function track(id: string): QueueTrack {
   return {
@@ -100,6 +100,25 @@ describe("loop modes", () => {
   test("ending an empty queue reports empty", () => {
     const queue = new QueueController();
     expect(queue.onTrackEnd()).toEqual({ type: "empty" });
+  });
+});
+
+describe("isRealAdvance", () => {
+  test("a different track is a real advance", () => {
+    expect(isRealAdvance("a", "b")).toBe(true);
+  });
+
+  test("a loop=queue repeat of the same track is not recorded", () => {
+    expect(isRealAdvance("a", "a")).toBe(false);
+  });
+
+  test("replaying the same track (loop=track) is not recorded", () => {
+    expect(isRealAdvance("a", "a")).toBe(false);
+  });
+
+  test("going to no track is not a real advance", () => {
+    expect(isRealAdvance("a", null)).toBe(false);
+    expect(isRealAdvance(null, null)).toBe(false);
   });
 });
 

@@ -82,12 +82,19 @@ export async function getGuildSettings(guildId: string): Promise<GuildSettings> 
   };
 }
 
-export async function getPlaylistWithItems(playlistId: string): Promise<PlaylistWithItems | null> {
+export async function getPlaylistWithItems(
+  playlistId: string,
+  guildId?: string,
+): Promise<PlaylistWithItems | null> {
+  const where = guildId
+    ? and(eq(playlistTable.id, playlistId), eq(playlistTable.guildId, guildId))
+    : eq(playlistTable.id, playlistId);
+
   const rows = await db
     .select({ playlist: playlistTable, item: playlistItemTable })
     .from(playlistTable)
     .leftJoin(playlistItemTable, eq(playlistItemTable.playlistId, playlistTable.id))
-    .where(eq(playlistTable.id, playlistId))
+    .where(where)
     .orderBy(asc(playlistItemTable.position));
 
   const first = rows[0];

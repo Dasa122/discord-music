@@ -1,6 +1,6 @@
 import { EmbedBuilder } from "discord.js";
 import { COLORS } from "./colors.js";
-import { formatDuration, truncate } from "./format.js";
+import { escapeMarkdown, formatDuration, truncate } from "./format.js";
 
 export interface HistoryItemView {
   title: string;
@@ -11,6 +11,13 @@ export interface HistoryItemView {
 }
 
 export const HISTORY_PAGE_SIZE = 10;
+export const MAX_HISTORY_PAGE = 1000;
+
+/** A page option is user input; clamp it so the offset stays sane. */
+export function clampHistoryPage(page: number): number {
+  if (!Number.isFinite(page)) return 1;
+  return Math.min(Math.max(1, Math.trunc(page)), MAX_HISTORY_PAGE);
+}
 
 export function historyPageCount(total: number, pageSize = HISTORY_PAGE_SIZE): number {
   const size = Math.max(1, Math.trunc(pageSize));
@@ -33,8 +40,8 @@ export function buildHistoryEmbed(
       ? "unknown time"
       : `<t:${Math.floor(playedAt.getTime() / 1000)}:R>`;
     const duration = item.durationSec ? ` · \`${formatDuration(item.durationSec)}\`` : "";
-    return `**${start + index + 1}.** [${truncate(item.title, 80)}](${item.url}) · \`${truncate(
-      item.requestedBy,
+    return `**${start + index + 1}.** [${truncate(escapeMarkdown(item.title), 80)}](${item.url}) · \`${truncate(
+      escapeMarkdown(item.requestedBy),
       40,
     )}\` · ${timestamp}${duration}`;
   });

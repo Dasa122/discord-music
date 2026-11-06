@@ -9,6 +9,29 @@ const LEVEL_ORDER: Record<LogLevel, number> = {
 
 const SECRET_KEY_PATTERN = /token|secret|password|authorization|cookie|api[-_]?key/i;
 
+/**
+ * `https://user:pass@proxy.example` leaks credentials into logs when yt-dlp
+ * echoes a proxy URL. Redact the userinfo, keep the scheme and host.
+ */
+const PROXY_CREDENTIALS = /([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+:[^\s/@]+@/gi;
+
+export function redactProxyCredentials(text: string): string {
+  return text.replace(PROXY_CREDENTIALS, "$1[REDACTED]@");
+}
+
+/**
+ * Process output is diagnostics, not a transcript: strip proxy credentials and
+ * keep only the tail so one noisy extractor cannot flood the log.
+ */
+export function sanitizeProcessOutput(text: string | undefined, maxLines = 20): string {
+  if (!text) return "";
+  return redactProxyCredentials(text)
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== "")
+    .slice(-Math.max(1, maxLines))
+    .join("\n");
+}
+
 let threshold = parseLevel(process.env.LOG_LEVEL);
 
 function parseLevel(value: string | undefined): number {
@@ -25,6 +48,7 @@ export function setLogLevel(level: LogLevel): void {
 
 function replacer(this: unknown, key: string, value: unknown): unknown {
   if (SECRET_KEY_PATTERN.test(key)) return "[REDACTED]";
+  if (typeof value === "string") return redactProxyCredentials(value);
   if (value instanceof Error) {
     return {
       name: value.name,

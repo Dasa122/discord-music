@@ -29,13 +29,15 @@ The bot image additionally installs `ffmpeg`, `yt-dlp`, and Deno.
 ### Everything in Docker
 
 ```bash
-cp .env.example .env      # fill in Discord/Authentik credentials where needed
-docker compose up --build # Postgres + bot (:3001) + web (:3000)
+cp .env.example .env                      # fill in credentials, including BOT_CONTROL_SECRET
+docker compose -f compose.dev.yml up --build   # Postgres + bot + web (:3000)
 ```
 
-The compose file supplies local-only defaults (`PUBLIC_BASE_URL=http://localhost:3000`,
-`BOT_INTERNAL_URL=http://bot:3001`, `AUTH_DEV_BYPASS=true`, `SESSION_COOKIE_SECURE=false`) and a
-shared placeholder `BOT_CONTROL_SECRET`. Override anything by editing `.env`.
+`compose.dev.yml` is **local development only** — never deploy it. It enables `AUTH_DEV_BYPASS`
+and refuses to start unless `BOT_CONTROL_SECRET` is set in `.env`. It publishes only the web
+port (:3000); Postgres and the bot control API stay on the compose network. Other local-only
+defaults are `PUBLIC_BASE_URL=http://localhost:3000`, `BOT_INTERNAL_URL=http://bot:3001`, and
+`SESSION_COOKIE_SECURE=false`.
 
 ### Vite dev pair
 
@@ -63,6 +65,14 @@ bun run --filter @music/bot watch   # optional: tsc --watch for live rebuilds
 For live reload, run `watch` in one terminal and `dev` in another. Running only `dev` works too —
 restart it after source changes.
 
+The bot's HTTP control API binds `BOT_CONTROL_HOST` (default `127.0.0.1`). Docker sets
+`0.0.0.0` so the web container can reach `music-bot:3001`; leave the default for bare-metal runs
+so port 3001 stays on the loopback interface.
+
+`DISCORD_ALLOWED_GUILD_IDS` is an optional comma-separated allow-list. When set, commands and
+buttons from any other guild are ignored (and logged once); leave it empty to serve every guild
+the bot is invited to.
+
 ### Database
 
 ```bash
@@ -78,6 +88,13 @@ so rolling replicas cannot race DDL.
 bun run check   # check:ts + typecheck + lint + test
 bun run build
 ```
+
+### Image toolchain pins
+
+`apps/bot/Dockerfile` downloads Deno and yt-dlp at build time. Deno is pinned by
+`DENO_VERSION` + `DENO_SHA256` (linux x86_64 archive) and yt-dlp by `YT_DLP_VERSION`, whose
+release `SHA2-256SUMS` is verified with `sha256sum -c`. Both fail the build on mismatch; override
+a pin only together with its matching checksum.
 
 ## Production
 

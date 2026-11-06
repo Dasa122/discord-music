@@ -45,11 +45,11 @@ export function usePlaylists(guildId: string | null) {
   });
 }
 
-export function usePlaylist(playlistId: string | null) {
+export function usePlaylist(playlistId: string | null, guildId: string | null) {
   return useQuery({
     queryKey: queryKeys.playlist(playlistId),
-    queryFn: () => api.playlist(playlistId as string),
-    enabled: Boolean(playlistId),
+    queryFn: () => api.playlist(playlistId as string, guildId as string),
+    enabled: Boolean(playlistId && guildId),
   });
 }
 
@@ -110,7 +110,7 @@ export function useUpdatePlaylist(guildId: string | null) {
       playlistId: string;
       name?: string;
       isShared?: boolean;
-    }) => api.updatePlaylist(playlistId, body),
+    }) => api.updatePlaylist(playlistId, guildId as string, body),
     onSuccess: (_playlist, variables) => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.playlists(guildId) });
       void queryClient.invalidateQueries({ queryKey: queryKeys.playlist(variables.playlistId) });
@@ -122,7 +122,7 @@ export function useDeletePlaylist(guildId: string | null) {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (playlistId: string) => api.deletePlaylist(playlistId),
+    mutationFn: (playlistId: string) => api.deletePlaylist(playlistId, guildId as string),
     onSuccess: (_data, playlistId) => {
       queryClient.removeQueries({ queryKey: queryKeys.playlist(playlistId) });
       void queryClient.invalidateQueries({ queryKey: queryKeys.playlists(guildId) });
@@ -134,7 +134,7 @@ export function useRemovePlaylistItem(playlistId: string, guildId: string | null
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (itemId: string) => api.removePlaylistItem(playlistId, itemId),
+    mutationFn: (itemId: string) => api.removePlaylistItem(playlistId, guildId as string, itemId),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.playlist(playlistId) });
       void queryClient.invalidateQueries({ queryKey: queryKeys.playlists(guildId) });
@@ -142,11 +142,11 @@ export function useRemovePlaylistItem(playlistId: string, guildId: string | null
   });
 }
 
-export function useReorderPlaylist(playlistId: string) {
+export function useReorderPlaylist(playlistId: string, guildId: string | null) {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (itemIds: string[]) => api.reorderPlaylist(playlistId, itemIds),
+    mutationFn: (itemIds: string[]) => api.reorderPlaylist(playlistId, guildId as string, itemIds),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.playlist(playlistId) });
     },

@@ -5,7 +5,7 @@ import { requestedBySchema } from "./track.js";
 export const controlActionSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("play"),
-    query: z.string().min(1),
+    query: z.string().min(1).max(500),
     requestedBy: requestedBySchema,
     textChannelId: z.string().optional(),
   }),

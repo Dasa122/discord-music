@@ -67,8 +67,14 @@ export async function getPlayer(guildId: string): Promise<GuildPlayer> {
         requestedBy: track.requestedBy.name,
       }),
     getHumanMemberCount: async (channelId) => {
-      const channel = await client.channels.fetch(channelId).catch(() => null);
-      if (!channel?.isVoiceBased()) return 0;
+      let channel: Awaited<ReturnType<typeof client.channels.fetch>>;
+      try {
+        channel = await client.channels.fetch(channelId);
+      } catch {
+        // Unknown membership: the player reschedules instead of leaving.
+        return null;
+      }
+      if (!channel?.isVoiceBased()) return null;
       return channel.members.filter((member) => !member.user.bot).size;
     },
     onStateChange: (state) => {

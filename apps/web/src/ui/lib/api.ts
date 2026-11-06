@@ -233,6 +233,8 @@ export const queryKeys = {
 
 const guildPath = (guildId: string) => `/api/guilds/${encodeURIComponent(guildId)}`;
 const playlistPath = (playlistId: string) => `/api/playlists/${encodeURIComponent(playlistId)}`;
+const withGuildQuery = (path: string, guildId: string) =>
+  `${path}?guildId=${encodeURIComponent(guildId)}`;
 
 /** Typed bindings for every endpoint the dashboard uses. */
 export const api = {
@@ -247,18 +249,26 @@ export const api = {
   playlists: (guildId: string) => apiGet<PlaylistSummary[]>(`${guildPath(guildId)}/playlists`),
   createPlaylist: (guildId: string, body: { name: string; isShared?: boolean }) =>
     apiPost<PlaylistSummary>(`${guildPath(guildId)}/playlists`, { guildId, ...body }),
-  playlist: (playlistId: string) => apiGet<PlaylistDetail>(playlistPath(playlistId)),
-  updatePlaylist: (playlistId: string, body: { name?: string; isShared?: boolean }) =>
-    apiPatch<PlaylistDetail>(playlistPath(playlistId), body),
-  deletePlaylist: (playlistId: string) => apiDelete<unknown>(playlistPath(playlistId)),
+  playlist: (playlistId: string, guildId: string) =>
+    apiGet<PlaylistDetail>(withGuildQuery(playlistPath(playlistId), guildId)),
+  updatePlaylist: (
+    playlistId: string,
+    guildId: string,
+    body: { name?: string; isShared?: boolean },
+  ) => apiPatch<PlaylistDetail>(playlistPath(playlistId), { guildId, ...body }),
+  deletePlaylist: (playlistId: string, guildId: string) =>
+    apiDelete<unknown>(withGuildQuery(playlistPath(playlistId), guildId)),
   addPlaylistItem: (
     playlistId: string,
+    guildId: string,
     body: { title: string; url: string; durationSec?: number | null; thumbnailUrl?: string | null },
-  ) => apiPost<PlaylistItemView>(`${playlistPath(playlistId)}/items`, body),
-  removePlaylistItem: (playlistId: string, itemId: string) =>
-    apiDelete<unknown>(`${playlistPath(playlistId)}/items/${encodeURIComponent(itemId)}`),
-  reorderPlaylist: (playlistId: string, itemIds: string[]) =>
-    apiPost<PlaylistDetail>(`${playlistPath(playlistId)}/reorder`, { itemIds }),
+  ) => apiPost<PlaylistItemView>(`${playlistPath(playlistId)}/items`, { guildId, ...body }),
+  removePlaylistItem: (playlistId: string, guildId: string, itemId: string) =>
+    apiDelete<unknown>(
+      withGuildQuery(`${playlistPath(playlistId)}/items/${encodeURIComponent(itemId)}`, guildId),
+    ),
+  reorderPlaylist: (playlistId: string, guildId: string, itemIds: string[]) =>
+    apiPost<PlaylistDetail>(`${playlistPath(playlistId)}/reorder`, { guildId, itemIds }),
   history: (guildId: string, limit: number, offset: number) =>
     apiGet<HistoryPage>(
       `${guildPath(guildId)}/history?limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}`,

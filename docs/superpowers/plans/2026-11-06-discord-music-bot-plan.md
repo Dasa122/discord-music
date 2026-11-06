@@ -29,7 +29,7 @@ both apps. Nothing runs yet.
 
 - Root: `package.json` (Bun workspaces `apps/*`, `packages/*`; scripts `lint`,
   `typecheck`, `build`), `tsconfig.base.json` (strict, ESM, bundler resolution),
-  `biome.json`, `.env.example` (spec §10), `.gitignore`, `docker-compose.yml`.
+  `biome.json`, `.env.example` (spec §10), `.gitignore`, `compose.dev.yml`.
 - `packages/shared/`: `package.json` (`@music/shared`, ESM + types),
   `tsconfig.json` (build to `dist/`, emit `.d.ts`), `src/index.ts`.
 - `packages/shared/src/track.ts` (`Track`, `QueueTrack`), `player.ts`
@@ -124,7 +124,7 @@ secret never reaches the browser. Session ids are 32 random bytes hex with a
 
 ```bash
 bun lint && bun typecheck && bun run build --filter web
-docker compose up -d db && bun run --cwd apps/web start &
+docker compose -f compose.dev.yml up -d postgres && bun run --cwd apps/web start &
 curl -fsS localhost:3000/api/health
 curl -s -o /dev/null -w '%{http_code}' localhost:3000/api/me   # expect 401
 ```
@@ -173,7 +173,7 @@ bun install && bun lint && bun typecheck && bun run build
 bun test                                        # queue ops, DJ matrix, dispatch
 docker build -f apps/bot/Dockerfile -t music-bot:local .
 docker build -f apps/web/Dockerfile -t music-web:local .
-docker compose up -d db                         # then migrate + boot both apps
+docker compose -f compose.dev.yml up -d postgres  # then migrate + boot both apps
 ```
 
 **Exit criteria:** all commands pass from the repo root; both images build; a

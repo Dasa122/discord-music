@@ -54,7 +54,7 @@ function entryFor(guildId: string): GuildEntry {
 /** Called by every player state change; coalesces bursts into one edit. */
 export function notifyStateChange(state: PlayerState): void {
   const entry = entryFor(state.guildId);
-  if (state.textChannelId) entry.textChannelId = state.textChannelId;
+  entry.textChannelId = resolveTextChannel(entry.textChannelId, state);
   entry.lastState = state;
 
   if (entry.timer) clearTimeout(entry.timer);
@@ -63,6 +63,47 @@ export function notifyStateChange(state: PlayerState): void {
     void flush(state.guildId);
   }, DEBOUNCE_MS);
   entry.timer.unref?.();
+}
+
+/**
+ * Once the player leaves voice, forget the text channel so a later playback
+ * error cannot be posted into a channel the bot has left.
+ */
+export function resolveTextChannel(
+  previous: string | null,
+  state: Pick<PlayerState, "textChannelId" | "voiceChannelId">,
+): string | null {
+  if (state.textChannelId) return state.textChannelId;
+  if (state.voiceChannelId === null) return null;
+  return previous;
+}
+
+/**
+ * Register an externally posted now-playing message (for example the reply to
+ * `/nowplaying`) so the manager edits, disables, and finalizes it like one of
+ * its own instead of leaving an unmanaged second control surface behind.
+ */
+export async function adoptNowPlayingMessage(
+  guildId: string,
+  channelId: string,
+  messageId: string,
+  state: PlayerState,
+): Promise<void> {
+  const entry = entryFor(guildId);
+
+  if (entry.messageId && entry.messageId !== messageId) {
+    await finalize(entry, entry.lastTrack);
+    clearDisableTimer(entry);
+  }
+
+  entry.messageId = messageId;
+  entry.textChannelId = channelId;
+  entry.lastState = null;
+  entry.lastTrackId = state.current?.id ?? null;
+  entry.lastTrack = state.current;
+  entry.lastRenderedState = state;
+  entry.postedAt = Date.now();
+  scheduleDisableTimer(entry, guildId);
 }
 
 async function flush(guildId: string): Promise<void> {

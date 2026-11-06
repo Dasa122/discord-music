@@ -17,6 +17,7 @@ import {
   listGuildSummaries,
 } from "../player/registry.js";
 import { mapControlError } from "./errors.js";
+import { decodePathSegment } from "./path.js";
 
 const MAX_BODY_BYTES = 256 * 1024;
 
@@ -117,7 +118,10 @@ async function handleRequest(
       return;
     }
 
-    const guildId = decodeURIComponent(match[1] ?? "");
+    const guildId = decodePathSegment(match[1] ?? "");
+    if (guildId === null) {
+      throw new HttpError(400, "INVALID_PATH", "The guild id is not valid percent-encoding.");
+    }
     const route = match[2];
     if (!guildId || !client.guilds.cache.has(guildId)) {
       sendJson(response, 404, {
@@ -212,9 +216,9 @@ async function applyAction(guildId: string, action: ControlAction): Promise<Guil
       }
       if (action.textChannelId) player.setTextChannel(action.textChannelId);
 
-      const loaded = await getPlaylistWithItems(action.playlistId);
+      const loaded = await getPlaylistWithItems(action.playlistId, guildId);
       if (!loaded) {
-        throw new PlayerError("GUILD_NOT_FOUND", "Playlist not found.");
+        throw new PlayerError("PLAYLIST_NOT_FOUND", "Playlist not found in this server.");
       }
 
       const tracks: QueueTrack[] = loaded.items.map((item) => ({
@@ -249,22 +253,22 @@ async function applyAction(guildId: string, action: ControlAction): Promise<Guil
       await player.seek(action.positionSec);
       break;
     case "volume":
-      player.setVolume(action.volume);
+      await player.setVolume(action.volume);
       break;
     case "loop":
-      player.setLoop(action.mode);
+      await player.setLoop(action.mode);
       break;
     case "shuffle":
-      player.shuffle();
+      await player.shuffle();
       break;
     case "remove":
-      player.remove(action.index);
+      await player.remove(action.index);
       break;
     case "move":
-      player.move(action.from, action.to);
+      await player.move(action.from, action.to);
       break;
     case "clear":
-      player.clear();
+      await player.clear();
       break;
     case "disconnect":
       await player.disconnect();

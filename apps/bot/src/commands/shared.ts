@@ -9,9 +9,10 @@ import {
   type RepliableInteraction,
   type VoiceBasedChannel,
 } from "discord.js";
-import { errorMessage, PlayerError } from "../errors.js";
+import { PlayerError, userFacingErrorMessage } from "../errors.js";
 import type { GuildPlayer } from "../player/guild-player.js";
 import { getPlayer } from "../player/registry.js";
+import { canUseDjControls, type GuildActor } from "./permissions.js";
 
 export type { RepliableInteraction };
 
@@ -78,7 +79,8 @@ export async function respondInfo(
 }
 
 /**
- * DJ gate: skip / stop / clear / remove / move / seek / shuffle / volume.
+ * DJ gate: skip / stop / clear / remove / move / seek / shuffle / volume,
+ * plus pause / resume / disconnect.
  * A configured role wins; Manage Guild always passes.
  */
 export async function guardDj(
@@ -87,18 +89,24 @@ export async function guardDj(
 ): Promise<boolean> {
   await player.ensureSettings();
   const { djRoleId } = player.getSettings();
-  if (!djRoleId) return true;
 
   const member = await getMember(interaction);
   if (!member) {
     await respondError(interaction, "Only server members can use that.");
     return false;
   }
-  if (member.roles.cache.has(djRoleId)) return true;
-  if (member.permissions.has(PermissionFlagsBits.ManageGuild)) return true;
+  if (canUseDjControls(guildActor(member, djRoleId), djRoleId)) return true;
 
   await respondError(interaction, "You need the DJ role to use this command.");
   return false;
+}
+
+/** Snapshot the Discord member into the boolean shape the predicates use. */
+export function guildActor(member: GuildMember, djRoleId: string | null): GuildActor {
+  return {
+    hasDjRole: djRoleId !== null && member.roles.cache.has(djRoleId),
+    hasManageGuild: member.permissions.has(PermissionFlagsBits.ManageGuild),
+  };
 }
 
 export function parseSeekInput(input: string): number | null {
@@ -117,5 +125,5 @@ export function parseSeekInput(input: string): number | null {
 }
 
 export function commandErrorMessage(error: unknown): string {
-  return errorMessage(error);
+  return userFacingErrorMessage(error);
 }

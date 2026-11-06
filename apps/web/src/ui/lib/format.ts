@@ -77,6 +77,16 @@ export function formatNumber(value: number): string {
   return numberFormatter.format(value);
 }
 
+/**
+ * Authentik subjects are not Discord identities, so they are never shown.
+ * Admins see themselves as "You" and every other admin generically.
+ */
+export function formatActorLabel(actorSub: string, viewerSub: string | null | undefined): string {
+  return viewerSub !== null && viewerSub !== undefined && actorSub === viewerSub
+    ? "You"
+    : "Another admin";
+}
+
 /** Constrains `value` to the inclusive `[min, max]` range. */
 export function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);

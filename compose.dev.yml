@@ -1,3 +1,4 @@
+# LOCAL DEVELOPMENT ONLY — never deploy this file. It enables auth bypass and a placeholder control secret.
 services:
   postgres:
     image: postgres:17-alpine
@@ -5,8 +6,6 @@ services:
       POSTGRES_USER: music
       POSTGRES_PASSWORD: music
       POSTGRES_DB: music
-    ports:
-      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -25,9 +24,9 @@ services:
     environment:
       BOT_CONTROL_HOST: 0.0.0.0
       DATABASE_URL: postgres://music:music@postgres:5432/music
-      BOT_CONTROL_SECRET: dev-only-control-secret-change-me
-    ports:
-      - "3001:3001"
+      # Shared with the web service; supply it in `.env` (compose refuses to
+      # start without it, so this file cannot run with a placeholder secret).
+      BOT_CONTROL_SECRET: ${BOT_CONTROL_SECRET:?set BOT_CONTROL_SECRET in .env}
     volumes:
       - mediadata:/data
     depends_on:
@@ -45,8 +44,9 @@ services:
       NODE_ENV: development
       PUBLIC_BASE_URL: http://localhost:3000
       BOT_INTERNAL_URL: http://bot:3001
-      BOT_CONTROL_SECRET: dev-only-control-secret-change-me
+      BOT_CONTROL_SECRET: ${BOT_CONTROL_SECRET:?set BOT_CONTROL_SECRET in .env}
       DATABASE_URL: postgres://music:music@postgres:5432/music
+      # Dev-only shortcut; production runs Authentik and leaves this unset.
       AUTH_DEV_BYPASS: "true"
       SESSION_COOKIE_SECURE: "false"
     ports:

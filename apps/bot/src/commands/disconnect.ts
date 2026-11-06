@@ -1,5 +1,5 @@
 import { SlashCommandBuilder } from "discord.js";
-import { commandErrorMessage, getPlayerFor, respondError, respondInfo } from "./shared.js";
+import { commandErrorMessage, getPlayerFor, guardDj, respondError, respondInfo } from "./shared.js";
 import type { Command } from "./types.js";
 
 export const disconnectCommand: Command = {
@@ -10,6 +10,7 @@ export const disconnectCommand: Command = {
   async execute(interaction) {
     try {
       const player = await getPlayerFor(interaction);
+      if (!(await guardDj(interaction, player))) return;
       await player.disconnect();
       await respondInfo(interaction, "Disconnected.");
     } catch (error) {

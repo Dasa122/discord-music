@@ -24,7 +24,7 @@ export const moveCommand: Command = {
 
       const from = interaction.options.getInteger("from", true);
       const to = interaction.options.getInteger("to", true);
-      player.move(from - 1, to - 1);
+      await player.move(from - 1, to - 1);
       await respondInfo(interaction, `Moved track ${from} to position ${to}.`);
     } catch (error) {
       await respondError(interaction, commandErrorMessage(error));

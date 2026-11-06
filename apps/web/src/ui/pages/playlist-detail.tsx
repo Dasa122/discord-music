@@ -17,7 +17,7 @@ import { Skeleton } from "../components/skeleton";
 import { useToast } from "../components/toast";
 import { playPlaylistAction } from "../lib/actions";
 import { ApiError, getErrorMessage, type PlaylistItemView } from "../lib/api";
-import { formatDuration, formatRelativeTime } from "../lib/format";
+import { formatActorLabel, formatDuration, formatRelativeTime } from "../lib/format";
 import { withGuild } from "../lib/guild-selection";
 import {
   useGuildAction,
@@ -31,13 +31,13 @@ import { useGuildSelection } from "../lib/use-guild-selection";
 export function PlaylistDetailPage() {
   const params = useParams<{ id: string }>();
   const playlistId = params.id ?? null;
-  const { guildId: selectedGuildId } = useGuildSelection();
-  const playlistQuery = usePlaylist(playlistId);
+  const { guildId: selectedGuildId, isLoading: guildsLoading } = useGuildSelection();
+  const playlistQuery = usePlaylist(playlistId, selectedGuildId);
   const playlist = playlistQuery.data;
   const guildId = playlist?.guildId ?? selectedGuildId;
 
   const removeMutation = useRemovePlaylistItem(playlistId ?? "", guildId);
-  const reorderMutation = useReorderPlaylist(playlistId ?? "");
+  const reorderMutation = useReorderPlaylist(playlistId ?? "", guildId);
   const playerAction = useGuildAction(guildId);
   const meQuery = useMe();
   const me = meQuery.data;
@@ -68,13 +68,31 @@ export function PlaylistDetailPage() {
     );
   }
 
-  if (playlistQuery.isLoading) {
+  if (playlistQuery.isLoading || (selectedGuildId === null && guildsLoading)) {
     return (
       <div className="space-y-4">
         <Skeleton className="h-4 w-24" />
         <Skeleton className="h-8 w-64" />
         <Skeleton className="h-64 w-full rounded-xl" />
       </div>
+    );
+  }
+
+  if (!selectedGuildId && !playlist) {
+    return (
+      <EmptyState
+        icon={<ListIcon className="h-5 w-5" />}
+        title="Select a server"
+        description="Choose a server from the switcher in the sidebar to open its playlists."
+        action={
+          <Link
+            to="/playlists"
+            className="text-sm font-medium text-accent underline-offset-4 hover:underline"
+          >
+            Back to playlists
+          </Link>
+        }
+      />
     );
   }
 
@@ -217,7 +235,7 @@ export function PlaylistDetailPage() {
                     {item.title}
                   </a>
                   <p className="mt-0.5 truncate text-xs text-muted">
-                    Added by {item.addedBy === me?.sub ? "you" : item.addedBy}
+                    Added by {formatActorLabel(item.addedBy, me?.sub)}
                     <span className="sm:hidden"> · {formatDuration(item.durationSec)}</span>
                   </p>
                 </div>
