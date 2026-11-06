@@ -45,6 +45,12 @@ COPY apps/web/package.json ./apps/web/package.json
 COPY apps/web/tsconfig.json ./apps/web/tsconfig.json
 COPY apps/web/src/server ./apps/web/src/server
 
+# The base image ships neither curl nor wget, which Coolify's container
+# healthcheck needs for its HTTP probe. Install curl only.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
 # The runtime only reads from /app and writes nothing to disk (migrations run
 # against Postgres), so the image runs as the `bun` user shipped by the base
 # image instead of root.
