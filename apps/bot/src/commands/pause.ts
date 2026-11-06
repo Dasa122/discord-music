@@ -1,0 +1,17 @@
+import { SlashCommandBuilder } from "discord.js";
+import { commandErrorMessage, getPlayerFor, respondError, respondInfo } from "./shared.js";
+import type { Command } from "./types.js";
+
+export const pauseCommand: Command = {
+  data: new SlashCommandBuilder().setName("pause").setDescription("Pause playback"),
+
+  async execute(interaction) {
+    try {
+      const player = await getPlayerFor(interaction);
+      player.pause();
+      await respondInfo(interaction, "Paused playback.");
+    } catch (error) {
+      await respondError(interaction, commandErrorMessage(error));
+    }
+  },
+};

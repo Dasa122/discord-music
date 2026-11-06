@@ -1,0 +1,27 @@
+{
+  "name": "discord-music",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "trustedDependencies": [
+    "@discordjs/opus",
+    "esbuild"
+  ],
+  "scripts": {
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "typecheck": "bun run --filter '*' typecheck",
+    "build": "bun run --filter @music/shared build && bun run --filter @music/bot build && bun run --filter @music/web build",
+    "test": "bun run --filter '*' test",
+    "dev:web": "bun run --filter @music/web dev",
+    "dev:bot": "bun run --filter @music/bot dev",
+    "db:generate": "bun run --filter @music/shared db:generate",
+    "check:ts": "bun scripts/check-ts-source.ts && bun run typecheck",
+    "check": "bun run check:ts && bun run lint && bun run test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.6"
+  }
+}
