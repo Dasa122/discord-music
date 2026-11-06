@@ -63,6 +63,49 @@ describe("loadConfig session TTL", () => {
   });
 });
 
+describe("loadConfig trims pasted values", () => {
+  test("accepts credentials with trailing CR/LF and surrounding spaces", () => {
+    const config = loadConfig(
+      baseEnv({
+        AUTHENTIK_CLIENT_ID: "  test-client-id\n",
+        AUTHENTIK_CLIENT_SECRET: "test-client-secret\r\n",
+        AUTHENTIK_REDIRECT_URI: " https://music.example.test/api/auth/callback \n",
+        DATABASE_URL: " postgres://postgres:postgres@127.0.0.1:5432/music_test\n",
+        BOT_CONTROL_SECRET: " test-control-secret-0123456789\n",
+      }),
+    );
+
+    expect(config.authentikClientId).toBe("test-client-id");
+    expect(config.authentikClientSecret).toBe("test-client-secret");
+    expect(config.authentikRedirectUri).toBe("https://music.example.test/api/auth/callback");
+    expect(config.databaseUrl).toBe("postgres://postgres:postgres@127.0.0.1:5432/music_test");
+    expect(config.botControlSecret).toBe("test-control-secret-0123456789");
+  });
+
+  test("preserves a meaningful trailing slash on the issuer while trimming whitespace", () => {
+    const withSlash = loadConfig(
+      baseEnv({ AUTHENTIK_ISSUER: " https://auth.example.test/application/o/music/\n" }),
+    );
+    expect(withSlash.authentikIssuer).toBe("https://auth.example.test/application/o/music/");
+
+    const withoutSlash = loadConfig(
+      baseEnv({ AUTHENTIK_ISSUER: "https://auth.example.test/application/o/music\r\n" }),
+    );
+    expect(withoutSlash.authentikIssuer).toBe("https://auth.example.test/application/o/music");
+  });
+
+  test("trims and strips one trailing slash from public base URLs", () => {
+    const config = loadConfig(
+      baseEnv({
+        PUBLIC_BASE_URL: " https://music.example.test/ \n",
+        BOT_INTERNAL_URL: " http://127.0.0.1:3001/\n",
+      }),
+    );
+    expect(config.publicBaseUrl).toBe("https://music.example.test");
+    expect(config.botInternalUrl).toBe("http://127.0.0.1:3001");
+  });
+});
+
 describe("loadConfig cookie hardening", () => {
   test("refuses an insecure cookie in production", () => {
     expect(() =>

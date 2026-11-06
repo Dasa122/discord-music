@@ -4,6 +4,7 @@ import { deleteCookie, setCookie } from "hono/cookie";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { z } from "zod";
 import { config } from "../config.js";
+import { logger } from "../logger.js";
 
 /**
  * Minimal OpenID Connect authorization-code client with PKCE (S256).
@@ -20,6 +21,10 @@ const OAUTH_COOKIE_MAX_AGE_SECONDS = 600;
 const DISCOVERY_TTL_MS = 5 * 60_000;
 const HTTP_TIMEOUT_MS = 10_000;
 const DEFAULT_SCOPE = "openid profile email";
+/** Provider error bodies are diagnostics only: cap the bytes we read. */
+const MAX_ERROR_BODY_BYTES = 4 * 1024;
+const MAX_ERROR_CODE_LENGTH = 64;
+const MAX_ERROR_DESCRIPTION_LENGTH = 200;
 
 export class AuthError extends Error {
   readonly code: string;
@@ -31,6 +36,79 @@ export class AuthError extends Error {
     this.code = code;
     this.status = status;
   }
+}
+
+export type TokenErrorDiagnostics = {
+  error?: string;
+  errorDescription?: string;
+};
+
+function sanitizeProviderText(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const cleaned = Array.from(value)
+    .map((char) => {
+      const code = char.codePointAt(0) ?? 0;
+      return code < 0x20 || code === 0x7f ? " " : char;
+    })
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (cleaned === "") return undefined;
+  return cleaned.slice(0, maxLength);
+}
+
+/**
+ * Extract only the OAuth `error`/`error_description` pair from a provider
+ * response. Tokens and every other field are ignored, so they can never be
+ * retained or logged.
+ */
+export function parseTokenErrorBody(text: string): TokenErrorDiagnostics {
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return {};
+  }
+  if (typeof body !== "object" || body === null) return {};
+
+  const record = body as Record<string, unknown>;
+  const diagnostics: TokenErrorDiagnostics = {};
+  const error = sanitizeProviderText(record.error, MAX_ERROR_CODE_LENGTH);
+  const errorDescription = sanitizeProviderText(
+    record.error_description,
+    MAX_ERROR_DESCRIPTION_LENGTH,
+  );
+  if (error !== undefined) diagnostics.error = error;
+  if (errorDescription !== undefined) diagnostics.errorDescription = errorDescription;
+  return diagnostics;
+}
+
+/** Read at most `limit` bytes from a response body, then stop. */
+async function readLimitedText(response: Response, limit: number): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      const slice = value.subarray(0, limit - total);
+      chunks.push(slice);
+      total += slice.byteLength;
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
 }
 
 const discoverySchema = z.object({
@@ -68,9 +146,15 @@ async function fetchDiscovery(): Promise<OidcDiscovery> {
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     });
   } catch {
+    logger.warn({ event: "oidc_discovery_failed", code: "DISCOVERY_UNAVAILABLE" });
     throw new AuthError("DISCOVERY_UNAVAILABLE", "The identity provider could not be reached", 502);
   }
   if (!response.ok) {
+    logger.warn({
+      event: "oidc_discovery_failed",
+      code: "DISCOVERY_FAILED",
+      status: response.status,
+    });
     throw new AuthError(
       "DISCOVERY_FAILED",
       "The identity provider discovery document is unavailable",
@@ -81,6 +165,7 @@ async function fetchDiscovery(): Promise<OidcDiscovery> {
   const body: unknown = await response.json().catch(() => null);
   const parsed = discoverySchema.safeParse(body);
   if (!parsed.success) {
+    logger.warn({ event: "oidc_discovery_failed", code: "DISCOVERY_INVALID" });
     throw new AuthError(
       "DISCOVERY_INVALID",
       "The identity provider discovery document is invalid",
@@ -173,6 +258,7 @@ export function stateMatches(actual: string, expected: string): boolean {
 
 export function assertNonceMatch(actual: unknown, expected: string): void {
   if (typeof actual !== "string" || !constantTimeEquals(actual, expected)) {
+    logger.warn({ event: "oidc_nonce_mismatch", code: "INVALID_NONCE" });
     throw new AuthError("INVALID_NONCE", "Sign-in verification failed", 400);
   }
 }
@@ -261,6 +347,7 @@ async function verifyIdToken(
     });
     claims = verified.payload as Record<string, unknown>;
   } catch {
+    logger.warn({ event: "oidc_id_token_invalid", code: "INVALID_ID_TOKEN", stage: "verify" });
     throw new AuthError("INVALID_ID_TOKEN", "The identity provider returned an invalid token", 401);
   }
 
@@ -268,6 +355,7 @@ async function verifyIdToken(
 
   const sub = claims.sub;
   if (typeof sub !== "string" || sub === "") {
+    logger.warn({ event: "oidc_id_token_invalid", code: "INVALID_ID_TOKEN", stage: "subject" });
     throw new AuthError("INVALID_ID_TOKEN", "The identity provider returned an invalid token", 401);
   }
 
@@ -298,6 +386,7 @@ export function requireIdToken(tokenResponse: unknown): string {
       : null;
   const idToken = record?.id_token;
   if (typeof idToken !== "string" || idToken === "") {
+    logger.warn({ event: "oidc_missing_id_token", code: "MISSING_ID_TOKEN" });
     throw new AuthError(
       "MISSING_ID_TOKEN",
       "The identity provider did not return an ID token",
@@ -339,10 +428,22 @@ export async function exchangeCode(
   }
 
   if (!response.ok) {
-    // The body may contain tokens or provider internals: never read or log it.
+    // Only the provider's OAuth error code/description leave this block; tokens
+    // and every other field are never read into memory or logged.
+    const diagnostics = parseTokenErrorBody(
+      await readLimitedText(response, MAX_ERROR_BODY_BYTES).catch(() => ""),
+    );
+    logger.warn({
+      event: "oidc_token_exchange_failed",
+      status: response.status,
+      error: diagnostics.error,
+      errorDescription: diagnostics.errorDescription,
+    });
     throw new AuthError(
       "TOKEN_EXCHANGE_FAILED",
-      "Authentication with the identity provider failed",
+      diagnostics.error
+        ? `Authentication with the identity provider failed (${diagnostics.error})`
+        : "Authentication with the identity provider failed",
       502,
     );
   }

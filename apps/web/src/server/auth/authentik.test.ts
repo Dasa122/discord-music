@@ -9,6 +9,8 @@ const {
   buildAuthorizeUrlFrom,
   createPkcePair,
   discoveryUrl,
+  exchangeCode,
+  parseTokenErrorBody,
   pkceChallenge,
   randomToken,
   requireIdToken,
@@ -123,5 +125,133 @@ describe("requireIdToken", () => {
         expect((error as InstanceType<typeof AuthError>).code).toBe("MISSING_ID_TOKEN");
       }
     }
+  });
+});
+
+describe("parseTokenErrorBody", () => {
+  test("extracts only the provider error code and description", () => {
+    expect(
+      parseTokenErrorBody(
+        JSON.stringify({
+          error: "invalid_client",
+          error_description: "Client authentication failed.",
+        }),
+      ),
+    ).toEqual({
+      error: "invalid_client",
+      errorDescription: "Client authentication failed.",
+    });
+  });
+
+  test("truncates and strips CR/LF and control characters", () => {
+    const diagnostics = parseTokenErrorBody(
+      JSON.stringify({
+        error: `invalid_client\r\n\u0000${"e".repeat(200)}`,
+        error_description: `line one\r\nline two\u0007${"d".repeat(300)}`,
+      }),
+    );
+
+    expect(diagnostics.error).toHaveLength(64);
+    expect(diagnostics.error?.startsWith("invalid_client e")).toBe(true);
+    expect(diagnostics.errorDescription).toHaveLength(200);
+    expect(diagnostics.errorDescription?.startsWith("line one line two d")).toBe(true);
+    for (const value of [diagnostics.error, diagnostics.errorDescription]) {
+      for (const char of value ?? "") {
+        const code = char.codePointAt(0) ?? 0;
+        expect(code < 0x20 || code === 0x7f).toBe(false);
+      }
+    }
+  });
+
+  test("never surfaces tokens or other response fields", () => {
+    const diagnostics = parseTokenErrorBody(
+      JSON.stringify({
+        error: "invalid_grant",
+        error_description: "The authorization code expired.",
+        access_token: "access-token-must-not-leak",
+        refresh_token: "refresh-token-must-not-leak",
+        id_token: "id-token-must-not-leak",
+        session_state: "session-must-not-leak",
+      }),
+    );
+
+    expect(Object.keys(diagnostics).sort()).toEqual(["error", "errorDescription"]);
+    expect(JSON.stringify(diagnostics)).not.toContain("must-not-leak");
+  });
+
+  test("returns no diagnostics for non-JSON bodies", () => {
+    expect(parseTokenErrorBody("<html>bad gateway</html>")).toEqual({});
+    expect(parseTokenErrorBody("invalid_grant")).toEqual({});
+    expect(parseTokenErrorBody("")).toEqual({});
+    expect(parseTokenErrorBody("null")).toEqual({});
+  });
+});
+
+describe("exchangeCode token failures", () => {
+  const discoveryUrlForTest = discoveryUrl(DISCOVERY.issuer);
+
+  async function withTokenResponse(
+    tokenResponse: () => Response,
+    run: () => Promise<unknown>,
+  ): Promise<unknown> {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url === discoveryUrlForTest) {
+        return new Response(JSON.stringify(DISCOVERY), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return tokenResponse();
+    }) as typeof fetch;
+
+    try {
+      return await run();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
+  async function caught(run: () => Promise<unknown>): Promise<InstanceType<typeof AuthError>> {
+    try {
+      await run();
+    } catch (error) {
+      expect(error).toBeInstanceOf(AuthError);
+      return error as InstanceType<typeof AuthError>;
+    }
+    throw new Error("expected exchangeCode to throw");
+  }
+
+  test("includes the provider error code in a typed TOKEN_EXCHANGE_FAILED error", async () => {
+    const error = await caught(() =>
+      withTokenResponse(
+        () =>
+          new Response(JSON.stringify({ error: "invalid_grant", error_description: "expired" }), {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          }),
+        () => exchangeCode("code", "verifier", "nonce"),
+      ),
+    );
+
+    expect(error.code).toBe("TOKEN_EXCHANGE_FAILED");
+    expect(error.status).toBe(502);
+    expect(error.message).toBe("Authentication with the identity provider failed (invalid_grant)");
+    expect(error.message).not.toContain("expired");
+  });
+
+  test("non-JSON error bodies still raise TOKEN_EXCHANGE_FAILED without a code", async () => {
+    const error = await caught(() =>
+      withTokenResponse(
+        () => new Response("upstream said no", { status: 503 }),
+        () => exchangeCode("code", "verifier", "nonce"),
+      ),
+    );
+
+    expect(error.code).toBe("TOKEN_EXCHANGE_FAILED");
+    expect(error.status).toBe(502);
+    expect(error.message).toBe("Authentication with the identity provider failed");
   });
 });

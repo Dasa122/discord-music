@@ -1,18 +1,32 @@
 import { z } from "zod";
 import { parseAllowedGuildIds } from "./guild-allowlist.js";
 
-const blankToUndefined = (value: unknown): unknown =>
-  typeof value === "string" && value.trim() === "" ? undefined : value;
+/**
+ * Pasted values routinely carry a trailing newline or surrounding quotes; both
+ * break Discord's auth and the database URL. Normalise before validation.
+ */
+const normalizeEnvValue = (value: unknown): unknown => {
+  if (typeof value !== "string") return value;
+  let normalized = value.trim();
+  if (
+    normalized.length >= 2 &&
+    ((normalized.startsWith('"') && normalized.endsWith('"')) ||
+      (normalized.startsWith("'") && normalized.endsWith("'")))
+  ) {
+    normalized = normalized.slice(1, -1).trim();
+  }
+  return normalized === "" ? undefined : normalized;
+};
 
 const envSchema = z.object({
-  DISCORD_TOKEN: z.string().min(1),
-  DISCORD_CLIENT_ID: z.string().min(1),
-  DISCORD_GUILD_ID: z.string().min(1).optional(),
+  DISCORD_TOKEN: z.string().trim().min(1),
+  DISCORD_CLIENT_ID: z.string().trim().min(1),
+  DISCORD_GUILD_ID: z.string().trim().min(1).optional(),
   /** Optional comma-separated allow-list; empty means every guild. */
   DISCORD_ALLOWED_GUILD_IDS: z.string().optional(),
   BOT_CONTROL_PORT: z.coerce.number().int().min(1).max(65_535).default(3001),
   BOT_CONTROL_HOST: z.string().min(1).default("127.0.0.1"),
-  BOT_CONTROL_SECRET: z.string().min(16),
+  BOT_CONTROL_SECRET: z.string().trim().min(16),
   MAX_CONCURRENT_STREAMS: z.coerce.number().int().min(1).max(100).default(3),
   IDLE_TIMEOUT_SECONDS: z.coerce.number().int().min(0).max(86_400).default(300),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
@@ -22,7 +36,7 @@ const envSchema = z.object({
   YTDLP_COOKIES_FILE: z.string().min(1).optional(),
   YTDLP_PROXY: z.url().optional(),
   POT_PROVIDER_URL: z.url().optional(),
-  DATABASE_URL: z.string().min(1),
+  DATABASE_URL: z.string().trim().min(1),
 });
 
 const REQUIRED_KEYS = [
@@ -58,7 +72,7 @@ export interface AppConfig {
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const normalized = Object.fromEntries(
-    Object.entries(env).map(([key, value]) => [key, blankToUndefined(value)]),
+    Object.entries(env).map(([key, value]) => [key, normalizeEnvValue(value)]),
   );
 
   const missing = REQUIRED_KEYS.filter((key) => normalized[key] === undefined);
