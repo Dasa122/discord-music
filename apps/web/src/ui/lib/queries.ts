@@ -1,13 +1,25 @@
 import type { GuildSettingsUpdate } from "@music/shared";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type GuildActionBody, queryKeys } from "./api";
+import { ApiError, api, type GuildActionBody, type Me, queryKeys } from "./api";
 
+/**
+ * Session identity. A 401 is a normal "signed out" answer (`null`), not an
+ * error, so the gate can route to the landing page instead of an error state.
+ */
 export function useMe() {
   return useQuery({
     queryKey: queryKeys.me(),
-    queryFn: api.me,
+    queryFn: async (): Promise<Me | null> => {
+      try {
+        return await api.me();
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 401) {
+          return null;
+        }
+        throw error;
+      }
+    },
     staleTime: 60_000,
-    retry: 1,
   });
 }
 
@@ -176,7 +188,7 @@ export function useLogout() {
     mutationFn: api.logout,
     onSuccess: () => {
       queryClient.clear();
-      window.location.assign("/login");
+      window.location.assign("/");
     },
   });
 }

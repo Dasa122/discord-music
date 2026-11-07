@@ -67,7 +67,7 @@ function errorPage(
   <body style="font-family: system-ui, sans-serif; margin: 3rem auto; max-width: 32rem; line-height: 1.5;">
     <h1>${escapeHtml(title)}</h1>
     <p>${escapeHtml(detail)}</p>
-    <p><a href="/">Return to the dashboard</a></p>
+    <p><a href="/">Return to the home page</a></p>
   </body>
 </html>`;
   return c.html(html, status);
@@ -77,11 +77,11 @@ authRoutes.get("/login", async (c) => {
   if (config.authDevBypass) {
     // Reuse a valid session instead of inserting a second row on every visit.
     const existing = await getSession(c);
-    if (existing) return c.redirect("/", 302);
+    if (existing) return c.redirect("/dashboard", 302);
 
     const id = await replaceSession(c, DEV_USER);
     setSessionCookie(c, id);
-    return c.redirect("/", 302);
+    return c.redirect("/dashboard", 302);
   }
 
   let request: Awaited<ReturnType<typeof buildAuthorizeUrl>>;
@@ -168,7 +168,7 @@ authRoutes.get("/callback", async (c) => {
 
   const id = await replaceSession(c, user);
   setSessionCookie(c, id);
-  return c.redirect("/", 302);
+  return c.redirect("/dashboard", 302);
 });
 
 authRoutes.post("/logout", async (c) => {
