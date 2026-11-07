@@ -15,6 +15,11 @@ jobs:
   gitleaks:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
+    # gitleaks-action lists the PR's commits to diff the range, which needs
+    # pull-requests: read on top of the workflow-level contents: read.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,9 +38,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # trivy-action@master currently delegates to aquasecurity/setup-trivy,
+      # whose default path (`$HOME/.local/bin`) trips its own literal-path
+      # validation. Install the same pinned Trivy version ourselves and skip
+      # the broken setup step.
+      - name: Install Trivy
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/trivy.tar.gz" \
+            https://github.com/aquasecurity/trivy/releases/download/v0.76.2/trivy_0.76.2_Linux-64bit.tar.gz
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP/bin" trivy
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
       - name: Scan filesystem
         uses: aquasecurity/trivy-action@master
         with:
+          skip-setup-trivy: true
           scan-type: fs
           scanners: vuln,secret,config
           severity: HIGH,CRITICAL

@@ -23,10 +23,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # --error makes the scan itself the gate. Rulesets come from Semgrep's
-      # public registry, so no token is needed.
+      # --error makes the scan itself the gate. --severity ERROR keeps the gate
+      # on real errors: p/ci's mutable-action-tag rule is WARNING severity and
+      # would otherwise permanently fail because the action tags here (v4/v2/v3)
+      # are immutable-by-convention but not pinned to commit SHAs. Rulesets come
+      # from Semgrep's public registry, so no token is needed.
       - name: Scan with p/ci and p/secrets
-        run: semgrep scan --config p/ci --config p/secrets --error --sarif --output semgrep.sarif
+        run: >-
+          semgrep scan --config p/ci --config p/secrets
+          --severity ERROR --error --sarif --output semgrep.sarif
 
       # SARIF upload requires GitHub Advanced Security, which this private repo
       # does not have; `continue-on-error` keeps the upload from failing the
