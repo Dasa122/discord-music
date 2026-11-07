@@ -65,15 +65,28 @@ export function decodeHtmlEntities(value: string): string {
 
 /** Drop `<script>` bodies before parsing: they hold a Next.js blob of JSON. */
 export function stripScriptBlocks(html: string): string {
-  // `</script` may be followed by whitespace, `/` or `>`, and nested constructs
-  // can leave a new `<script>` behind, so strip repeatedly until stable.
-  const block = /<script\b[^>]*>[\s\S]*?<\/script\b[^>]*>/gi;
-  const selfClosing = /<script\b[^>]*\/>/gi;
-  let current = html;
+  // A scanner instead of a regex `replace`: `</script foo>` and nested
+  // constructs cannot leave a new opening tag behind, and there is no
+  // multi-character replacement for a nested payload to slip through.
+  const lower = html.toLowerCase();
+  let kept = "";
+  let cursor = 0;
   for (;;) {
-    const next = current.replace(block, "").replace(selfClosing, "");
-    if (next === current) return next;
-    current = next;
+    const open = lower.indexOf("<script", cursor);
+    if (open === -1) return kept + html.slice(cursor);
+    const openEnd = html.indexOf(">", open);
+    if (openEnd === -1) return kept;
+    kept += html.slice(cursor, open);
+    // A self-closing `<script … />` has no body to drop.
+    if (html[openEnd - 1] === "/") {
+      cursor = openEnd + 1;
+      continue;
+    }
+    const close = lower.indexOf("</script", openEnd + 1);
+    if (close === -1) return kept;
+    const closeEnd = html.indexOf(">", close);
+    if (closeEnd === -1) return kept;
+    cursor = closeEnd + 1;
   }
 }
 

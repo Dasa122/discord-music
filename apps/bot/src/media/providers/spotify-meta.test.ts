@@ -145,6 +145,7 @@ describe("html sanitising", () => {
     expect(stripScriptBlocks("<scr<script>ipt>alert(1)</script>").toLowerCase()).not.toContain(
       "<script",
     );
+    expect(stripScriptBlocks("<script>unterminated")).toBe("");
   });
 
   test("caps the body at 512 KB", () => {
