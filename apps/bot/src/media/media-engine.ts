@@ -8,14 +8,29 @@ import {
   computeGainDb,
   DEFAULT_LOUDNESS_SETTINGS,
   DEFAULT_MAX_GAIN_DB,
+  DEFAULT_STREAM_FILTER,
   type LoudnessMeasurement,
   type LoudnessSettings,
+  type PlaybackAudioConfig,
+  type StreamFilterMode,
   selectPlaybackFilter,
   toPcm,
   toPcmFromFile,
+  toPcmFromUrl,
 } from "./ffmpeg.js";
 import { QueuedSemaphore } from "./limits.js";
+import {
+  buildTrackSearchQuery,
+  DEFAULT_MUSIC_LINK_MAX_TRACKS,
+  type DetectedMusicLink,
+  MusicLinkError,
+  type MusicLinkResolution,
+  type ProviderTrack,
+  providerArtist,
+} from "./providers/index.js";
 import { type CachedResolution, ResolveCache } from "./resolve-cache.js";
+import type { TrackResolver } from "./resolver/types.js";
+import { createYtdlpResolver } from "./resolver/ytdlp-resolver.js";
 import {
   downloadAudio,
   openAudioStream,
@@ -41,6 +56,29 @@ export const DEFAULT_PREBUFFER_TIMEOUT_MS = 15_000;
 
 /** A stream prebuffer that produces nothing within this multiple falls back to piping. */
 export const STREAM_PREBUFFER_TIMEOUT_FACTOR = 4;
+
+/** A direct-URL ffmpeg exit inside this window is treated as a stale URL. */
+export const STREAM_URL_FAST_FAIL_MS = 5_000;
+
+/** One queued stream URL per resolved track; the oldest is evicted past this. */
+export const MAX_PENDING_STREAMS = 64;
+
+/**
+ * Is a failed direct-URL attempt worth one re-resolve? An explicit 403/410 from
+ * googlevideo means the signed URL expired or was minted for another client;
+ * any other fast non-zero exit (bad manifest, rejected UA) may also be cured by
+ * a fresh URL. Anything slower is a network problem and belongs on yt-dlp.
+ */
+export function isRetryableStreamUrlFailure(message: string, elapsedMs: number): boolean {
+  if (/\b(403|410)\b/.test(message)) return true;
+  return elapsedMs < STREAM_URL_FAST_FAIL_MS && /ffmpeg exited with code/i.test(message);
+}
+
+/** A signed media URL handed from `resolve()` to the play that follows it. */
+interface PendingStream {
+  url: string;
+  headers?: Record<string, string>;
+}
 
 export interface MediaTrack {
   id?: string;
@@ -89,7 +127,17 @@ export interface MediaEngineDeps {
   resolveSearch: typeof resolveSearch;
   toPcm: typeof toPcm;
   toPcmFromFile: typeof toPcmFromFile;
+  toPcmFromUrl: typeof toPcmFromUrl;
   analyzeLoudness: typeof analyzeLoudness;
+}
+
+/**
+ * The music-link seam: `MusicLinkResolver` implements it, and tests can supply
+ * one without a network.
+ */
+export interface MusicLinkSource {
+  parse(query: string): DetectedMusicLink | null;
+  resolve(query: string, maxTracks?: number): Promise<MusicLinkResolution>;
 }
 
 /** Exact gain measured for one cached track. */
@@ -103,6 +151,11 @@ export interface YtdlpMediaEngineOptions {
   ffmpegPath: string;
   /** Applied to every decoded track on both the stream and cached-file paths. */
   normalization?: LoudnessSettings;
+  /**
+   * Filter for the streamed first play (default `limiter`). A cached track
+   * with a measurement always overrides this with its exact gain.
+   */
+  streamFilter?: StreamFilterMode;
   /** Measure cached tracks once so replays use an exact gain (default on). */
   twoPass?: boolean;
   /** Symmetric bound on the measured gain, in dB. */
@@ -117,7 +170,31 @@ export interface YtdlpMediaEngineOptions {
   prebufferTimeoutMs?: number;
   /** Shared across engines; injectable so a test can use a controlled clock. */
   resolveCache?: ResolveCache;
+  /**
+   * Where resolved metadata comes from. Defaults to the yt-dlp wrapper, so the
+   * pre-P2 behaviour is unchanged when RESOLVER is unset.
+   */
+  resolver?: TrackResolver;
+  /** Spotify/Apple Music link resolution; disabled when omitted. */
+  musicLinks?: MusicLinkSource;
+  /** Cap applied to a provider collection (MUSIC_LINK_MAX_TRACKS). */
+  musicLinkMaxTracks?: number;
   deps?: Partial<MediaEngineDeps>;
+}
+
+/** Wait for ffmpeg's exit report, but never block a failure path on it. */
+const EXIT_WAIT_MS = 2_000;
+
+function raceExit(
+  exit: Promise<{ code: number | null; stderr: string }>,
+): Promise<{ code: number | null; stderr: string } | null> {
+  return Promise.race([
+    exit,
+    new Promise<null>((resolvePromise) => {
+      const timer = setTimeout(() => resolvePromise(null), EXIT_WAIT_MS);
+      timer.unref?.();
+    }),
+  ]);
 }
 
 function readFirstChunks(
@@ -191,6 +268,12 @@ function readFirstChunks(
   });
 }
 
+/** "Spotify playlist" / "Apple Music album" when the API exposed no name. */
+function collectionFallbackTitle(resolution: MusicLinkResolution): string {
+  const label = resolution.provider === "spotify" ? "Spotify" : "Apple Music";
+  return `${label} ${resolution.kind}`;
+}
+
 /**
  * Rebuild a playable `ResolvedTrack` from cached metadata. Only the canonical
  * video id is cached, so the page URL is derived here instead of a signed
@@ -203,6 +286,7 @@ function materializeResolvedTrack(entry: CachedResolution, fallbackUrl: string):
   const track: ResolvedTrack = {
     videoId: entry.videoId,
     title: entry.title,
+    artist: entry.artist ?? null,
     webpageUrl,
     durationSec: entry.durationSec,
     thumbnailUrl: entry.thumbnailUrl,
@@ -218,6 +302,7 @@ export class YtdlpMediaEngine implements MediaEngine {
   private readonly ytdlpOptions: YtdlpOptions;
   private readonly ffmpegPath: string;
   private readonly normalization: LoudnessSettings | undefined;
+  private readonly streamFilter: StreamFilterMode;
   private readonly twoPass: boolean;
   private readonly maxGainDb: number;
   private readonly cache: AudioCache | null;
@@ -228,6 +313,9 @@ export class YtdlpMediaEngine implements MediaEngine {
   private readonly streamPrebufferMs: number;
   private readonly prebufferTimeoutMs: number;
   private readonly resolveCache: ResolveCache;
+  private readonly resolver: TrackResolver;
+  private readonly musicLinks: MusicLinkSource | null;
+  private readonly musicLinkMaxTracks: number;
   private readonly deps: MediaEngineDeps;
 
   private readonly preparing = new Map<string, Promise<void>>();
@@ -236,11 +324,18 @@ export class YtdlpMediaEngine implements MediaEngine {
   private readonly measurementByKey = new Map<string, TrackMeasurement>();
   private readonly prefetching = new Map<string, Promise<void>>();
   private readonly prefetchAborts = new Map<string, AbortController>();
+  /**
+   * Signed stream URLs keyed by track id, written by `resolve()` and consumed
+   * by exactly one `open()`. Never persisted, never sent to the client: a
+   * googlevideo URL is IP/UA-bound and expires.
+   */
+  private readonly pendingStreams = new Map<string, PendingStream>();
 
   constructor(options: YtdlpMediaEngineOptions) {
     this.ytdlpOptions = options.ytdlp;
     this.ffmpegPath = options.ffmpegPath;
     this.normalization = options.normalization;
+    this.streamFilter = options.streamFilter ?? DEFAULT_STREAM_FILTER;
     this.twoPass = options.twoPass ?? true;
     this.maxGainDb = options.maxGainDb ?? DEFAULT_MAX_GAIN_DB;
     this.cache = options.cache ?? null;
@@ -254,6 +349,11 @@ export class YtdlpMediaEngine implements MediaEngine {
     this.streamPrebufferMs = options.streamPrebufferMs ?? DEFAULT_STREAM_PREBUFFER_MS;
     this.prebufferTimeoutMs = options.prebufferTimeoutMs ?? DEFAULT_PREBUFFER_TIMEOUT_MS;
     this.resolveCache = options.resolveCache ?? new ResolveCache();
+    this.musicLinks = options.musicLinks ?? null;
+    this.musicLinkMaxTracks = Math.max(
+      1,
+      Math.min(100, options.musicLinkMaxTracks ?? DEFAULT_MUSIC_LINK_MAX_TRACKS),
+    );
     this.deps = {
       downloadAudio,
       openAudioStream,
@@ -261,9 +361,17 @@ export class YtdlpMediaEngine implements MediaEngine {
       resolveSearch,
       toPcm,
       toPcmFromFile,
+      toPcmFromUrl,
       analyzeLoudness,
       ...options.deps,
     };
+    this.resolver =
+      options.resolver ??
+      createYtdlpResolver({
+        options: this.ytdlpOptions,
+        resolve: this.deps.resolve,
+        resolveSearch: this.deps.resolveSearch,
+      });
   }
 
   async resolve(query: string, sessionId?: string): Promise<ResolvedTrack> {
@@ -281,14 +389,157 @@ export class YtdlpMediaEngine implements MediaEngine {
     }
 
     logger.debug("resolve_source", { source: "extractor" });
-    const resolved = await this.deps.resolve(query, this.ytdlpOptions);
+
+    // A Spotify/Apple Music link is resolved here, before the URL guard (which
+    // only admits media hosts) and before any yt-dlp call.
+    const musicLink = this.musicLinks?.parse(query) ?? null;
+    if (musicLink) return await this.resolveMusicLink(query, musicLink);
+
+    const resolved = await this.resolver.resolve(query, { sessionId });
     // Failures are never cached: a transient extractor error must not stick.
     this.resolveCache.set(query, resolved);
+    this.rememberStream(resolved);
     return resolved;
   }
 
-  resolveSearch(query: string, limit: number): Promise<ResolvedTrack[]> {
-    return this.deps.resolveSearch(query, limit, this.ytdlpOptions);
+  /**
+   * Map a provider link to playable YouTube tracks. Each source track either
+   * already carries a YouTube id (song.link fast path) or costs exactly one
+   * search; the queue keeps the source title/artist/thumbnail either way.
+   */
+  private async resolveMusicLink(
+    query: string,
+    detected: DetectedMusicLink,
+  ): Promise<ResolvedTrack> {
+    const musicLinks = this.musicLinks;
+    if (!musicLinks) throw new MediaError("EXTRACTOR_FAILED", "Music links are not configured.");
+
+    const startedAt = Date.now();
+    let resolution: MusicLinkResolution;
+    try {
+      resolution = await musicLinks.resolve(query, this.musicLinkMaxTracks);
+    } catch (error) {
+      const message =
+        error instanceof MusicLinkError
+          ? error.message
+          : error instanceof Error && error.message
+            ? error.message
+            : "Could not resolve that music link.";
+      logger.warn("provider_resolve_failed", {
+        provider: detected.provider,
+        kind: detected.kind,
+        error: message,
+      });
+      throw new MediaError("EXTRACTOR_FAILED", message);
+    }
+
+    const searchStartedAt = Date.now();
+    const settled = await Promise.allSettled(
+      resolution.tracks
+        .slice(0, this.musicLinkMaxTracks)
+        .map((track) => this.resolveProviderTrack(track)),
+    );
+    const searchMs = Date.now() - searchStartedAt;
+
+    const entries: ResolvedTrack[] = [];
+    for (const result of settled) {
+      if (result.status === "fulfilled") entries.push(result.value);
+    }
+    const failed = settled.length - entries.length;
+    if (failed > 0) {
+      logger.debug("provider_track_skipped", {
+        provider: resolution.provider,
+        count: failed,
+      });
+    }
+    if (entries.length === 0) {
+      throw new MediaError("NOT_FOUND", "No YouTube matches were found for that link.");
+    }
+
+    const single = resolution.kind === "track" && entries.length === 1;
+    const resolved: ResolvedTrack = single
+      ? (entries[0] as ResolvedTrack)
+      : {
+          videoId: null,
+          title: resolution.title ?? collectionFallbackTitle(resolution),
+          webpageUrl: query.trim(),
+          durationSec: null,
+          thumbnailUrl: null,
+          isPlaylist: true,
+          entries,
+        };
+
+    this.resolveCache.set(query, resolved);
+    this.rememberStream(resolved);
+    logger.debug("provider_resolved", {
+      provider: resolution.provider,
+      kind: resolution.kind,
+      tracks: entries.length,
+      searchMs,
+      totalMs: Date.now() - startedAt,
+    });
+    return resolved;
+  }
+
+  private async resolveProviderTrack(track: ProviderTrack): Promise<ResolvedTrack> {
+    const artist = providerArtist(track);
+    if (track.youtubeVideoId) {
+      return {
+        videoId: track.youtubeVideoId,
+        title: track.title,
+        artist,
+        webpageUrl: `https://www.youtube.com/watch?v=${track.youtubeVideoId}`,
+        durationSec: track.durationSec,
+        thumbnailUrl: track.thumbnailUrl,
+        isPlaylist: false,
+      };
+    }
+
+    const hits = await this.resolver.resolveSearch(buildTrackSearchQuery(track), 1);
+    const hit = hits[0];
+    const videoId = hit?.videoId ?? (hit ? youtubeVideoIdFromUrl(hit.webpageUrl) : null);
+    if (!hit || !videoId) {
+      throw new MediaError("NOT_FOUND", `No YouTube match found for "${track.title}".`);
+    }
+    return {
+      videoId,
+      title: track.title,
+      artist,
+      webpageUrl: hit.webpageUrl || `https://www.youtube.com/watch?v=${videoId}`,
+      durationSec: track.durationSec ?? hit.durationSec,
+      thumbnailUrl: track.thumbnailUrl ?? hit.thumbnailUrl,
+      isPlaylist: false,
+    };
+  }
+
+  async resolveSearch(query: string, limit: number): Promise<ResolvedTrack[]> {
+    const results = await this.resolver.resolveSearch(query, limit);
+    for (const result of results) this.rememberStream(result);
+    return results;
+  }
+
+  private rememberStream(track: ResolvedTrack): void {
+    if (track.streamUrl) {
+      const key = track.videoId ?? track.webpageUrl;
+      if (!this.pendingStreams.has(key) && this.pendingStreams.size >= MAX_PENDING_STREAMS) {
+        const oldest = this.pendingStreams.keys().next();
+        if (!oldest.done) this.pendingStreams.delete(oldest.value);
+      }
+      this.pendingStreams.set(key, {
+        url: track.streamUrl,
+        ...(track.headers ? { headers: track.headers } : {}),
+      });
+    }
+    for (const entry of track.entries ?? []) this.rememberStream(entry);
+  }
+
+  /** The one-shot hand-off for this play; a second play re-resolves. */
+  private takeStream(track: MediaTrack): PendingStream | null {
+    const key = this.trackId(track);
+    const pending = this.pendingStreams.get(key);
+    if (!pending) return null;
+    this.pendingStreams.delete(key);
+    return pending;
   }
 
   /**
@@ -567,10 +818,21 @@ export class YtdlpMediaEngine implements MediaEngine {
     await this.cache?.releaseSession(sessionId);
   }
 
+  /** Loudness settings plus the stream mode, as the filter builder expects. */
+  private playbackConfig(): PlaybackAudioConfig {
+    return {
+      ...(this.normalization ?? DEFAULT_LOUDNESS_SETTINGS),
+      streamFilter: this.streamFilter,
+    };
+  }
+
   async open(track: MediaTrack, options: OpenTrackOptions = {}): Promise<OpenedStream> {
     const startSec = options.startSec ?? 0;
     const id = this.trackId(track);
     const openStartedAt = Date.now();
+    // Consumed here so a cache hit discards it and a second play re-resolves:
+    // the URL lives for exactly one open.
+    const pending = this.takeStream(track);
 
     if (this.cache && options.sessionId && !track.isLive) {
       if (this.cache.has(options.sessionId, id)) {
@@ -579,8 +841,9 @@ export class YtdlpMediaEngine implements MediaEngine {
           if (target) {
             const measurement = this.measurementByKey.get(this.cacheKey(options.sessionId, track));
             const selected = selectPlaybackFilter({
-              settings: this.normalization ?? DEFAULT_LOUDNESS_SETTINGS,
+              config: this.playbackConfig(),
               source: "cache",
+              hasMeasurement: measurement !== undefined,
               gainDb: measurement?.gainDb,
             });
             logger.debug("play_filter", {
@@ -613,11 +876,12 @@ export class YtdlpMediaEngine implements MediaEngine {
     // Stream first, cache in the background: playback never waits for a
     // download and the live resource is never swapped mid-track.
     const selected = selectPlaybackFilter({
-      settings: this.normalization ?? DEFAULT_LOUDNESS_SETTINGS,
+      config: this.playbackConfig(),
       source: "stream",
+      hasMeasurement: false,
     });
     logger.debug("play_filter", { source: "stream", filter: selected.kind });
-    const opened = await this.openStream(track, startSec, selected.filter, id);
+    const opened = await this.openStream(track, startSec, selected.filter, id, pending);
     logger.info("play_source", { source: "stream", trackId: id });
     logger.debug("open_ms", { ms: Date.now() - openStartedAt, source: "stream", trackId: id });
 
@@ -663,7 +927,13 @@ export class YtdlpMediaEngine implements MediaEngine {
     startSec: number,
     filter: string | null,
     trackId: string,
+    pending: PendingStream | null,
   ): Promise<OpenedStream> {
+    if (pending) {
+      const fromUrl = await this.openUrlWithRetry(track, pending, startSec, filter, trackId);
+      if (fromUrl) return fromUrl;
+    }
+
     const ytdlp = await this.deps.openAudioStream(track, {
       startSec,
       options: this.ytdlpOptions,
@@ -696,6 +966,103 @@ export class YtdlpMediaEngine implements MediaEngine {
     });
   }
 
+  /**
+   * Play straight from the resolver's googlevideo URL. A stale URL is re-minted
+   * once, and if that fails too the caller falls back to the yt-dlp pipe — a
+   * resolver failure must never fail the command.
+   */
+  private async openUrlWithRetry(
+    track: MediaTrack,
+    pending: PendingStream,
+    startSec: number,
+    filter: string | null,
+    trackId: string,
+  ): Promise<OpenedStream | null> {
+    const startedAt = Date.now();
+    try {
+      logger.debug("play_transport", { trackId, transport: "url" });
+      return await this.openFromUrl(pending, startSec, filter, trackId);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const elapsedMs = Date.now() - startedAt;
+      if (!isRetryableStreamUrlFailure(reason, elapsedMs)) {
+        // Not something a fresh URL can cure (missing ffmpeg, broken network).
+        // The URL path is an optimisation, never a dependency: degrade instead
+        // of failing a command that yt-dlp can still serve.
+        logger.warn("stream_url_fallback", { trackId, reason: reason.slice(0, 240) });
+        return null;
+      }
+      logger.warn("stream_url_retry", {
+        trackId,
+        elapsedMs,
+        reason: reason.slice(0, 240),
+      });
+    }
+
+    try {
+      const refreshed = await this.resolver.resolve(track.url);
+      if (refreshed.streamUrl) {
+        return await this.openFromUrl(
+          {
+            url: refreshed.streamUrl,
+            ...(refreshed.headers ? { headers: refreshed.headers } : {}),
+          },
+          startSec,
+          filter,
+          trackId,
+        );
+      }
+      logger.warn("stream_url_fallback", { trackId, reason: "no_refreshed_url" });
+    } catch (error) {
+      logger.warn("stream_url_fallback", {
+        trackId,
+        reason: (error instanceof Error ? error.message : String(error)).slice(0, 240),
+      });
+    }
+    return null;
+  }
+
+  private async openFromUrl(
+    pending: PendingStream,
+    startSec: number,
+    filter: string | null,
+    trackId: string,
+  ): Promise<OpenedStream> {
+    const decoded = this.deps.toPcmFromUrl(pending.url, pending.headers, {
+      ffmpegPath: this.ffmpegPath,
+      startSec,
+      filter,
+      normalization: this.normalization,
+    });
+    try {
+      return await this.finishOpened({
+        pcm: decoded.stream,
+        stopDecoder: decoded.kill,
+        prebufferBytes: Math.round(this.streamPrebufferMs * PCM_BYTES_PER_MS),
+        source: "stream",
+        timeoutMs: this.streamPrebufferMs * STREAM_PREBUFFER_TIMEOUT_FACTOR,
+        fallbackOnTimeout: true,
+        trackId,
+      });
+    } catch (error) {
+      // A failed HTTP open closes stdout before ffmpeg reports why, so the
+      // "no audio" error alone cannot tell a stale URL from an empty file.
+      // Fold ffmpeg's own exit code and stderr back into the message.
+      const exit = decoded.exit ? await raceExit(decoded.exit) : null;
+      if (!exit || (exit.code === 0 && !exit.stderr.trim())) throw error;
+      const detail = exit.stderr
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .pop();
+      const base = error instanceof Error ? error.message : String(error);
+      throw new MediaError(
+        "EXTRACTOR_FAILED",
+        `${base} (ffmpeg exit ${exit.code ?? "null"}${detail ? `: ${detail}` : ""})`,
+      );
+    }
+  }
+
   private async finishOpened(input: {
     pcm: Readable;
     stopDecoder: () => void;
@@ -721,6 +1088,9 @@ export class YtdlpMediaEngine implements MediaEngine {
     pcm.on("error", (error) => {
       if (!output.destroyed) output.destroy(error);
     });
+    // The decoder error is already surfaced by the prebuffer awaiting below;
+    // this listener only stops Node from treating it as unhandled.
+    output.on("error", () => {});
     output.on("close", () => {
       if (!stopped) stop();
     });

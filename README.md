@@ -150,35 +150,55 @@ bytes within four times that window it falls back to the raw pipe instead of fai
 The first track of each play logs `first_audio { ms, source, trackId }` at `info` when the player
 reaches `Playing`, which is the measurement to compare before and after these changes.
 
+### Playlists and music links
+
+- `/play` accepts `start_at` (1-based track number) or `start_from` (title substring) for YouTube,
+  Spotify and Apple Music collections; they are mutually exclusive.
+- A multi-track collection without a start point now shows a picker (first 10 previewed, up to 25
+  selectable) instead of queueing everything blindly; **Queue all** or a chosen track enqueues from
+  that point.
+- Single Spotify/Apple Music **tracks** resolve with no credentials (Spotify reads the public
+  page's OpenGraph tags, then falls back to oEmbed; Apple Music reads JSON-LD), but Spotify
+  **albums/playlists** need `SPOTIFY_CLIENT_ID`/`SPOTIFY_CLIENT_SECRET`. `MUSIC_LINK_MAX_TRACKS`
+  (default 50) caps how far one link expands.
+
 ### Loudness normalization
 
 Every decoded track passes through a loudness filter before the 48 kHz stereo s16le PCM reaches
-Discord, so a quiet master and a loud one play at a similar perceived volume. The filter is applied
-on both playback paths: the yt-dlp stream (the first play of a track) and the cached file
-(local or presigned S3 URL).
+Discord. The two playback paths are filtered differently, because only one of them can be measured
+before it starts.
 
-`AUDIO_NORMALIZE` selects the mode:
+**Streamed first play — limiter only.** `AUDIO_STREAM_FILTER` (default `limiter`) selects the
+filter for the stream, which has no measurement yet. `limiter` is
+`alimiter=limit=0.891:level=false`: a peak limiter at about −1 dBFS with **no gain change and no
+pumping**. A one-pass `loudnorm` cannot work without first measuring the track, and its dynamic
+mode ducks a hot master hard: the reported case was −8.37 LUFS integrated with +2.65 dBTP, which
+needs roughly 8 dB of cut to reach the target and was audible as "it goes quiet after ~10 s". The
+tradeoff is that track 1 may be louder than the rest until its measured gain is available on a
+later play. Set `AUDIO_STREAM_FILTER` to `loudnorm`, `dynaudnorm` or `off` to opt back into a
+one-pass dynamic filter, a moving-average filter, or no stream filter at all.
 
-- **`loudnorm`** (default) — one-pass EBU R128, targeting integrated loudness. Exact per-track
-  levelling with `AUDIO_TARGET_LUFS` (default `-16` LUFS, range `-30..-5`), `AUDIO_TRUE_PEAK_DB`
-  (default `-1.5` dBTP, range `-6..0`), and `AUDIO_LRA` (default `11`, range `1..20`).
+**Cached replay — measured gain.** Once the background download fills the cache, the bot runs a
+loudnorm analysis pass on the local file and stores the result for the session. A cached replay
+applies that exact gain as `volume=<gain>dB,alimiter=limit=0.891:level=false`, which is more
+accurate and cheaper at playback time and never changes shape. `AUDIO_TWO_PASS` (default `true`)
+turns the analysis pass off; `AUDIO_MAX_GAIN_DB` (default `12`, range `0..24`) caps the applied gain
+in both directions, and the true peak still cannot exceed `AUDIO_TRUE_PEAK_DB`.
+
+**Cached without a measurement — `AUDIO_NORMALIZE`.** A cached track whose analysis failed or was
+skipped falls back to `AUDIO_NORMALIZE`, the same three modes as before:
+
+- **`loudnorm`** (default) — one-pass EBU R128, targeting integrated loudness with
+  `AUDIO_TARGET_LUFS` (default `-14` LUFS, range `-30..-5`), `AUDIO_TRUE_PEAK_DB` (default `-1.0`
+  dBTP, range `-6..0`), and `AUDIO_LRA` (default `11`, range `1..20`).
 - **`dynaudnorm`** — a smoother, faster moving-average normaliser. It evens out a track that is
   itself uneven, but is less exact at matching the target level across tracks. Its window is
   `AUDIO_DYN_FRAME_MS` (default `150`, range `10..500`).
-- **`off`** — no filter at all; the decoder emits untouched PCM.
-
-The first play of a track is a stream, so it cannot be measured before it starts: it always uses
-the configured live filter above. Once the background download fills the cache, the bot runs a
-loudnorm analysis pass on the local file and stores the result for the session. A cached replay
-then applies that exact gain (`volume=<gain>dB` plus a −1 dBFS limiter) instead of a live
-one-pass normalization, which is more accurate and cheaper at playback time. `AUDIO_TWO_PASS`
-(default `true`) turns the analysis pass off; `AUDIO_MAX_GAIN_DB` (default `12`, range `0..24`)
-caps the applied gain in both directions, and the true peak still cannot exceed
-`AUDIO_TRUE_PEAK_DB`. A failed or silent analysis just falls back to the configured filter.
+- **`off`** — no filter at all; the decoder emits untouched PCM, on every path.
 
 `/volume` is applied after normalization on the AudioResource's inline volume, so it stays a live
-per-guild setting and is never baked into the ffmpeg filter. Normalization costs roughly a few
-percent of one CPU core per active stream, on top of decoding.
+per-guild setting and is never baked into the ffmpeg filter. A limiter costs a fraction of what a
+one-pass `loudnorm` does; the analysis pass runs once per cached track, off the playback path.
 
 ### Opus bitrate
 

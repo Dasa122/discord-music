@@ -37,6 +37,7 @@ export function toQueueTrack(track: ResolvedTrack, requestedBy: RequestedBy): Qu
   return {
     id: track.videoId ?? track.webpageUrl,
     title: track.title,
+    artist: track.artist ?? null,
     url: track.webpageUrl,
     durationSec: track.durationSec === null ? null : Math.max(0, Math.round(track.durationSec)),
     thumbnailUrl: track.thumbnailUrl,

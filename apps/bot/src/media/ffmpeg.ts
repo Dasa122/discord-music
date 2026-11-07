@@ -5,6 +5,16 @@ import { logger } from "../logger.js";
 
 export type LoudnessMode = "loudnorm" | "dynaudnorm" | "off";
 
+/**
+ * How the streamed first play of a track is filtered. A stream cannot be
+ * measured before it starts, so a one-pass `loudnorm` there dynamically cuts a
+ * hot master (a −8 LUFS / +2.6 dBTP track needed ~8 dB of ducking to hit −16,
+ * audible as "it goes quiet after ~10 s"). `limiter` only catches peaks: no
+ * gain change, no pumping, at the cost of track 1 possibly being louder than
+ * the rest until its measured gain is available on a later play.
+ */
+export type StreamFilterMode = "limiter" | "loudnorm" | "dynaudnorm" | "off";
+
 export interface LoudnessSettings {
   mode: LoudnessMode;
   /** Integrated loudness target in LUFS (`loudnorm` only). */
@@ -17,14 +27,26 @@ export interface LoudnessSettings {
   dynFrameMs: number;
 }
 
+/** Loudness settings plus the separate stream-path mode. */
+export interface PlaybackAudioConfig extends LoudnessSettings {
+  /** `AUDIO_STREAM_FILTER`: filter applied to the streamed first play. */
+  streamFilter: StreamFilterMode;
+}
+
 /** Mirrors the config defaults so a caller that omits settings still normalises. */
 export const DEFAULT_LOUDNESS_SETTINGS: LoudnessSettings = {
   mode: "loudnorm",
-  targetLufs: -16,
-  truePeakDb: -1.5,
+  targetLufs: -14,
+  truePeakDb: -1,
   lra: 11,
   dynFrameMs: 150,
 };
+
+/** Default streamed-play filter: peak limiting only, never a gain change. */
+export const DEFAULT_STREAM_FILTER: StreamFilterMode = "limiter";
+
+/** Brick-wall peak limiter at 0.891 (~−1 dBFS), with no makeup gain. */
+export const LIMITER_FILTER = "alimiter=limit=0.891:level=false";
 
 /** Upper bound on a measured gain boost (dB); attenuation uses the same limit. */
 export const DEFAULT_MAX_GAIN_DB = 12;
@@ -66,10 +88,24 @@ export function computeGainDb(
 
 /** A fixed gain plus a brick-wall limiter at 0.891 (~-1 dBFS). */
 export function buildMeasuredFilter(gainDb: number): string {
-  return `volume=${roundGain(gainDb)}dB,alimiter=limit=0.891:level=false`;
+  return `volume=${roundGain(gainDb)}dB,${LIMITER_FILTER}`;
 }
 
-export type PlayFilterKind = "measured" | "configured" | "off";
+/** The streamed-path filter, or `null` when it must not emit `-af` at all. */
+export function buildStreamFilter(config: PlaybackAudioConfig): string | null {
+  switch (config.streamFilter) {
+    case "limiter":
+      return LIMITER_FILTER;
+    case "loudnorm":
+      return buildAudioFilter({ ...config, mode: "loudnorm" });
+    case "dynaudnorm":
+      return buildAudioFilter({ ...config, mode: "dynaudnorm" });
+    case "off":
+      return null;
+  }
+}
+
+export type PlayFilterKind = "measured" | "stream" | "configured" | "off";
 
 export interface PlayFilterSelection {
   /** The `-af` value, or `null` when no filter must be emitted at all. */
@@ -79,22 +115,30 @@ export interface PlayFilterSelection {
 }
 
 /**
- * Pick the playback filter. A cached track with a measured gain gets that
- * exact gain; anything else falls back to the configured live filter. `off`
- * always means no filter, even for a measured track.
+ * Pick the playback filter — the whole source/measurement matrix lives here.
+ *
+ * - `AUDIO_NORMALIZE=off` wins everywhere and emits no `-af` at all.
+ * - A cached track with a measurement always replays its exact gain plus the
+ *   limiter, regardless of `AUDIO_STREAM_FILTER`.
+ * - A cached track without one falls back to `AUDIO_NORMALIZE`.
+ * - The streamed first play uses `AUDIO_STREAM_FILTER`, which defaults to a
+ *   limiter so a hot master is not dynamically ducked.
  */
 export function selectPlaybackFilter(input: {
   source: "cache" | "stream";
-  settings: LoudnessSettings;
+  /** A finite measured gain exists for this cached track. */
+  hasMeasurement: boolean;
   gainDb?: number | null;
+  config: PlaybackAudioConfig;
 }): PlayFilterSelection {
-  if (input.settings.mode === "off") return { filter: null, kind: "off" };
+  if (input.config.mode === "off") return { filter: null, kind: "off" };
 
-  if (
-    input.source === "cache" &&
-    typeof input.gainDb === "number" &&
-    Number.isFinite(input.gainDb)
-  ) {
+  if (input.source === "stream") {
+    const streamFilter = buildStreamFilter(input.config);
+    return streamFilter ? { filter: streamFilter, kind: "stream" } : { filter: null, kind: "off" };
+  }
+
+  if (input.hasMeasurement && typeof input.gainDb === "number" && Number.isFinite(input.gainDb)) {
     return {
       filter: buildMeasuredFilter(input.gainDb),
       kind: "measured",
@@ -102,7 +146,7 @@ export function selectPlaybackFilter(input: {
     };
   }
 
-  const configured = buildAudioFilter(input.settings);
+  const configured = buildAudioFilter(input.config);
   return configured ? { filter: configured, kind: "configured" } : { filter: null, kind: "off" };
 }
 
@@ -244,6 +288,15 @@ export interface FfmpegFileStream {
   kill(): void;
 }
 
+export interface FfmpegUrlStream extends FfmpegFileStream {
+  /**
+   * Settles when ffmpeg exits, carrying its stderr tail. A failed HTTP open
+   * closes stdout first, so the stderr reason arrives after the stream error —
+   * this is what lets the caller tell a stale 403 from a genuine empty file.
+   */
+  exit?: Promise<{ code: number | null; stderr: string }>;
+}
+
 function appendOutputTail(args: string[], options: FfmpegOptions): void {
   const filter =
     options.filter !== undefined
@@ -271,6 +324,103 @@ export function toPcmArgs(options: FfmpegOptions = {}): string[] {
   const args = ["-hide_banner", "-loglevel", "error", "-i", "pipe:0"];
   appendOutputTail(args, options);
   return args;
+}
+
+/**
+ * One `-headers` value for ffmpeg. A header value is attacker-adjacent input
+ * (it comes from the extractor), so CR/LF are stripped: a newline in a value
+ * would let it inject a second header or a whole extra request.
+ */
+export function sanitizeStreamHeaders(headers?: Record<string, string>): string | null {
+  if (!headers) return null;
+  const lines: string[] = [];
+  for (const [rawName, rawValue] of Object.entries(headers)) {
+    const name = String(rawName)
+      .replace(/[\r\n]/g, "")
+      .trim();
+    if (!name) continue;
+    const value = String(rawValue).replace(/[\r\n]/g, "");
+    lines.push(`${name}: ${value}`);
+  }
+  return lines.length > 0 ? lines.join("\r\n") : null;
+}
+
+/**
+ * Args for decoding a remote URL. `-headers` and `-ss` are input options, so
+ * both must precede `-i`; the output tail always comes last.
+ */
+export function toPcmFromUrlArgs(
+  url: string,
+  headers?: Record<string, string>,
+  options: FfmpegOptions & { startSec?: number } = {},
+): string[] {
+  const startSec = Math.max(0, Math.floor(options.startSec ?? 0));
+  const args = ["-hide_banner", "-loglevel", "error"];
+  const headerBlock = sanitizeStreamHeaders(headers);
+  if (headerBlock) args.push("-headers", headerBlock);
+  args.push("-ss", String(startSec), "-i", url);
+  appendOutputTail(args, options);
+  return args;
+}
+
+/**
+ * Decode a remote media URL to 48 kHz stereo s16le PCM on stdout. Used for a
+ * resolver-provided stream URL, which skips yt-dlp at playback time.
+ */
+export function toPcmFromUrl(
+  url: string,
+  headers?: Record<string, string>,
+  options: FfmpegOptions & { startSec?: number } = {},
+): FfmpegUrlStream {
+  const ffmpegPath = options.ffmpegPath ?? process.env.FFMPEG_PATH?.trim() ?? "ffmpeg";
+
+  const child = spawn(ffmpegPath, toPcmFromUrlArgs(url, headers, options), {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const output = child.stdout;
+  let stderr = "";
+  let settleExit!: (value: { code: number | null; stderr: string }) => void;
+  const exit = new Promise<{ code: number | null; stderr: string }>((resolvePromise) => {
+    settleExit = resolvePromise;
+  });
+
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr = `${stderr}${chunk}`.slice(-4000);
+  });
+
+  child.on("error", (error) => {
+    output.destroy(new Error(`Could not start ffmpeg at "${ffmpegPath}": ${error.message}`));
+  });
+
+  child.on("close", (code) => {
+    settleExit({ code, stderr });
+    if (code !== 0 && code !== null && !output.destroyed) {
+      const reason = stderr
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .pop();
+      output.destroy(new Error(`ffmpeg exited with code ${code}${reason ? `: ${reason}` : ""}`));
+    }
+  });
+
+  output.on("error", () => {});
+
+  return {
+    stream: output,
+    exit,
+    kill: () => {
+      if (child.exitCode === null) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+      output.destroy();
+    },
+  };
 }
 
 /**

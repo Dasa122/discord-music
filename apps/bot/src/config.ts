@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { parseAllowedGuildIds } from "./guild-allowlist.js";
-import { DEFAULT_LOUDNESS_SETTINGS, DEFAULT_MAX_GAIN_DB } from "./media/ffmpeg.js";
+import {
+  DEFAULT_LOUDNESS_SETTINGS,
+  DEFAULT_MAX_GAIN_DB,
+  DEFAULT_STREAM_FILTER,
+  type StreamFilterMode,
+} from "./media/ffmpeg.js";
 import { DEFAULT_AUDIO_BITRATE_KBPS } from "./player/audio-bitrate.js";
 
 /**
@@ -34,6 +39,34 @@ const envSchema = z.object({
   MAX_CONCURRENT_STREAMS: z.coerce.number().int().min(1).max(100).default(3),
   IDLE_TIMEOUT_SECONDS: z.coerce.number().int().min(0).max(86_400).default(60),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+  /**
+   * Which resolver turns a query into a track. `ytdlp` is the pre-P2 path and
+   * the default, so deploying this changes nothing until it is flipped.
+   */
+  RESOLVER: z.enum(["ytdlp", "innertube"]).default("ytdlp"),
+  /**
+   * InnerTube client used for playback. VISIONOS is the only client measured to
+   * return URLs that ffmpeg can actually stream (10/10 sampled videos; IOS
+   * manages 1/8 because its URLs 403 above a ~1 MiB range, ANDROID/WEB fail to
+   * decipher and TV reports the page as unplayable). It is an undocumented
+   * client, so `RESOLVER` stays `ytdlp` by default and this only matters when
+   * the resolver is opted into.
+   */
+  INNERTUBE_CLIENT: z.enum(["IOS", "ANDROID", "TV", "WEB", "VISIONOS"]).default("VISIONOS"),
+  /** Consecutive innertube failures before every call is routed to yt-dlp. */
+  RESOLVER_FAILURE_THRESHOLD: z.coerce
+    .number()
+    .int()
+    .min(1, "must be between 1 and 100")
+    .max(100, "must be between 1 and 100")
+    .default(3),
+  /** How long the breaker stays open (then one probe) in milliseconds. */
+  RESOLVER_COOLDOWN_MS: z.coerce
+    .number()
+    .int()
+    .min(1_000, "must be between 1000 and 86400000")
+    .max(86_400_000, "must be between 1000 and 86400000")
+    .default(600_000),
   YTDLP_PATH: z.string().min(1).default("yt-dlp"),
   DENO_PATH: z.string().min(1).default("deno"),
   FFMPEG_PATH: z.string().min(1).default("ffmpeg"),
@@ -42,6 +75,16 @@ const envSchema = z.object({
   POT_PROVIDER_URL: z.url().optional(),
   /** Persists the extractor's player/challenge work across invocations. */
   YTDLP_CACHE_DIR: z.string().trim().min(1).default("/tmp/yt-dlp-cache"),
+  /** Spotify Web API credentials; both or neither, validated below. */
+  SPOTIFY_CLIENT_ID: z.string().trim().min(1).optional(),
+  SPOTIFY_CLIENT_SECRET: z.string().trim().min(1).optional(),
+  /** Cap on tracks expanded from one album/playlist link (1..100). */
+  MUSIC_LINK_MAX_TRACKS: z.coerce
+    .number()
+    .int()
+    .min(1, "must be between 1 and 100")
+    .max(100, "must be between 1 and 100")
+    .default(50),
   /** `local` keeps files on disk; `s3` uploads them to Garage/MinIO. */
   AUDIO_STORE: z.enum(["local", "s3"]).default("local"),
   /** Where downloaded audio is cached for the lifetime of a voice session. */
@@ -82,6 +125,17 @@ const envSchema = z.object({
   AUDIO_NORMALIZE: z
     .enum(["loudnorm", "dynaudnorm", "off"])
     .default(DEFAULT_LOUDNESS_SETTINGS.mode),
+  /**
+   * Filter for the streamed first play of a track. A stream cannot be measured
+   * before it starts, so a one-pass `loudnorm` there dynamically ducks a hot
+   * master (a −8 LUFS / +2.6 dBTP track loses ~8 dB to reach the target, which
+   * is audible as "it goes quiet after ~10 s"). `limiter` only limits peaks:
+   * no gain change, no pumping. The tradeoff is that track 1 may be louder than
+   * the rest until its measured gain is available on a later play.
+   */
+  AUDIO_STREAM_FILTER: z
+    .enum(["limiter", "off", "loudnorm", "dynaudnorm"])
+    .default(DEFAULT_STREAM_FILTER),
   AUDIO_TARGET_LUFS: z.coerce
     .number()
     .min(-30, "must be between -30 and -5")
@@ -155,6 +209,10 @@ export interface AppConfig {
   maxConcurrentStreams: number;
   idleTimeoutSeconds: number;
   logLevel: "debug" | "info" | "warn" | "error";
+  resolver: "ytdlp" | "innertube";
+  innertubeClient: "IOS" | "ANDROID" | "TV" | "WEB" | "VISIONOS";
+  resolverFailureThreshold: number;
+  resolverCooldownMs: number;
   ytdlpPath: string;
   denoPath: string;
   ffmpegPath: string;
@@ -162,6 +220,9 @@ export interface AppConfig {
   ytdlpProxy: string | undefined;
   potProviderUrl: string | undefined;
   ytdlpCacheDir: string;
+  spotifyClientId: string | undefined;
+  spotifyClientSecret: string | undefined;
+  musicLinkMaxTracks: number;
   audioStore: "local" | "s3";
   audioCacheDir: string;
   audioCacheMaxBytes: number;
@@ -171,6 +232,7 @@ export interface AppConfig {
   streamPrebufferMs: number;
   audioCacheMaxFileBytes: number;
   audioNormalize: "loudnorm" | "dynaudnorm" | "off";
+  audioStreamFilter: StreamFilterMode;
   audioTargetLufs: number;
   audioTruePeakDb: number;
   audioLra: number;
@@ -232,6 +294,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     }
   }
 
+  if ((value.SPOTIFY_CLIENT_ID === undefined) !== (value.SPOTIFY_CLIENT_SECRET === undefined)) {
+    throw new Error(
+      "Invalid environment configuration: SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be set together.",
+    );
+  }
+
   return Object.freeze({
     discordToken: value.DISCORD_TOKEN,
     discordClientId: value.DISCORD_CLIENT_ID,
@@ -243,6 +311,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     maxConcurrentStreams: value.MAX_CONCURRENT_STREAMS,
     idleTimeoutSeconds: value.IDLE_TIMEOUT_SECONDS,
     logLevel: value.LOG_LEVEL,
+    resolver: value.RESOLVER,
+    innertubeClient: value.INNERTUBE_CLIENT,
+    resolverFailureThreshold: value.RESOLVER_FAILURE_THRESHOLD,
+    resolverCooldownMs: value.RESOLVER_COOLDOWN_MS,
     ytdlpPath: value.YTDLP_PATH,
     denoPath: value.DENO_PATH,
     ffmpegPath: value.FFMPEG_PATH,
@@ -250,6 +322,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ytdlpProxy: value.YTDLP_PROXY,
     potProviderUrl: value.POT_PROVIDER_URL,
     ytdlpCacheDir: value.YTDLP_CACHE_DIR,
+    spotifyClientId: value.SPOTIFY_CLIENT_ID,
+    spotifyClientSecret: value.SPOTIFY_CLIENT_SECRET,
+    musicLinkMaxTracks: value.MUSIC_LINK_MAX_TRACKS,
     audioStore: value.AUDIO_STORE,
     audioCacheDir: value.AUDIO_CACHE_DIR,
     audioCacheMaxBytes: value.AUDIO_CACHE_MAX_BYTES,
@@ -259,6 +334,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     streamPrebufferMs: value.STREAM_PREBUFFER_MS,
     audioCacheMaxFileBytes: value.AUDIO_CACHE_MAX_FILE_BYTES,
     audioNormalize: value.AUDIO_NORMALIZE,
+    audioStreamFilter: value.AUDIO_STREAM_FILTER,
     audioTargetLufs: value.AUDIO_TARGET_LUFS,
     audioTruePeakDb: value.AUDIO_TRUE_PEAK_DB,
     audioLra: value.AUDIO_LRA,

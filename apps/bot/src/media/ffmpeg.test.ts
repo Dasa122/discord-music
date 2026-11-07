@@ -4,22 +4,30 @@ import {
   buildMeasuredFilter,
   computeGainDb,
   DEFAULT_LOUDNESS_SETTINGS,
+  LIMITER_FILTER,
   type LoudnessSettings,
+  type PlaybackAudioConfig,
   parseLoudnormJson,
+  sanitizeStreamHeaders,
   selectPlaybackFilter,
   toPcmArgs,
   toPcmFromFileArgs,
+  toPcmFromUrlArgs,
 } from "./ffmpeg.js";
 
 function settings(overrides: Partial<LoudnessSettings> = {}): LoudnessSettings {
   return { ...DEFAULT_LOUDNESS_SETTINGS, ...overrides };
 }
 
+function config(overrides: Partial<PlaybackAudioConfig> = {}): PlaybackAudioConfig {
+  return { ...DEFAULT_LOUDNESS_SETTINGS, streamFilter: "limiter", ...overrides };
+}
+
 const OUTPUT_TAIL = ["-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"];
 
 describe("buildAudioFilter", () => {
   test("loudnorm uses the target loudness, true peak, and LRA defaults", () => {
-    expect(buildAudioFilter(settings())).toBe("loudnorm=I=-16:TP=-1.5:LRA=11");
+    expect(buildAudioFilter(settings())).toBe("loudnorm=I=-14:TP=-1:LRA=11");
   });
 
   test("loudnorm interpolates every configured value", () => {
@@ -50,7 +58,7 @@ describe("ffmpeg arguments", () => {
       "-i",
       "pipe:0",
       "-af",
-      "loudnorm=I=-16:TP=-1.5:LRA=11",
+      "loudnorm=I=-14:TP=-1:LRA=11",
       ...OUTPUT_TAIL,
     ]);
     expect(args.indexOf("-i")).toBeLessThan(args.indexOf("-af"));
@@ -98,8 +106,8 @@ describe("ffmpeg arguments", () => {
   });
 
   test("omitting settings still normalises with the loudnorm defaults", () => {
-    expect(toPcmArgs()).toContain("loudnorm=I=-16:TP=-1.5:LRA=11");
-    expect(toPcmFromFileArgs("/cache/track.audio")).toContain("loudnorm=I=-16:TP=-1.5:LRA=11");
+    expect(toPcmArgs()).toContain("loudnorm=I=-14:TP=-1:LRA=11");
+    expect(toPcmFromFileArgs("/cache/track.audio")).toContain("loudnorm=I=-14:TP=-1:LRA=11");
   });
 });
 
@@ -109,7 +117,7 @@ describe("volume is not part of the filter", () => {
     // filter must not bake in a per-guild volume that a later change cannot undo.
     const args = toPcmArgs({ normalization: settings() });
     const filter = args[args.indexOf("-af") + 1];
-    expect(filter).toBe("loudnorm=I=-16:TP=-1.5:LRA=11");
+    expect(filter).toBe("loudnorm=I=-14:TP=-1:LRA=11");
     expect(filter).not.toContain("volume");
     expect(args.filter((arg) => arg.includes("volume"))).toEqual([]);
   });
@@ -172,22 +180,30 @@ describe("parseLoudnormJson", () => {
 
 describe("computeGainDb", () => {
   test("a normal track gets target - input", () => {
-    // -25 LUFS to -16 LUFS is +9 dB, and -20 dBTP leaves plenty of headroom.
-    expect(computeGainDb(-25, -20, -16, -1.5, 12)).toBe(9);
+    // -25 LUFS to -14 LUFS is +11 dB, and -20 dBTP leaves plenty of headroom.
+    expect(computeGainDb(-25, -20, -14, -1, 12)).toBe(11);
   });
 
   test("the gain is clamped to maxGainDb in both directions", () => {
-    expect(computeGainDb(-40, -20, -16, -1.5, 12)).toBe(12);
-    expect(computeGainDb(0, -20, -16, -1.5, 12)).toBe(-12);
+    expect(computeGainDb(-40, -20, -14, -1, 12)).toBe(12);
+    expect(computeGainDb(0, -20, -14, -1, 12)).toBe(-12);
   });
 
   test("true-peak limiting reduces the gain below the loudness delta", () => {
-    // +7 dB would push a -2 dBTP peak to +5; only 0.5 dB fits under -1.5.
-    expect(computeGainDb(-23, -2, -16, -1.5, 12)).toBe(0.5);
+    // +7 dB would push a -2 dBTP peak to +5; only 1 dB fits under -1.0.
+    expect(computeGainDb(-23, -2, -14, -1, 12)).toBe(1);
+  });
+
+  test("a hot master is attenuated, not boosted, under the -1.0 dBTP ceiling", () => {
+    // The reported case: -8.37 LUFS / +2.65 dBTP needs -5.63 dB to reach -14,
+    // and the peak (which allows at most -3.65 dB) is already satisfied by it.
+    expect(computeGainDb(-8.37, 2.65, -14, -1, 12)).toBeCloseTo(-5.63, 2);
+    // The ceiling only caps a boost: +6 dB wanted, but -1.0 - 2 = -3 dB fits.
+    expect(computeGainDb(-20, 2, -14, -1, 12)).toBe(-3);
   });
 
   test("a track already at the target gets no gain", () => {
-    expect(computeGainDb(-16, -10, -16, -1.5, 12)).toBe(0);
+    expect(computeGainDb(-14, -10, -14, -1, 12)).toBe(0);
   });
 });
 
@@ -199,64 +215,162 @@ describe("buildMeasuredFilter", () => {
 
   test("rounds a long measured gain to two decimals", () => {
     expect(buildMeasuredFilter(2.346)).toBe("volume=2.35dB,alimiter=limit=0.891:level=false");
+    expect(buildMeasuredFilter(-7.631)).toBe("volume=-7.63dB,alimiter=limit=0.891:level=false");
   });
 });
 
 describe("selectPlaybackFilter", () => {
-  const configured = "loudnorm=I=-16:TP=-1.5:LRA=11";
+  const configured = "loudnorm=I=-14:TP=-1:LRA=11";
 
-  test("cached with a measured gain uses that exact gain", () => {
-    expect(selectPlaybackFilter({ source: "cache", settings: settings(), gainDb: -3.21 })).toEqual({
-      filter: buildMeasuredFilter(-3.21),
-      kind: "measured",
-      gainDb: -3.21,
-    });
+  test("cached with a measurement always uses the measured filter", () => {
+    for (const streamFilter of ["limiter", "off", "loudnorm", "dynaudnorm"] as const) {
+      expect(
+        selectPlaybackFilter({
+          source: "cache",
+          hasMeasurement: true,
+          gainDb: -7.631,
+          config: config({ streamFilter }),
+        }),
+      ).toEqual({
+        filter: "volume=-7.63dB,alimiter=limit=0.891:level=false",
+        kind: "measured",
+        gainDb: -7.631,
+      });
+    }
   });
 
-  test("cached without a measurement keeps the configured filter", () => {
-    expect(selectPlaybackFilter({ source: "cache", settings: settings() })).toEqual({
-      filter: configured,
-      kind: "configured",
-    });
-    expect(selectPlaybackFilter({ source: "cache", settings: settings(), gainDb: null })).toEqual({
-      filter: configured,
-      kind: "configured",
-    });
+  test("a stream uses the stream filter, never a configured one", () => {
+    const expected = {
+      limiter: "alimiter=limit=0.891:level=false",
+      loudnorm: configured,
+      dynaudnorm: "dynaudnorm=f=150:g=15:p=0.7",
+    } as const;
+    for (const [streamFilter, filter] of Object.entries(expected)) {
+      expect(
+        selectPlaybackFilter({
+          source: "stream",
+          hasMeasurement: false,
+          config: config({ streamFilter: streamFilter as keyof typeof expected }),
+        }),
+      ).toEqual({ filter, kind: "stream" });
+    }
   });
 
-  test("dynaudnorm is still the configured filter for an unmeasured cached track", () => {
+  test("the default stream filter is a limiter and never duck a hot master", () => {
+    const selected = selectPlaybackFilter({
+      source: "stream",
+      hasMeasurement: false,
+      config: config(),
+    });
+    expect(selected.filter).toBe("alimiter=limit=0.891:level=false");
+    expect(selected.filter).not.toContain("loudnorm");
+  });
+
+  test("stream filter off emits no -af", () => {
     expect(
-      selectPlaybackFilter({ source: "cache", settings: settings({ mode: "dynaudnorm" }) }),
-    ).toEqual({ filter: "dynaudnorm=f=150:g=15:p=0.7", kind: "configured" });
-  });
-
-  test("a stream always uses the configured filter, even with a gain", () => {
-    expect(selectPlaybackFilter({ source: "stream", settings: settings(), gainDb: 5 })).toEqual({
-      filter: configured,
-      kind: "configured",
-    });
-  });
-
-  test("off wins over a measured gain and emits no filter", () => {
-    expect(
-      selectPlaybackFilter({ source: "cache", settings: settings({ mode: "off" }), gainDb: -3 }),
+      selectPlaybackFilter({
+        source: "stream",
+        hasMeasurement: false,
+        config: config({ streamFilter: "off" }),
+      }),
     ).toEqual({ filter: null, kind: "off" });
-    expect(selectPlaybackFilter({ source: "stream", settings: settings({ mode: "off" }) })).toEqual(
-      {
-        filter: null,
-        kind: "off",
-      },
-    );
+  });
+
+  test("cached without a measurement falls back to AUDIO_NORMALIZE", () => {
+    const expected = {
+      loudnorm: configured,
+      dynaudnorm: "dynaudnorm=f=150:g=15:p=0.7",
+    } as const;
+    for (const [mode, filter] of Object.entries(expected)) {
+      expect(
+        selectPlaybackFilter({
+          source: "cache",
+          hasMeasurement: false,
+          // AUDIO_STREAM_FILTER must not leak into the cached fallback.
+          config: config({ mode: mode as "loudnorm" | "dynaudnorm", streamFilter: "limiter" }),
+        }),
+      ).toEqual({ filter, kind: "configured" });
+    }
+    expect(
+      selectPlaybackFilter({
+        source: "cache",
+        hasMeasurement: false,
+        gainDb: null,
+        config: config({ mode: "off" }),
+      }),
+    ).toEqual({ filter: null, kind: "off" });
+  });
+
+  test("the loudness mode off wins over every other choice and emits no -af", () => {
+    for (const streamFilter of ["limiter", "off", "loudnorm", "dynaudnorm"] as const) {
+      expect(
+        selectPlaybackFilter({
+          source: "cache",
+          hasMeasurement: true,
+          gainDb: -3,
+          config: config({ mode: "off", streamFilter }),
+        }),
+      ).toEqual({ filter: null, kind: "off" });
+      expect(
+        selectPlaybackFilter({
+          source: "stream",
+          hasMeasurement: false,
+          config: config({ mode: "off", streamFilter }),
+        }),
+      ).toEqual({ filter: null, kind: "off" });
+    }
   });
 
   test("a non-finite gain falls back to the configured filter", () => {
     expect(
-      selectPlaybackFilter({ source: "cache", settings: settings(), gainDb: Number.NaN }),
+      selectPlaybackFilter({
+        source: "cache",
+        hasMeasurement: true,
+        gainDb: Number.NaN,
+        config: config(),
+      }),
     ).toEqual({ filter: configured, kind: "configured" });
   });
 });
 
 describe("per-call filter override", () => {
+  test("a stream filter of off builds argv with no -af at all", () => {
+    const selected = selectPlaybackFilter({
+      source: "stream",
+      hasMeasurement: false,
+      config: config({ streamFilter: "off" }),
+    });
+    expect(selected.filter).toBeNull();
+    for (const args of [
+      toPcmArgs({ normalization: settings(), filter: selected.filter }),
+      toPcmFromFileArgs("/cache/track.audio", {
+        startSec: 10,
+        normalization: settings(),
+        filter: selected.filter,
+      }),
+      toPcmFromUrlArgs("https://example.test/a", undefined, {
+        normalization: settings(),
+        filter: selected.filter,
+      }),
+    ]) {
+      expect(args).not.toContain("-af");
+      expect(args).not.toContain("");
+    }
+  });
+
+  test("the limiter filter is valid ffmpeg argv for a streamed play", () => {
+    const selected = selectPlaybackFilter({
+      source: "stream",
+      hasMeasurement: false,
+      config: config(),
+    });
+    const args = toPcmFromUrlArgs("https://example.test/a", undefined, {
+      normalization: settings(),
+      filter: selected.filter,
+    });
+    expect(args[args.indexOf("-af") + 1]).toBe(LIMITER_FILTER);
+  });
+
   test("the measured filter replaces the configured one on both argv builders", () => {
     const measured = buildMeasuredFilter(4.5);
     for (const args of [
@@ -276,5 +390,58 @@ describe("per-call filter override", () => {
       expect(args).not.toContain("-af");
       expect(args.slice(-OUTPUT_TAIL.length)).toEqual(OUTPUT_TAIL);
     }
+  });
+});
+
+describe("direct stream URL", () => {
+  test("sanitizeStreamHeaders joins with CRLF and strips CR/LF from values", () => {
+    const block = sanitizeStreamHeaders({
+      "User-Agent": "com.google.ios.youtube/20.11.6\r\nX-Injected: 1",
+      "X-Other": "line\nbreak\r",
+    });
+
+    expect(block).toBe(
+      "User-Agent: com.google.ios.youtube/20.11.6X-Injected: 1\r\nX-Other: linebreak",
+    );
+    expect(block?.split("\r\n")).toHaveLength(2);
+  });
+
+  test("sanitizeStreamHeaders also strips CR/LF from a header name and drops empty ones", () => {
+    expect(sanitizeStreamHeaders({ "Bad\r\nName": "v" })).toBe("BadName: v");
+    expect(sanitizeStreamHeaders({})).toBeNull();
+    expect(sanitizeStreamHeaders(undefined)).toBeNull();
+  });
+
+  test("toPcmFromUrl puts -headers and -ss before -i and the output tail last", () => {
+    const args = toPcmFromUrlArgs(
+      "https://rr1.googlevideo.com/videoplayback?itag=140",
+      { "User-Agent": "UA" },
+      { startSec: 30, normalization: settings() },
+    );
+
+    const headers = args.indexOf("-headers");
+    const seek = args.indexOf("-ss");
+    const input = args.indexOf("-i");
+
+    expect(headers).toBeGreaterThanOrEqual(0);
+    expect(args[headers + 1]).toBe("User-Agent: UA");
+    expect(seek).toBeGreaterThanOrEqual(0);
+    expect(args[seek + 1]).toBe("30");
+    expect(headers).toBeLessThan(input);
+    expect(seek).toBeLessThan(input);
+    expect(input).toBeLessThan(args.indexOf("-af"));
+    expect(args.slice(-OUTPUT_TAIL.length)).toEqual(OUTPUT_TAIL);
+    expect(args[args.length - 1]).toBe("pipe:1");
+  });
+
+  test("toPcmFromUrl emits -ss 0 for the first play and no -headers when absent", () => {
+    const args = toPcmFromUrlArgs("https://rr1.googlevideo.com/videoplayback", undefined, {
+      normalization: settings({ mode: "off" }),
+    });
+
+    expect(args).not.toContain("-headers");
+    expect(args[args.indexOf("-ss") + 1]).toBe("0");
+    expect(args).not.toContain("-af");
+    expect(args.slice(-OUTPUT_TAIL.length)).toEqual(OUTPUT_TAIL);
   });
 });

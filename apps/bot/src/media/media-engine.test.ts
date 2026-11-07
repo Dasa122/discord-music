@@ -8,13 +8,24 @@ import { MediaError } from "../errors.js";
 import { AudioCache } from "./audio-cache.js";
 import type { AudioStore } from "./audio-store.js";
 import { DownloadRegistry } from "./download-registry.js";
-import { buildMeasuredFilter, computeGainDb, type LoudnessSettings } from "./ffmpeg.js";
+import {
+  buildMeasuredFilter,
+  computeGainDb,
+  type LoudnessSettings,
+  type StreamFilterMode,
+} from "./ffmpeg.js";
 import {
   CACHE_PREBUFFER_BYTES,
   type MediaEngineDeps,
+  type MusicLinkSource,
   STREAM_PREBUFFER_BYTES,
   YtdlpMediaEngine,
 } from "./media-engine.js";
+import { OdesliClient } from "./providers/odesli.js";
+import { createSpotifyProvider } from "./providers/spotify.js";
+import { MusicLinkError, type ProviderTrack } from "./providers/types.js";
+import { ResolveCache } from "./resolve-cache.js";
+import type { TrackResolver } from "./resolver/types.js";
 
 class MemoryStore implements AudioStore {
   readonly objects = new Map<string, number>();
@@ -60,13 +71,23 @@ function makeEngine(overrides: {
   twoPass?: boolean;
   maxGainDb?: number;
   normalization?: LoudnessSettings;
+  streamFilter?: StreamFilterMode;
   streamPrebufferMs?: number;
+  resolver?: TrackResolver;
+  resolveCache?: ResolveCache;
+  musicLinks?: MusicLinkSource;
+  musicLinkMaxTracks?: number;
 }) {
   return new YtdlpMediaEngine({
     ytdlp: { path: "yt-dlp", denoPath: "deno" },
     ffmpegPath: "ffmpeg",
+    resolver: overrides.resolver,
+    resolveCache: overrides.resolveCache,
+    musicLinks: overrides.musicLinks,
+    musicLinkMaxTracks: overrides.musicLinkMaxTracks,
     cache: overrides.cache,
     normalization: overrides.normalization,
+    streamFilter: overrides.streamFilter,
     twoPass: overrides.twoPass,
     maxGainDb: overrides.maxGainDb,
     prefetchEnabled: overrides.prefetchEnabled,
@@ -531,7 +552,7 @@ describe("media engine background cancellation", () => {
 
 describe("media engine two-pass gain", () => {
   const measurement = { inputLufs: -23, inputTp: -4, inputLra: 7, inputThresh: -33 };
-  const configured = "loudnorm=I=-16:TP=-1.5:LRA=11";
+  const configured = "loudnorm=I=-14:TP=-1:LRA=11";
 
   function captureFileFilter() {
     const captured: { filter: string | null | undefined } = { filter: "unset" };
@@ -570,9 +591,66 @@ describe("media engine two-pass gain", () => {
     opened.stop();
 
     expect(opened.source).toBe("cache");
-    const gain = computeGainDb(-23, -4, -16, -1.5, 12);
-    expect(gain).toBe(2.5);
+    const gain = computeGainDb(-23, -4, -14, -1, 12);
+    expect(gain).toBe(3);
     expect(captured.filter).toBe(buildMeasuredFilter(gain));
+  });
+
+  test("a cached track ignores AUDIO_STREAM_FILTER and replays its measured gain", async () => {
+    const { captured, toPcmFromFile } = captureFileFilter();
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      // Would disable the stream path entirely; a measured cache must be blind to it.
+      streamFilter: "off",
+      deps: {
+        analyzeLoudness: async () => measurement,
+        toPcmFromFile,
+      },
+    });
+
+    await engine.ensureCached(track, "s");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(opened.source).toBe("cache");
+    const gain = computeGainDb(-23, -4, -14, -1, 12);
+    expect(captured.filter).toBe(buildMeasuredFilter(gain));
+  });
+
+  test("a streamed first play is peak-limited, never dynamically normalised", async () => {
+    const captured: { filter?: string | null } = {};
+    const engine = makeEngine({
+      deps: {
+        toPcm: (_stream, options) => {
+          captured.filter = options?.filter;
+          return pcmStream(200_000);
+        },
+      },
+    });
+
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(opened.source).toBe("stream");
+    expect(captured.filter).toBe("alimiter=limit=0.891:level=false");
+  });
+
+  test("AUDIO_STREAM_FILTER=off removes -af from the streamed path", async () => {
+    const captured: { filter?: string | null } = {};
+    const engine = makeEngine({
+      streamFilter: "off",
+      deps: {
+        toPcm: (_stream, options) => {
+          captured.filter = options?.filter;
+          return pcmStream(200_000);
+        },
+      },
+    });
+
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(captured.filter).toBeNull();
   });
 
   test("a cached track with no measurement falls back to the configured filter", async () => {
@@ -662,7 +740,7 @@ describe("media engine two-pass gain", () => {
     const { captured, toPcmFromFile } = captureFileFilter();
     const engine = makeEngine({
       cache: makeCache(new MemoryStore()),
-      normalization: { mode: "off", targetLufs: -16, truePeakDb: -1.5, lra: 11, dynFrameMs: 150 },
+      normalization: { mode: "off", targetLufs: -14, truePeakDb: -1, lra: 11, dynFrameMs: 150 },
       deps: {
         analyzeLoudness: async () => measurement,
         toPcmFromFile,
@@ -701,7 +779,7 @@ describe("media engine download reporting", () => {
       trackId: "vid",
       title: "Track",
       state: "ready",
-      gainDb: 2.5,
+      gainDb: 3,
       percent: 100,
     });
     expect(snapshot.totalBytes).toBe(10);
@@ -878,5 +956,483 @@ describe("media engine stream prebuffer", () => {
     expect(received.reduce((total, chunk) => total + chunk.length, 0)).toBeGreaterThan(0);
 
     opened.stop();
+  });
+});
+
+function failingStream(message: string): PassThrough {
+  const stream = new PassThrough();
+  queueMicrotask(() => stream.destroy(new Error(message)));
+  return stream;
+}
+
+const GOOGLEVIDEO = "https://rr1.googlevideo.com/videoplayback?itag=140&expire=1";
+
+function streamResolver(overrides: {
+  streamUrl?: string | null;
+  onResolve?: (query: string) => void;
+}): TrackResolver {
+  return {
+    async resolve(query) {
+      overrides.onResolve?.(query);
+      return {
+        videoId: "vid",
+        title: "Track",
+        webpageUrl: track.url,
+        durationSec: 30,
+        thumbnailUrl: null,
+        isPlaylist: false,
+        ...(overrides.streamUrl === null
+          ? {}
+          : {
+              streamUrl: overrides.streamUrl ?? GOOGLEVIDEO,
+              headers: { "User-Agent": "com.google.ios.youtube/20.11.6" },
+            }),
+      };
+    },
+    async resolveSearch() {
+      return [];
+    },
+  };
+}
+
+describe("media engine direct stream URLs", () => {
+  test("a resolver streamUrl plays through ffmpeg on the URL and skips yt-dlp", async () => {
+    let ytdlpStreams = 0;
+    let capturedUrl = "";
+    let capturedHeaders: Record<string, string> | undefined;
+    let capturedFilter: string | null | undefined;
+
+    const engine = makeEngine({
+      resolver: streamResolver({}),
+      deps: {
+        toPcmFromUrl: (url, headers, options) => {
+          capturedUrl = url;
+          capturedHeaders = headers;
+          capturedFilter = options?.filter;
+          return { stream: pcmStream(200_000), kill: () => undefined };
+        },
+        openAudioStream: async () => {
+          ytdlpStreams += 1;
+          return { process: fakeProcess(), stream: pcmStream(200_000) };
+        },
+      },
+    });
+
+    await engine.resolve("a song");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(capturedUrl).toBe(GOOGLEVIDEO);
+    expect(capturedHeaders).toEqual({ "User-Agent": "com.google.ios.youtube/20.11.6" });
+    expect(capturedFilter).toBe("alimiter=limit=0.891:level=false");
+    expect(ytdlpStreams).toBe(0);
+    expect(opened.source).toBe("stream");
+  });
+
+  test("a resolver without a streamUrl keeps the yt-dlp pipe", async () => {
+    let urlAttempts = 0;
+    let ytdlpStreams = 0;
+
+    const engine = makeEngine({
+      resolver: streamResolver({ streamUrl: null }),
+      deps: {
+        toPcmFromUrl: () => {
+          urlAttempts += 1;
+          return { stream: pcmStream(200_000), kill: () => undefined };
+        },
+        openAudioStream: async () => {
+          ytdlpStreams += 1;
+          return { process: fakeProcess(), stream: pcmStream(200_000) };
+        },
+      },
+    });
+
+    await engine.resolve("a song");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(urlAttempts).toBe(0);
+    expect(ytdlpStreams).toBe(1);
+  });
+
+  test("a 403 re-resolves exactly once, then falls back to the yt-dlp pipe", async () => {
+    const resolved: string[] = [];
+    let urlAttempts = 0;
+    let ytdlpStreams = 0;
+
+    const engine = makeEngine({
+      resolver: streamResolver({ onResolve: (query) => resolved.push(query) }),
+      deps: {
+        toPcmFromUrl: () => {
+          urlAttempts += 1;
+          return {
+            stream: failingStream("ffmpeg exited with code 1: HTTP error 403 Forbidden"),
+            kill: () => undefined,
+          };
+        },
+        openAudioStream: async () => {
+          ytdlpStreams += 1;
+          return { process: fakeProcess(), stream: pcmStream(200_000) };
+        },
+      },
+    });
+
+    await engine.resolve("a song");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    // One resolve to queue the track, one re-resolve to re-mint the URL.
+    expect(resolved).toEqual(["a song", track.url]);
+    expect(urlAttempts).toBe(2);
+    expect(ytdlpStreams).toBe(1);
+    expect(opened.source).toBe("stream");
+  });
+
+  test("a 403 that only reaches stderr still re-resolves once, then falls back", async () => {
+    const resolved: string[] = [];
+    let urlAttempts = 0;
+    let ytdlpStreams = 0;
+
+    const engine = makeEngine({
+      resolver: streamResolver({ onResolve: (query) => resolved.push(query) }),
+      deps: {
+        // stdout closes before ffmpeg reports why: the 403 is only in `exit`.
+        toPcmFromUrl: () => {
+          urlAttempts += 1;
+          return {
+            stream: pcmStream(0, true),
+            kill: () => undefined,
+            exit: Promise.resolve({
+              code: 1,
+              stderr: "Server returned 403 Forbidden (access denied)",
+            }),
+          };
+        },
+        openAudioStream: async () => {
+          ytdlpStreams += 1;
+          return { process: fakeProcess(), stream: pcmStream(200_000) };
+        },
+      },
+    });
+
+    await engine.resolve("a song");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(resolved).toEqual(["a song", track.url]);
+    expect(urlAttempts).toBe(2);
+    expect(ytdlpStreams).toBe(1);
+  });
+
+  test("an empty file that ffmpeg exits cleanly on is not retried", async () => {
+    let urlAttempts = 0;
+    let resolves = 0;
+
+    const engine = makeEngine({
+      resolver: streamResolver({ onResolve: () => (resolves += 1) }),
+      deps: {
+        toPcmFromUrl: () => {
+          urlAttempts += 1;
+          return {
+            stream: pcmStream(0, true),
+            kill: () => undefined,
+            exit: Promise.resolve({ code: 0, stderr: "" }),
+          };
+        },
+        openAudioStream: async () => ({ process: fakeProcess(), stream: pcmStream(200_000) }),
+      },
+    });
+
+    await engine.resolve("a song");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(urlAttempts).toBe(1);
+    expect(resolves).toBe(1);
+  });
+
+  test("a failure that a fresh URL cannot cure is not retried, but still degrades", async () => {
+    let urlAttempts = 0;
+    let resolves = 0;
+    let ytdlpStreams = 0;
+
+    const engine = makeEngine({
+      resolver: streamResolver({ onResolve: () => (resolves += 1) }),
+      deps: {
+        toPcmFromUrl: () => {
+          urlAttempts += 1;
+          return {
+            stream: failingStream('Could not start ffmpeg at "ffmpeg": spawn ffmpeg ENOENT'),
+            kill: () => undefined,
+          };
+        },
+        openAudioStream: async () => {
+          ytdlpStreams += 1;
+          return { process: fakeProcess(), stream: pcmStream(200_000) };
+        },
+      },
+    });
+
+    await engine.resolve("a song");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(urlAttempts).toBe(1);
+    expect(resolves).toBe(1);
+    expect(ytdlpStreams).toBe(1);
+  });
+
+  test("the signed URL is never written to the resolve cache", async () => {
+    const resolveCache = new ResolveCache();
+    const engine = makeEngine({
+      resolveCache,
+      resolver: streamResolver({}),
+      deps: {
+        toPcmFromUrl: () => ({ stream: pcmStream(200_000), kill: () => undefined }),
+      },
+    });
+
+    await engine.resolve("a song");
+
+    const cached = resolveCache.get("a song");
+    expect(cached?.videoId).toBe("vid");
+    expect(JSON.stringify(cached)).not.toContain("googlevideo");
+  });
+
+  test("the stream URL is consumed by exactly one open", async () => {
+    let urlAttempts = 0;
+    let ytdlpStreams = 0;
+
+    const engine = makeEngine({
+      resolver: streamResolver({}),
+      deps: {
+        toPcmFromUrl: () => {
+          urlAttempts += 1;
+          return { stream: pcmStream(200_000), kill: () => undefined };
+        },
+        openAudioStream: async () => {
+          ytdlpStreams += 1;
+          return { process: fakeProcess(), stream: pcmStream(200_000) };
+        },
+      },
+    });
+
+    await engine.resolve("a song");
+    (await engine.open(track, { sessionId: "s" })).stop();
+    (await engine.open(track, { sessionId: "s" })).stop();
+
+    expect(urlAttempts).toBe(1);
+    expect(ytdlpStreams).toBe(1);
+  });
+});
+
+describe("media engine music links", () => {
+  const spotifyUrl = "https://open.spotify.com/album/a1";
+
+  function providerTrack(overrides: Partial<ProviderTrack> = {}): ProviderTrack {
+    return {
+      title: "Source Title",
+      artists: ["Source Artist"],
+      durationSec: 222,
+      thumbnailUrl: "https://i.scdn.co/image/source",
+      sourceUrl: "https://open.spotify.com/track/t1",
+      provider: "spotify",
+      ...overrides,
+    };
+  }
+
+  function linkSource(
+    tracks: ProviderTrack[],
+    overrides: Partial<MusicLinkSource> = {},
+  ): MusicLinkSource {
+    return {
+      parse: (query) =>
+        query === spotifyUrl
+          ? { provider: "spotify", kind: "album", id: "a1", url: new URL(spotifyUrl) }
+          : null,
+      resolve: async () => ({ provider: "spotify", kind: "album", title: "Album", tracks }),
+      ...overrides,
+    };
+  }
+
+  test("a provider track with a youtube id performs zero searches", async () => {
+    let searches = 0;
+    const engine = makeEngine({
+      musicLinks: {
+        parse: (query) =>
+          query === spotifyUrl
+            ? { provider: "spotify", kind: "track", id: "t1", url: new URL(spotifyUrl) }
+            : null,
+        resolve: async () => ({
+          provider: "spotify",
+          kind: "track",
+          tracks: [providerTrack({ youtubeVideoId: "ytid1234567" })],
+        }),
+      },
+      deps: {
+        resolveSearch: async () => {
+          searches += 1;
+          return [];
+        },
+      },
+    });
+
+    const resolved = await engine.resolve(spotifyUrl);
+    expect(searches).toBe(0);
+    expect(resolved.isPlaylist).toBe(false);
+    expect(resolved.videoId).toBe("ytid1234567");
+    expect(resolved.webpageUrl).toBe("https://www.youtube.com/watch?v=ytid1234567");
+    // Source metadata wins over anything YouTube would say.
+    expect(resolved.title).toBe("Source Title");
+    expect(resolved.thumbnailUrl).toBe("https://i.scdn.co/image/source");
+  });
+
+  test("a provider track without a youtube id costs exactly one search", async () => {
+    const searches: string[] = [];
+    const engine = makeEngine({
+      musicLinks: linkSource([
+        providerTrack({ title: "One", artists: ["A"] }),
+        providerTrack({ title: "Two", artists: ["B", "C"] }),
+        providerTrack({ title: "Three", artists: [] }),
+      ]),
+      musicLinkMaxTracks: 10,
+      deps: {
+        resolveSearch: async (query) => {
+          searches.push(query);
+          return [
+            {
+              videoId: `yt${searches.length}`,
+              title: "YouTube title",
+              webpageUrl: `https://www.youtube.com/watch?v=yt${searches.length}`,
+              durationSec: 111,
+              thumbnailUrl: "https://i.ytimg.com/x.jpg",
+              isPlaylist: false,
+            },
+          ];
+        },
+      },
+    });
+
+    const resolved = await engine.resolve(spotifyUrl);
+    expect(searches).toEqual(["One A", "Two B C", "Three"]);
+    expect(resolved.isPlaylist).toBe(true);
+    expect(resolved.title).toBe("Album");
+    expect(resolved.entries?.map((entry) => entry.videoId)).toEqual(["yt1", "yt2", "yt3"]);
+    expect(resolved.entries?.[0]?.title).toBe("One");
+    expect(resolved.entries?.[0]?.artist).toBe("A");
+    expect(resolved.entries?.[0]?.durationSec).toBe(222);
+  });
+
+  test("a scraped track goes through the normal YouTube search path, never an invented id", async () => {
+    const trackUrl = "https://open.spotify.com/track/t1";
+    const calls: string[] = [];
+    const provider = createSpotifyProvider({
+      odesli: new OdesliClient({
+        fetch: async (input) => {
+          calls.push(input);
+          return new Response("{}", { status: 404 });
+        },
+      }),
+      fetch: async (input) => {
+        calls.push(input);
+        if (input !== trackUrl) return new Response("{}", { status: 404 });
+        return new Response(
+          `<html><head>` +
+            `<meta property="og:title" content="Blinding Lights"/>` +
+            `<meta property="og:description" content="The Weeknd · After Hours · Song · 2020"/>` +
+            `<meta property="og:type" content="music.song"/>` +
+            `<meta property="og:image" content="https://i.scdn.co/image/abc"/>` +
+            `<meta name="music:duration" content="200"/>` +
+            `</head><body></body></html>`,
+          { status: 200 },
+        );
+      },
+    });
+
+    const searches: string[] = [];
+    const engine = makeEngine({
+      musicLinks: {
+        parse: (query) =>
+          query === trackUrl
+            ? { provider: "spotify", kind: "track", id: "t1", url: new URL(trackUrl) }
+            : null,
+        resolve: (query) => provider.resolve(new URL(query)),
+      },
+      deps: {
+        resolveSearch: async (query) => {
+          searches.push(query);
+          return [
+            {
+              videoId: "ytSearchHit1",
+              title: "YouTube title",
+              webpageUrl: "https://www.youtube.com/watch?v=ytSearchHit1",
+              durationSec: 200,
+              thumbnailUrl: "https://i.ytimg.com/yt.jpg",
+              isPlaylist: false,
+            },
+          ];
+        },
+      },
+    });
+
+    const resolved = await engine.resolve(trackUrl);
+    expect(searches).toEqual(["Blinding Lights The Weeknd"]);
+    expect(resolved.videoId).toBe("ytSearchHit1");
+    expect(resolved.title).toBe("Blinding Lights");
+    expect(resolved.artist).toBe("The Weeknd");
+    expect(resolved.durationSec).toBe(200);
+    expect(resolved.thumbnailUrl).toBe("https://i.scdn.co/image/abc");
+    // The scrape is the only network call: no token, no Web API, no oEmbed.
+    expect(calls).toEqual([trackUrl]);
+  });
+
+  test("the music link cap is enforced on the mapped collection", async () => {
+    const engine = makeEngine({
+      musicLinks: linkSource([
+        providerTrack({ youtubeVideoId: "yt1" }),
+        providerTrack({ youtubeVideoId: "yt2" }),
+        providerTrack({ youtubeVideoId: "yt3" }),
+      ]),
+      musicLinkMaxTracks: 2,
+    });
+
+    const resolved = await engine.resolve(spotifyUrl);
+    expect(resolved.entries).toHaveLength(2);
+  });
+
+  test("a provider failure surfaces as a typed MediaError", async () => {
+    const engine = makeEngine({
+      musicLinks: linkSource([], {
+        resolve: async () => {
+          throw new MusicLinkError("TRACK_NOT_FOUND", "Spotify could not find that track.");
+        },
+      }),
+    });
+
+    const error = await engine.resolve(spotifyUrl).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(MediaError);
+    expect((error as MediaError).code).toBe("EXTRACTOR_FAILED");
+    expect((error as MediaError).message).toBe("Spotify could not find that track.");
+  });
+
+  test("a resolve cache hit avoids a second provider call", async () => {
+    let providerCalls = 0;
+    const engine = makeEngine({
+      musicLinks: linkSource([providerTrack({ youtubeVideoId: "yt1" })], {
+        resolve: async () => {
+          providerCalls += 1;
+          return {
+            provider: "spotify",
+            kind: "album",
+            title: "Album",
+            tracks: [providerTrack({ youtubeVideoId: "yt1" })],
+          };
+        },
+      }),
+    });
+
+    await engine.resolve(spotifyUrl);
+    await engine.resolve(spotifyUrl);
+    expect(providerCalls).toBe(1);
   });
 });

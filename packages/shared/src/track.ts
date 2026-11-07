@@ -12,6 +12,11 @@ export type RequestedBy = z.infer<typeof requestedBySchema>;
 export const queueTrackSchema = z.object({
   id: z.string().min(1),
   title: z.string().min(1),
+  /**
+   * Source artist(s), when the request started from a Spotify/Apple Music
+   * link. Optional so existing clients and stored queue payloads stay valid.
+   */
+  artist: z.string().min(1).nullable().optional(),
   url: z.url(),
   durationSec: z.number().int().nonnegative().nullable(),
   thumbnailUrl: z.url().nullable(),
