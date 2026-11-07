@@ -71,11 +71,12 @@ describe("loadConfig normalises pasted values", () => {
 });
 
 describe("loadConfig loudness normalization", () => {
-  test("defaults to one-pass loudnorm at -16 LUFS", () => {
+  test("defaults to limiter-only streams and loudnorm cached fallback at -14 LUFS", () => {
     const config = loadConfig(baseEnv());
     expect(config.audioNormalize).toBe("loudnorm");
-    expect(config.audioTargetLufs).toBe(-16);
-    expect(config.audioTruePeakDb).toBe(-1.5);
+    expect(config.audioStreamFilter).toBe("limiter");
+    expect(config.audioTargetLufs).toBe(-14);
+    expect(config.audioTruePeakDb).toBe(-1);
     expect(config.audioLra).toBe(11);
     expect(config.audioDynFrameMs).toBe(150);
     expect(config.audioTwoPass).toBe(true);
@@ -131,9 +132,23 @@ describe("loadConfig loudness normalization", () => {
     }
   });
 
+  test("accepts every AUDIO_STREAM_FILTER mode and trims it", () => {
+    for (const mode of ["limiter", "off", "loudnorm", "dynaudnorm"] as const) {
+      expect(loadConfig(baseEnv({ AUDIO_STREAM_FILTER: ` ${mode}\n` })).audioStreamFilter).toBe(
+        mode,
+      );
+    }
+  });
+
   test("rejects an unknown AUDIO_NORMALIZE mode", () => {
     expect(() => loadConfig(baseEnv({ AUDIO_NORMALIZE: "peak" }))).toThrow(
       /AUDIO_NORMALIZE: Invalid option/,
+    );
+  });
+
+  test("rejects an unknown AUDIO_STREAM_FILTER mode", () => {
+    expect(() => loadConfig(baseEnv({ AUDIO_STREAM_FILTER: "compress" }))).toThrow(
+      /AUDIO_STREAM_FILTER: Invalid option/,
     );
   });
 });
@@ -230,6 +245,79 @@ describe("loadConfig fast-start tuning", () => {
     );
     expect(() => loadConfig(baseEnv({ PREFETCH_DEPTH: "4" }))).toThrow(
       /PREFETCH_DEPTH: must be between 1 and 3/,
+    );
+  });
+});
+
+describe("loadConfig resolver selection", () => {
+  test("defaults to the yt-dlp resolver, so deploying changes nothing", () => {
+    const config = loadConfig(baseEnv());
+    expect(config.resolver).toBe("ytdlp");
+    expect(config.innertubeClient).toBe("VISIONOS");
+    expect(config.resolverFailureThreshold).toBe(3);
+    expect(config.resolverCooldownMs).toBe(600_000);
+  });
+
+  test("accepts the innertube flag and every client name", () => {
+    const config = loadConfig(baseEnv({ RESOLVER: " innertube\n" }));
+    expect(config.resolver).toBe("innertube");
+
+    for (const client of ["IOS", "ANDROID", "TV", "WEB", "VISIONOS"] as const) {
+      expect(loadConfig(baseEnv({ INNERTUBE_CLIENT: client })).innertubeClient).toBe(client);
+    }
+  });
+
+  test("accepts the breaker knobs and rejects values outside their range", () => {
+    const config = loadConfig(
+      baseEnv({ RESOLVER_FAILURE_THRESHOLD: "5", RESOLVER_COOLDOWN_MS: "30000" }),
+    );
+    expect(config.resolverFailureThreshold).toBe(5);
+    expect(config.resolverCooldownMs).toBe(30_000);
+
+    expect(() => loadConfig(baseEnv({ RESOLVER: "magic" }))).toThrow(/RESOLVER:/);
+    expect(() => loadConfig(baseEnv({ INNERTUBE_CLIENT: "MWEB" }))).toThrow(/INNERTUBE_CLIENT:/);
+    expect(() => loadConfig(baseEnv({ RESOLVER_FAILURE_THRESHOLD: "0" }))).toThrow(
+      /RESOLVER_FAILURE_THRESHOLD: must be between 1 and 100/,
+    );
+    expect(() => loadConfig(baseEnv({ RESOLVER_COOLDOWN_MS: "999" }))).toThrow(
+      /RESOLVER_COOLDOWN_MS: must be between 1000 and 86400000/,
+    );
+  });
+});
+
+describe("loadConfig music link providers", () => {
+  test("defaults the collection cap to 50 with no Spotify credentials", () => {
+    const config = loadConfig(baseEnv());
+    expect(config.musicLinkMaxTracks).toBe(50);
+    expect(config.spotifyClientId).toBeUndefined();
+    expect(config.spotifyClientSecret).toBeUndefined();
+  });
+
+  test("accepts a complete Spotify credential pair", () => {
+    const config = loadConfig(
+      baseEnv({ SPOTIFY_CLIENT_ID: " id ", SPOTIFY_CLIENT_SECRET: " secret " }),
+    );
+    expect(config.spotifyClientId).toBe("id");
+    expect(config.spotifyClientSecret).toBe("secret");
+  });
+
+  test("rejects half a credential pair in either direction", () => {
+    expect(() => loadConfig(baseEnv({ SPOTIFY_CLIENT_ID: "id" }))).toThrow(
+      /SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be set together/,
+    );
+    expect(() => loadConfig(baseEnv({ SPOTIFY_CLIENT_SECRET: "secret" }))).toThrow(
+      /SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be set together/,
+    );
+  });
+
+  test("bounds the collection cap at 1..100", () => {
+    expect(loadConfig(baseEnv({ MUSIC_LINK_MAX_TRACKS: "1" })).musicLinkMaxTracks).toBe(1);
+    expect(loadConfig(baseEnv({ MUSIC_LINK_MAX_TRACKS: "100" })).musicLinkMaxTracks).toBe(100);
+    expect(() => loadConfig(baseEnv({ MUSIC_LINK_MAX_TRACKS: "0" }))).toThrow(
+      /MUSIC_LINK_MAX_TRACKS: must be between 1 and 100/,
+    );
+    expect(() => loadConfig(baseEnv({ MUSIC_LINK_MAX_TRACKS: "101" }))).toThrow(
+      /MUSIC_LINK_MAX_TRACKS: must be between 1 and 100/,
     );
   });
 });

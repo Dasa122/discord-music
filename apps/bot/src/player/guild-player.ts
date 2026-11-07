@@ -39,6 +39,7 @@ import {
   VOICE_DISCONNECT_GRACE_MS,
   voiceTransitionAction,
 } from "./lifecycle.js";
+import { pendingCollections } from "./pending-collection.js";
 import { isRealAdvance, QueueController } from "./queue-ops.js";
 
 /** The subset of a voice state a log line needs. */
@@ -1103,6 +1104,10 @@ export class GuildPlayer {
    */
   private async endSessionInternal(): Promise<void> {
     const sessionId = this.sessionId;
+
+    // Pending /play pickers belong to this voice session; drop them with it so a
+    // choice can never enqueue into a destroyed player.
+    pendingCollections.clearGuild(this.guildId);
 
     this.clearIdleTimer();
     this.clearDisconnectTimer();
