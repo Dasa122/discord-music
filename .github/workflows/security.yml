@@ -1,0 +1,88 @@
+name: Security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    # gitleaks-action lists the PR's commits to diff the range, which needs
+    # pull-requests: read on top of the workflow-level contents: read.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan for secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  trivy-fs:
+    name: Filesystem scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # trivy-action@master currently delegates to aquasecurity/setup-trivy,
+      # whose default path (`$HOME/.local/bin`) trips its own literal-path
+      # validation. Install the same pinned Trivy version ourselves and skip
+      # the broken setup step.
+      - name: Install Trivy
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/trivy.tar.gz" \
+            https://github.com/aquasecurity/trivy/releases/download/v0.76.2/trivy_0.76.2_Linux-64bit.tar.gz
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP/bin" trivy
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Scan filesystem
+        uses: aquasecurity/trivy-action@master
+        with:
+          skip-setup-trivy: true
+          scan-type: fs
+          scanners: vuln,secret,config
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          # Explicit repo-root path: don't rely on the action's cwd resolving
+          # the default .trivyignore.
+          trivyignores: .trivyignore
+          exit-code: "1"
+
+  deps:
+    name: Dependency audit (bun audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      # Non-blocking on purpose: a registry hiccup or a fresh advisory must not
+      # block every PR. Once the baseline is clean, remove `continue-on-error`
+      # to make advisory findings fail the check.
+      - name: Audit dependencies
+        continue-on-error: true
+        run: |
+          if ! bun audit --help >/dev/null 2>&1; then
+            echo "bun audit is not available in this Bun build; skipping."
+            exit 0
+          fi
+          bun audit --json

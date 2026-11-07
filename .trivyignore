@@ -1,0 +1,5 @@
+# dxflrs/garage is a distroless image (single static binary, no passwd/group)
+# and creates /var/lib/garage/{meta,data} at boot; upstream runs as root and a
+# non-root user cannot write those image-owned dirs, so the container would
+# crash-loop. No host mounts are used. Suppressed deliberately.
+DS-0002

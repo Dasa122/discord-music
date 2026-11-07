@@ -1,0 +1,44 @@
+name: Semgrep
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  semgrep:
+    name: Semgrep scan
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --error makes the scan itself the gate. --severity ERROR keeps the gate
+      # on real errors: p/ci's mutable-action-tag rule is WARNING severity and
+      # would otherwise permanently fail because the action tags here (v4/v2/v3)
+      # are immutable-by-convention but not pinned to commit SHAs. Rulesets come
+      # from Semgrep's public registry, so no token is needed.
+      - name: Scan with p/ci and p/secrets
+        run: >-
+          semgrep scan --config p/ci --config p/secrets
+          --severity ERROR --error --sarif --output semgrep.sarif
+
+      # SARIF upload requires GitHub Advanced Security, which this private repo
+      # does not have; `continue-on-error` keeps the upload from failing the
+      # job. The scan above still gates the PR.
+      - name: Upload SARIF
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
