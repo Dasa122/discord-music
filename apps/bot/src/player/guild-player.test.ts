@@ -5,7 +5,7 @@ import type { QueueTrack } from "@music/shared";
 import { MediaError } from "../errors.js";
 import { DownloadRegistry } from "../media/download-registry.js";
 import type { MediaEngine } from "../media/media-engine.js";
-import { GuildPlayer, StreamSemaphore } from "./guild-player.js";
+import { GuildPlayer, StreamSemaphore, voiceStateLogFields } from "./guild-player.js";
 
 function track(id: string): QueueTrack {
   return {
@@ -170,5 +170,28 @@ describe("GuildPlayer.enqueue is not blocked by playback preparation", () => {
     } finally {
       process.off("unhandledRejection", onUnhandled);
     }
+  });
+});
+
+describe("voiceStateLogFields", () => {
+  test("carries the transition and omits an absent reason", () => {
+    expect(voiceStateLogFields({ status: "connecting" }, { status: "ready" })).toEqual({
+      from: "connecting",
+      to: "ready",
+    });
+  });
+
+  test("reads the disconnect reason defensively", () => {
+    expect(voiceStateLogFields({ status: "ready" }, { status: "disconnected", reason: 2 })).toEqual(
+      { from: "ready", to: "disconnected", reason: 2 },
+    );
+
+    expect(
+      voiceStateLogFields({ status: "ready" }, { status: "disconnected", reason: "network" }),
+    ).toEqual({ from: "ready", to: "disconnected", reason: "network" });
+
+    expect(
+      voiceStateLogFields({ status: "ready" }, { status: "disconnected", reason: null }),
+    ).toEqual({ from: "ready", to: "disconnected" });
   });
 });

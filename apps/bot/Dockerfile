@@ -82,10 +82,24 @@ COPY package.json ./
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=deps /app/apps/bot/node_modules ./apps/bot/node_modules
 COPY --from=deps /app/packages/shared/node_modules ./packages/shared/node_modules
+
+# `bun install` runs on the bun image (Node 26 ABI, glibc 2.41), so the
+# @discordjs/opus addon lands under that ABI's prebuild directory and this
+# Node 22 runtime cannot load it (falls back to the slower opusscript). Rebuild
+# it against the runtime's own Node.
+RUN cd /app/apps/bot \
+  && npm rebuild @discordjs/opus --no-audit --no-fund \
+  && rm -rf /root/.npm
 COPY --from=build /app/apps/bot/dist ./apps/bot/dist
 COPY --from=build /app/packages/shared/dist ./packages/shared/dist
 COPY packages/shared/package.json ./packages/shared/package.json
 COPY apps/bot/package.json ./apps/bot/package.json
+
+# bun's isolated linker keeps workspace dependencies in the workspace's own
+# node_modules (apps/bot/node_modules), not in /app/node_modules. The bot's own
+# imports resolve either way, but a bare `require()` from /app (in-image
+# diagnostics) only finds them through NODE_PATH.
+ENV NODE_PATH=/app/apps/bot/node_modules
 
 # Runs as an unprivileged user. The only writable location the bot needs is the
 # mounted /data volume (cookies and other media tooling state).
