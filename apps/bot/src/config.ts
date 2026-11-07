@@ -56,6 +56,26 @@ const envSchema = z.object({
     .default("true")
     .transform((value) => !["false", "0", "no", "off"].includes(value)),
   PREFETCH_MAX_CONCURRENT: z.coerce.number().int().min(1).max(4).default(2),
+  /**
+   * How many upcoming queue tracks to prefetch. Kept small so the prefetch
+   * budget never competes with the track that is about to play.
+   */
+  PREFETCH_DEPTH: z.coerce
+    .number()
+    .int()
+    .min(1, "must be between 1 and 3")
+    .max(3, "must be between 1 and 3")
+    .default(2),
+  /**
+   * How much decoded PCM to buffer before a streamed track starts. Higher
+   * values trade start latency for a larger safety margin on a slow network.
+   */
+  STREAM_PREBUFFER_MS: z.coerce
+    .number()
+    .int()
+    .min(100, "must be between 100 and 2000")
+    .max(2000, "must be between 100 and 2000")
+    .default(250),
   /** Refuse individual downloads larger than this. */
   AUDIO_CACHE_MAX_FILE_BYTES: z.coerce.number().int().min(1).default(67_108_864),
   /** Perceived-volume levelling applied to decoded PCM before Discord. */
@@ -147,6 +167,8 @@ export interface AppConfig {
   audioCacheMaxBytes: number;
   prefetchEnabled: boolean;
   prefetchMaxConcurrent: number;
+  prefetchDepth: number;
+  streamPrebufferMs: number;
   audioCacheMaxFileBytes: number;
   audioNormalize: "loudnorm" | "dynaudnorm" | "off";
   audioTargetLufs: number;
@@ -233,6 +255,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     audioCacheMaxBytes: value.AUDIO_CACHE_MAX_BYTES,
     prefetchEnabled: value.PREFETCH_ENABLED,
     prefetchMaxConcurrent: value.PREFETCH_MAX_CONCURRENT,
+    prefetchDepth: value.PREFETCH_DEPTH,
+    streamPrebufferMs: value.STREAM_PREBUFFER_MS,
     audioCacheMaxFileBytes: value.AUDIO_CACHE_MAX_FILE_BYTES,
     audioNormalize: value.AUDIO_NORMALIZE,
     audioTargetLufs: value.AUDIO_TARGET_LUFS,

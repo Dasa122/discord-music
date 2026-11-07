@@ -200,3 +200,36 @@ describe("loadConfig opus bitrate", () => {
     );
   });
 });
+
+describe("loadConfig fast-start tuning", () => {
+  test("defaults to a 250 ms stream prebuffer and prefetch depth 2", () => {
+    const config = loadConfig(baseEnv());
+    expect(config.streamPrebufferMs).toBe(250);
+    expect(config.prefetchDepth).toBe(2);
+  });
+
+  test("accepts the stream prebuffer range 100..2000", () => {
+    expect(loadConfig(baseEnv({ STREAM_PREBUFFER_MS: " 100\n" })).streamPrebufferMs).toBe(100);
+    expect(loadConfig(baseEnv({ STREAM_PREBUFFER_MS: "2000" })).streamPrebufferMs).toBe(2000);
+  });
+
+  test("accepts the prefetch depth range 1..3", () => {
+    expect(loadConfig(baseEnv({ PREFETCH_DEPTH: "1" })).prefetchDepth).toBe(1);
+    expect(loadConfig(baseEnv({ PREFETCH_DEPTH: " 3 " })).prefetchDepth).toBe(3);
+  });
+
+  test("rejects out-of-range values and names the variable", () => {
+    expect(() => loadConfig(baseEnv({ STREAM_PREBUFFER_MS: "99" }))).toThrow(
+      /STREAM_PREBUFFER_MS: must be between 100 and 2000/,
+    );
+    expect(() => loadConfig(baseEnv({ STREAM_PREBUFFER_MS: "2001" }))).toThrow(
+      /STREAM_PREBUFFER_MS: must be between 100 and 2000/,
+    );
+    expect(() => loadConfig(baseEnv({ PREFETCH_DEPTH: "0" }))).toThrow(
+      /PREFETCH_DEPTH: must be between 1 and 3/,
+    );
+    expect(() => loadConfig(baseEnv({ PREFETCH_DEPTH: "4" }))).toThrow(
+      /PREFETCH_DEPTH: must be between 1 and 3/,
+    );
+  });
+});

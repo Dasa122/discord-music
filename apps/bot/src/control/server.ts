@@ -4,6 +4,7 @@ import { createServer, type Server } from "node:http";
 import type { ControlAction, QueueTrack } from "@music/shared";
 import { controlActionSchema } from "@music/shared";
 import type { Client } from "discord.js";
+import { startPlayInParallel } from "../commands/play-start.js";
 import { config } from "../config.js";
 import { getPlaylistWithItems } from "../db/client.js";
 import { MediaError, PlayerError } from "../errors.js";
@@ -209,12 +210,20 @@ async function applyAction(guildId: string, action: ControlAction): Promise<Guil
 
   switch (action.type) {
     case "play": {
-      if (!player.getState().connected) {
-        throw new PlayerError("NOT_CONNECTED", "The bot is not connected to a voice channel.");
-      }
+      // The dashboard can only drive an existing voice session, so the
+      // control-side "join" is a connection guard. It still runs in parallel
+      // with the resolve, and a failure cleans up the allocated session.
+      const sessionId = player.beginSession();
+      const { resolved } = await startPlayInParallel({
+        join: async () => {
+          if (!player.getState().connected) {
+            throw new PlayerError("NOT_CONNECTED", "The bot is not connected to a voice channel.");
+          }
+        },
+        resolve: () => getMedia().resolve(action.query, sessionId),
+        onJoinFailure: () => player.endSession(),
+      });
       if (action.textChannelId) player.setTextChannel(action.textChannelId);
-
-      const resolved = await getMedia().resolve(action.query, player.beginSession());
       const tracks = toQueueTracks(resolved, action.requestedBy);
       if (tracks.length === 0) {
         throw new MediaError("NOT_FOUND", "No playable tracks were found.");

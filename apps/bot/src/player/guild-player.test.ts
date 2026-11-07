@@ -338,7 +338,7 @@ describe("GuildPlayer prefetch scheduling", () => {
       new StreamSemaphore(4),
       prefetchMedia(prefetched, cancelled),
       undefined,
-      { prefetchDebounceMs: 0 },
+      { prefetchDebounceMs: 0, prefetchDepth: 1 },
     );
 
     await player.enqueue([track("a")]);
@@ -354,7 +354,7 @@ describe("GuildPlayer prefetch scheduling", () => {
       new StreamSemaphore(4),
       prefetchMedia(prefetched, cancelled),
       undefined,
-      { prefetchDebounceMs: 50 },
+      { prefetchDebounceMs: 50, prefetchDepth: 1 },
     );
 
     await startWithQueued(player, ["a"]);
@@ -373,7 +373,7 @@ describe("GuildPlayer prefetch scheduling", () => {
       new StreamSemaphore(4),
       prefetchMedia(prefetched, cancelled),
       undefined,
-      { prefetchDebounceMs: 0 },
+      { prefetchDebounceMs: 0, prefetchDepth: 1 },
     );
 
     await startWithQueued(player, ["a"]);
@@ -395,7 +395,7 @@ describe("GuildPlayer prefetch scheduling", () => {
       new StreamSemaphore(4),
       prefetchMedia(prefetched, cancelled),
       undefined,
-      { prefetchDebounceMs: 0 },
+      { prefetchDebounceMs: 0, prefetchDepth: 1 },
     );
 
     await startWithQueued(player, ["a"]);
@@ -416,7 +416,7 @@ describe("GuildPlayer prefetch scheduling", () => {
       new StreamSemaphore(4),
       prefetchMedia(prefetched, cancelled),
       undefined,
-      { prefetchDebounceMs: 0, rng: () => 0 },
+      { prefetchDebounceMs: 0, rng: () => 0, prefetchDepth: 1 },
     );
 
     await startWithQueued(player, ["a"]);
@@ -429,5 +429,72 @@ describe("GuildPlayer prefetch scheduling", () => {
     // rng 0 swaps the two-item queue to [c, b].
     expect(prefetched).toEqual(["b", "c"]);
     expect(cancelled.map((entry) => entry.trackId)).toEqual(["b"]);
+  });
+});
+
+describe("GuildPlayer prefetch depth", () => {
+  test("depth 2 schedules the first two upcoming tracks once, in queue order", async () => {
+    const prefetched: string[] = [];
+    const cancelled: Array<{ sessionId?: string; trackId?: string }> = [];
+    const player = makePlayer(
+      new StreamSemaphore(4),
+      prefetchMedia(prefetched, cancelled),
+      undefined,
+      { prefetchDebounceMs: 0, prefetchDepth: 2 },
+    );
+
+    await startWithQueued(player, ["a"]);
+    await player.enqueue([track("b"), track("c"), track("d")]);
+    await waitFor(() => prefetched.length >= 2);
+    await tick();
+
+    expect(prefetched).toEqual(["b", "c"]);
+    expect(cancelled).toEqual([]);
+
+    // An unchanged window does not reschedule (the engine dedupes too, but the
+    // player must not even ask twice).
+    await player.enqueue([track("e")]);
+    await tick();
+    expect(prefetched).toEqual(["b", "c"]);
+  });
+
+  test("depth 1 behaves as before: only the head is prefetched", async () => {
+    const prefetched: string[] = [];
+    const cancelled: Array<{ sessionId?: string; trackId?: string }> = [];
+    const player = makePlayer(
+      new StreamSemaphore(4),
+      prefetchMedia(prefetched, cancelled),
+      undefined,
+      { prefetchDebounceMs: 0, prefetchDepth: 1 },
+    );
+
+    await startWithQueued(player, ["a"]);
+    await player.enqueue([track("b"), track("c"), track("d")]);
+    await tick();
+
+    expect(prefetched).toEqual(["b"]);
+  });
+
+  test("a track that leaves the depth-2 window has its job cancelled", async () => {
+    const prefetched: string[] = [];
+    const cancelled: Array<{ sessionId?: string; trackId?: string }> = [];
+    const player = makePlayer(
+      new StreamSemaphore(4),
+      prefetchMedia(prefetched, cancelled),
+      undefined,
+      { prefetchDebounceMs: 0, prefetchDepth: 2 },
+    );
+
+    await startWithQueued(player, ["a"]);
+    await player.enqueue([track("b"), track("c")]);
+    await waitFor(() => prefetched.length >= 2);
+    await tick();
+
+    // Removing the second window entry leaves b; c must be aborted.
+    await player.remove(1);
+    await tick();
+
+    expect(cancelled.map((entry) => entry.trackId)).toEqual(["c"]);
+    expect(prefetched).toEqual(["b", "c"]);
   });
 });

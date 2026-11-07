@@ -136,7 +136,19 @@ The byte cap (`AUDIO_CACHE_MAX_BYTES`, 1.5 GiB by default) is only an LRU safety
 long session. Live streams and tracks without a known duration are never cached; they always use
 the yt-dlp pipe. If a store read or download fails, playback degrades to that same pipe rather than
 failing the track. Cache tuning lives in `AUDIO_CACHE_DIR`, `AUDIO_CACHE_MAX_BYTES`,
-`AUDIO_CACHE_MAX_FILE_BYTES`, `PREFETCH_ENABLED`, and `PREFETCH_MAX_CONCURRENT`.
+`AUDIO_CACHE_MAX_FILE_BYTES`, `PREFETCH_ENABLED`, `PREFETCH_MAX_CONCURRENT`, and
+`PREFETCH_DEPTH` (1..3, default 2: the next two queue tracks are fetched in order, through a
+budget that playback never waits on).
+
+### Fast start
+
+`/play` joins the voice channel and resolves the query at the same time, so extraction no longer
+waits for the voice handshake, and resolved metadata is memoised for five minutes. Streamed
+tracks buffer `STREAM_PREBUFFER_MS` (default 250 ms, range 100..2000) of decoded audio before
+playback; lower values start faster but risk stalls on a slow network. If the stream produces no
+bytes within four times that window it falls back to the raw pipe instead of failing the track.
+The first track of each play logs `first_audio { ms, source, trackId }` at `info` when the player
+reaches `Playing`, which is the measurement to compare before and after these changes.
 
 ### Loudness normalization
 

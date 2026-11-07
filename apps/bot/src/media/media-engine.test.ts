@@ -60,6 +60,7 @@ function makeEngine(overrides: {
   twoPass?: boolean;
   maxGainDb?: number;
   normalization?: LoudnessSettings;
+  streamPrebufferMs?: number;
 }) {
   return new YtdlpMediaEngine({
     ytdlp: { path: "yt-dlp", denoPath: "deno" },
@@ -69,6 +70,7 @@ function makeEngine(overrides: {
     twoPass: overrides.twoPass,
     maxGainDb: overrides.maxGainDb,
     prefetchEnabled: overrides.prefetchEnabled,
+    streamPrebufferMs: overrides.streamPrebufferMs,
     prebufferTimeoutMs: 500,
     deps: {
       downloadAudio: async () => ({ path: "/tmp/produced", info: null }),
@@ -127,7 +129,7 @@ describe("media engine source selection", () => {
     expect(opened.source).toBe("cache");
     expect(target).toBe("mem://s/vid.audio");
     expect(CACHE_PREBUFFER_BYTES).toBe(48_000);
-    expect(STREAM_PREBUFFER_BYTES).toBe(192_000);
+    expect(STREAM_PREBUFFER_BYTES).toBe(48_000);
   });
 
   test("an uncached track streams through yt-dlp", async () => {
@@ -732,5 +734,149 @@ describe("media engine download reporting", () => {
     const entry = downloads.snapshot().entries[0];
     expect(entry?.state).toBe("failed");
     expect(entry?.error).toBe("DOWNLOAD_ABORTED");
+  });
+});
+
+describe("media engine resolve cache", () => {
+  test("a repeated text query extracts once and replays the metadata", async () => {
+    let extractions = 0;
+    const engine = makeEngine({
+      deps: {
+        resolve: async () => {
+          extractions += 1;
+          return {
+            videoId: "cachedVid",
+            title: "Cached Song",
+            webpageUrl: "https://www.youtube.com/watch?v=cachedVid",
+            durationSec: 123,
+            thumbnailUrl: "https://i.ytimg.com/vi/cachedVid/hqdefault.jpg",
+            isPlaylist: false,
+          };
+        },
+      },
+    });
+
+    const first = await engine.resolve("  Some  SONG ");
+    const second = await engine.resolve("some song");
+
+    expect(extractions).toBe(1);
+    expect(second.title).toBe(first.title);
+    expect(second.videoId).toBe("cachedVid");
+    expect(second.webpageUrl).toBe("https://www.youtube.com/watch?v=cachedVid");
+    expect(second.durationSec).toBe(123);
+  });
+
+  test("a URL query is a different cache key than its lowercased form", async () => {
+    let extractions = 0;
+    const engine = makeEngine({
+      deps: {
+        resolve: async (query) => {
+          extractions += 1;
+          return {
+            videoId: "vid",
+            title: query,
+            webpageUrl: query,
+            durationSec: 1,
+            thumbnailUrl: null,
+            isPlaylist: false,
+          };
+        },
+      },
+    });
+
+    await engine.resolve("https://example.com/Song.mp3");
+    await engine.resolve("https://example.com/Song.mp3");
+    await engine.resolve("https://example.com/song.mp3");
+    expect(extractions).toBe(2);
+  });
+
+  test("a failed extraction is not cached", async () => {
+    let extractions = 0;
+    const engine = makeEngine({
+      deps: {
+        resolve: async () => {
+          extractions += 1;
+          if (extractions === 1) throw new MediaError("EXTRACTOR_FAILED", "boom");
+          return {
+            videoId: "vid",
+            title: "Recovered",
+            webpageUrl: "https://www.youtube.com/watch?v=vid",
+            durationSec: 1,
+            thumbnailUrl: null,
+            isPlaylist: false,
+          };
+        },
+      },
+    });
+
+    await expect(engine.resolve("retry me")).rejects.toThrow(/boom/);
+    const resolved = await engine.resolve("retry me");
+    expect(resolved.title).toBe("Recovered");
+    expect(extractions).toBe(2);
+  });
+
+  test("the session cache-first check wins over the resolve cache", async () => {
+    const videoId = "dQw4w9WgXcQ";
+    const cachedTrack = {
+      ...track,
+      id: videoId,
+      url: `https://www.youtube.com/watch?v=${videoId}`,
+    };
+    const info = {
+      videoId,
+      title: "Download metadata",
+      durationSec: 42,
+      thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    };
+    let extractions = 0;
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      deps: {
+        downloadAudio: async () => ({ path: "/tmp/produced", info }),
+        resolve: async () => {
+          extractions += 1;
+          return {
+            videoId,
+            title: "Extractor title",
+            webpageUrl: cachedTrack.url,
+            durationSec: 1,
+            thumbnailUrl: null,
+            isPlaylist: false,
+          };
+        },
+      },
+    });
+
+    await engine.prepare(cachedTrack, "s");
+    const resolved = await engine.resolve(cachedTrack.url, "s");
+    expect(resolved.title).toBe("Download metadata");
+    expect(extractions).toBe(0);
+  });
+});
+
+describe("media engine stream prebuffer", () => {
+  test("a stream that produces nothing within 4x the window falls back to piping", async () => {
+    const silent = new PassThrough();
+    const engine = makeEngine({
+      streamPrebufferMs: 100,
+      deps: {
+        openAudioStream: async () => ({ process: fakeProcess(), stream: silent }),
+        toPcm: () => silent,
+      },
+    });
+
+    const startedAt = Date.now();
+    const opened = await engine.open(track, { sessionId: "s" });
+    expect(opened.source).toBe("stream");
+    // 100 ms window × 4 = 400 ms, well under the old 15 s failure timeout.
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+
+    const received: Buffer[] = [];
+    opened.stream.on("data", (chunk: Buffer) => received.push(chunk));
+    silent.write(Buffer.alloc(1_000));
+    await tick(20);
+    expect(received.reduce((total, chunk) => total + chunk.length, 0)).toBeGreaterThan(0);
+
+    opened.stop();
   });
 });

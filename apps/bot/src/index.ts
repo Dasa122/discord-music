@@ -101,6 +101,7 @@ async function main(): Promise<void> {
     maxGainDb: config.audioMaxGainDb,
     prefetchEnabled: config.prefetchEnabled,
     prefetchMaxConcurrent: config.prefetchMaxConcurrent,
+    streamPrebufferMs: config.streamPrebufferMs,
     maxCacheFileBytes: config.audioCacheMaxFileBytes,
   });
 

@@ -63,6 +63,7 @@ export async function getPlayer(guildId: string): Promise<GuildPlayer> {
     semaphore: globalStreamSemaphore,
     idleTimeoutSeconds: config.idleTimeoutSeconds,
     audioBitrateKbps: config.audioBitrateKbps,
+    prefetchDepth: config.prefetchDepth,
     loadSettings: () => getGuildSettings(guildId),
     recordPlay: (track) =>
       recordPlay({
