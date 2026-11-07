@@ -10,6 +10,7 @@ import { logger, setLogLevel } from "./logger.js";
 import { AudioCache } from "./media/audio-cache.js";
 import { selectAudioStore } from "./media/audio-store.js";
 import { YtdlpMediaEngine } from "./media/media-engine.js";
+import { createResolver } from "./media/resolver/index.js";
 import { destroyAllPlayers } from "./player/registry.js";
 import {
   assertDaveAvailable,
@@ -79,15 +80,26 @@ async function main(): Promise<void> {
     });
   });
 
+  const ytdlp = {
+    path: config.ytdlpPath,
+    denoPath: config.denoPath,
+    cookiesFile: config.ytdlpCookiesFile,
+    proxy: config.ytdlpProxy,
+    potProviderUrl: config.potProviderUrl,
+    cacheDir: config.ytdlpCacheDir,
+  };
+  // RESOLVER=ytdlp (the default) keeps the pre-P2 extractor path untouched.
+  const resolver = createResolver({
+    resolver: config.resolver,
+    innertubeClient: config.innertubeClient,
+    failureThreshold: config.resolverFailureThreshold,
+    cooldownMs: config.resolverCooldownMs,
+    ytdlp,
+  });
+
   const media = new YtdlpMediaEngine({
-    ytdlp: {
-      path: config.ytdlpPath,
-      denoPath: config.denoPath,
-      cookiesFile: config.ytdlpCookiesFile,
-      proxy: config.ytdlpProxy,
-      potProviderUrl: config.potProviderUrl,
-      cacheDir: config.ytdlpCacheDir,
-    },
+    ytdlp,
+    resolver,
     ffmpegPath: config.ffmpegPath,
     normalization: {
       mode: config.audioNormalize,

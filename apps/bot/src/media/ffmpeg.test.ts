@@ -6,9 +6,11 @@ import {
   DEFAULT_LOUDNESS_SETTINGS,
   type LoudnessSettings,
   parseLoudnormJson,
+  sanitizeStreamHeaders,
   selectPlaybackFilter,
   toPcmArgs,
   toPcmFromFileArgs,
+  toPcmFromUrlArgs,
 } from "./ffmpeg.js";
 
 function settings(overrides: Partial<LoudnessSettings> = {}): LoudnessSettings {
@@ -276,5 +278,58 @@ describe("per-call filter override", () => {
       expect(args).not.toContain("-af");
       expect(args.slice(-OUTPUT_TAIL.length)).toEqual(OUTPUT_TAIL);
     }
+  });
+});
+
+describe("direct stream URL", () => {
+  test("sanitizeStreamHeaders joins with CRLF and strips CR/LF from values", () => {
+    const block = sanitizeStreamHeaders({
+      "User-Agent": "com.google.ios.youtube/20.11.6\r\nX-Injected: 1",
+      "X-Other": "line\nbreak\r",
+    });
+
+    expect(block).toBe(
+      "User-Agent: com.google.ios.youtube/20.11.6X-Injected: 1\r\nX-Other: linebreak",
+    );
+    expect(block?.split("\r\n")).toHaveLength(2);
+  });
+
+  test("sanitizeStreamHeaders also strips CR/LF from a header name and drops empty ones", () => {
+    expect(sanitizeStreamHeaders({ "Bad\r\nName": "v" })).toBe("BadName: v");
+    expect(sanitizeStreamHeaders({})).toBeNull();
+    expect(sanitizeStreamHeaders(undefined)).toBeNull();
+  });
+
+  test("toPcmFromUrl puts -headers and -ss before -i and the output tail last", () => {
+    const args = toPcmFromUrlArgs(
+      "https://rr1.googlevideo.com/videoplayback?itag=140",
+      { "User-Agent": "UA" },
+      { startSec: 30, normalization: settings() },
+    );
+
+    const headers = args.indexOf("-headers");
+    const seek = args.indexOf("-ss");
+    const input = args.indexOf("-i");
+
+    expect(headers).toBeGreaterThanOrEqual(0);
+    expect(args[headers + 1]).toBe("User-Agent: UA");
+    expect(seek).toBeGreaterThanOrEqual(0);
+    expect(args[seek + 1]).toBe("30");
+    expect(headers).toBeLessThan(input);
+    expect(seek).toBeLessThan(input);
+    expect(input).toBeLessThan(args.indexOf("-af"));
+    expect(args.slice(-OUTPUT_TAIL.length)).toEqual(OUTPUT_TAIL);
+    expect(args[args.length - 1]).toBe("pipe:1");
+  });
+
+  test("toPcmFromUrl emits -ss 0 for the first play and no -headers when absent", () => {
+    const args = toPcmFromUrlArgs("https://rr1.googlevideo.com/videoplayback", undefined, {
+      normalization: settings({ mode: "off" }),
+    });
+
+    expect(args).not.toContain("-headers");
+    expect(args[args.indexOf("-ss") + 1]).toBe("0");
+    expect(args).not.toContain("-af");
+    expect(args.slice(-OUTPUT_TAIL.length)).toEqual(OUTPUT_TAIL);
   });
 });

@@ -34,6 +34,34 @@ const envSchema = z.object({
   MAX_CONCURRENT_STREAMS: z.coerce.number().int().min(1).max(100).default(3),
   IDLE_TIMEOUT_SECONDS: z.coerce.number().int().min(0).max(86_400).default(60),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+  /**
+   * Which resolver turns a query into a track. `ytdlp` is the pre-P2 path and
+   * the default, so deploying this changes nothing until it is flipped.
+   */
+  RESOLVER: z.enum(["ytdlp", "innertube"]).default("ytdlp"),
+  /**
+   * InnerTube client used for playback. VISIONOS is the only client measured to
+   * return URLs that ffmpeg can actually stream (10/10 sampled videos; IOS
+   * manages 1/8 because its URLs 403 above a ~1 MiB range, ANDROID/WEB fail to
+   * decipher and TV reports the page as unplayable). It is an undocumented
+   * client, so `RESOLVER` stays `ytdlp` by default and this only matters when
+   * the resolver is opted into.
+   */
+  INNERTUBE_CLIENT: z.enum(["IOS", "ANDROID", "TV", "WEB", "VISIONOS"]).default("VISIONOS"),
+  /** Consecutive innertube failures before every call is routed to yt-dlp. */
+  RESOLVER_FAILURE_THRESHOLD: z.coerce
+    .number()
+    .int()
+    .min(1, "must be between 1 and 100")
+    .max(100, "must be between 1 and 100")
+    .default(3),
+  /** How long the breaker stays open (then one probe) in milliseconds. */
+  RESOLVER_COOLDOWN_MS: z.coerce
+    .number()
+    .int()
+    .min(1_000, "must be between 1000 and 86400000")
+    .max(86_400_000, "must be between 1000 and 86400000")
+    .default(600_000),
   YTDLP_PATH: z.string().min(1).default("yt-dlp"),
   DENO_PATH: z.string().min(1).default("deno"),
   FFMPEG_PATH: z.string().min(1).default("ffmpeg"),
@@ -155,6 +183,10 @@ export interface AppConfig {
   maxConcurrentStreams: number;
   idleTimeoutSeconds: number;
   logLevel: "debug" | "info" | "warn" | "error";
+  resolver: "ytdlp" | "innertube";
+  innertubeClient: "IOS" | "ANDROID" | "TV" | "WEB" | "VISIONOS";
+  resolverFailureThreshold: number;
+  resolverCooldownMs: number;
   ytdlpPath: string;
   denoPath: string;
   ffmpegPath: string;
@@ -243,6 +275,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     maxConcurrentStreams: value.MAX_CONCURRENT_STREAMS,
     idleTimeoutSeconds: value.IDLE_TIMEOUT_SECONDS,
     logLevel: value.LOG_LEVEL,
+    resolver: value.RESOLVER,
+    innertubeClient: value.INNERTUBE_CLIENT,
+    resolverFailureThreshold: value.RESOLVER_FAILURE_THRESHOLD,
+    resolverCooldownMs: value.RESOLVER_COOLDOWN_MS,
     ytdlpPath: value.YTDLP_PATH,
     denoPath: value.DENO_PATH,
     ffmpegPath: value.FFMPEG_PATH,

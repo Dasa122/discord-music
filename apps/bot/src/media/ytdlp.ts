@@ -44,6 +44,14 @@ export interface ResolvedTrack {
   thumbnailUrl: string | null;
   isPlaylist: boolean;
   entries?: ResolvedTrack[];
+  /**
+   * Direct media URL for the play that follows this resolve. Signed and bound
+   * to the requesting IP/User-Agent, so it is never cached: the resolve cache
+   * drops it and the player keeps it only until the next open.
+   */
+  streamUrl?: string;
+  /** HTTP headers `streamUrl` must be fetched with. */
+  headers?: Record<string, string>;
 }
 
 /** Authoritative metadata printed by a download (`--print-json`). */
@@ -107,7 +115,7 @@ function isHttpUrl(value: string): boolean {
   return /^https?:\/\//i.test(value);
 }
 
-function isPlaylistUrl(value: string): boolean {
+export function isPlaylistUrl(value: string): boolean {
   return isHttpUrl(value) && /(?:[?&]list=|\/playlist\/|\/sets\/)/i.test(value);
 }
 

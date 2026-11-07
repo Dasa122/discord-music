@@ -25,6 +25,7 @@
     "drizzle-orm": "^0.45.4",
     "opusscript": "^0.1.1",
     "postgres": "^4.1.0",
+    "youtubei.js": "^18.3.0",
     "zod": "^4.6.7"
   },
   "devDependencies": {
