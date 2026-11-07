@@ -10,6 +10,7 @@ import { logger, setLogLevel } from "./logger.js";
 import { AudioCache } from "./media/audio-cache.js";
 import { selectAudioStore } from "./media/audio-store.js";
 import { YtdlpMediaEngine } from "./media/media-engine.js";
+import { createMusicLinkResolver } from "./media/providers/index.js";
 import { createResolver } from "./media/resolver/index.js";
 import { destroyAllPlayers } from "./player/registry.js";
 import {
@@ -100,6 +101,12 @@ async function main(): Promise<void> {
   const media = new YtdlpMediaEngine({
     ytdlp,
     resolver,
+    musicLinks: createMusicLinkResolver({
+      spotifyClientId: config.spotifyClientId,
+      spotifyClientSecret: config.spotifyClientSecret,
+      maxTracks: config.musicLinkMaxTracks,
+    }),
+    musicLinkMaxTracks: config.musicLinkMaxTracks,
     ffmpegPath: config.ffmpegPath,
     normalization: {
       mode: config.audioNormalize,

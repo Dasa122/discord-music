@@ -269,3 +269,40 @@ describe("loadConfig resolver selection", () => {
     );
   });
 });
+
+describe("loadConfig music link providers", () => {
+  test("defaults the collection cap to 50 with no Spotify credentials", () => {
+    const config = loadConfig(baseEnv());
+    expect(config.musicLinkMaxTracks).toBe(50);
+    expect(config.spotifyClientId).toBeUndefined();
+    expect(config.spotifyClientSecret).toBeUndefined();
+  });
+
+  test("accepts a complete Spotify credential pair", () => {
+    const config = loadConfig(
+      baseEnv({ SPOTIFY_CLIENT_ID: " id ", SPOTIFY_CLIENT_SECRET: " secret " }),
+    );
+    expect(config.spotifyClientId).toBe("id");
+    expect(config.spotifyClientSecret).toBe("secret");
+  });
+
+  test("rejects half a credential pair in either direction", () => {
+    expect(() => loadConfig(baseEnv({ SPOTIFY_CLIENT_ID: "id" }))).toThrow(
+      /SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be set together/,
+    );
+    expect(() => loadConfig(baseEnv({ SPOTIFY_CLIENT_SECRET: "secret" }))).toThrow(
+      /SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be set together/,
+    );
+  });
+
+  test("bounds the collection cap at 1..100", () => {
+    expect(loadConfig(baseEnv({ MUSIC_LINK_MAX_TRACKS: "1" })).musicLinkMaxTracks).toBe(1);
+    expect(loadConfig(baseEnv({ MUSIC_LINK_MAX_TRACKS: "100" })).musicLinkMaxTracks).toBe(100);
+    expect(() => loadConfig(baseEnv({ MUSIC_LINK_MAX_TRACKS: "0" }))).toThrow(
+      /MUSIC_LINK_MAX_TRACKS: must be between 1 and 100/,
+    );
+    expect(() => loadConfig(baseEnv({ MUSIC_LINK_MAX_TRACKS: "101" }))).toThrow(
+      /MUSIC_LINK_MAX_TRACKS: must be between 1 and 100/,
+    );
+  });
+});

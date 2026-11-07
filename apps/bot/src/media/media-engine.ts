@@ -16,6 +16,15 @@ import {
   toPcmFromUrl,
 } from "./ffmpeg.js";
 import { QueuedSemaphore } from "./limits.js";
+import {
+  buildTrackSearchQuery,
+  DEFAULT_MUSIC_LINK_MAX_TRACKS,
+  type DetectedMusicLink,
+  MusicLinkError,
+  type MusicLinkResolution,
+  type ProviderTrack,
+  providerArtist,
+} from "./providers/index.js";
 import { type CachedResolution, ResolveCache } from "./resolve-cache.js";
 import type { TrackResolver } from "./resolver/types.js";
 import { createYtdlpResolver } from "./resolver/ytdlp-resolver.js";
@@ -119,6 +128,15 @@ export interface MediaEngineDeps {
   analyzeLoudness: typeof analyzeLoudness;
 }
 
+/**
+ * The music-link seam: `MusicLinkResolver` implements it, and tests can supply
+ * one without a network.
+ */
+export interface MusicLinkSource {
+  parse(query: string): DetectedMusicLink | null;
+  resolve(query: string, maxTracks?: number): Promise<MusicLinkResolution>;
+}
+
 /** Exact gain measured for one cached track. */
 export interface TrackMeasurement {
   gainDb: number;
@@ -149,6 +167,10 @@ export interface YtdlpMediaEngineOptions {
    * pre-P2 behaviour is unchanged when RESOLVER is unset.
    */
   resolver?: TrackResolver;
+  /** Spotify/Apple Music link resolution; disabled when omitted. */
+  musicLinks?: MusicLinkSource;
+  /** Cap applied to a provider collection (MUSIC_LINK_MAX_TRACKS). */
+  musicLinkMaxTracks?: number;
   deps?: Partial<MediaEngineDeps>;
 }
 
@@ -238,6 +260,12 @@ function readFirstChunks(
   });
 }
 
+/** "Spotify playlist" / "Apple Music album" when the API exposed no name. */
+function collectionFallbackTitle(resolution: MusicLinkResolution): string {
+  const label = resolution.provider === "spotify" ? "Spotify" : "Apple Music";
+  return `${label} ${resolution.kind}`;
+}
+
 /**
  * Rebuild a playable `ResolvedTrack` from cached metadata. Only the canonical
  * video id is cached, so the page URL is derived here instead of a signed
@@ -250,6 +278,7 @@ function materializeResolvedTrack(entry: CachedResolution, fallbackUrl: string):
   const track: ResolvedTrack = {
     videoId: entry.videoId,
     title: entry.title,
+    artist: entry.artist ?? null,
     webpageUrl,
     durationSec: entry.durationSec,
     thumbnailUrl: entry.thumbnailUrl,
@@ -276,6 +305,8 @@ export class YtdlpMediaEngine implements MediaEngine {
   private readonly prebufferTimeoutMs: number;
   private readonly resolveCache: ResolveCache;
   private readonly resolver: TrackResolver;
+  private readonly musicLinks: MusicLinkSource | null;
+  private readonly musicLinkMaxTracks: number;
   private readonly deps: MediaEngineDeps;
 
   private readonly preparing = new Map<string, Promise<void>>();
@@ -308,6 +339,11 @@ export class YtdlpMediaEngine implements MediaEngine {
     this.streamPrebufferMs = options.streamPrebufferMs ?? DEFAULT_STREAM_PREBUFFER_MS;
     this.prebufferTimeoutMs = options.prebufferTimeoutMs ?? DEFAULT_PREBUFFER_TIMEOUT_MS;
     this.resolveCache = options.resolveCache ?? new ResolveCache();
+    this.musicLinks = options.musicLinks ?? null;
+    this.musicLinkMaxTracks = Math.max(
+      1,
+      Math.min(100, options.musicLinkMaxTracks ?? DEFAULT_MUSIC_LINK_MAX_TRACKS),
+    );
     this.deps = {
       downloadAudio,
       openAudioStream,
@@ -343,11 +379,127 @@ export class YtdlpMediaEngine implements MediaEngine {
     }
 
     logger.debug("resolve_source", { source: "extractor" });
+
+    // A Spotify/Apple Music link is resolved here, before the URL guard (which
+    // only admits media hosts) and before any yt-dlp call.
+    const musicLink = this.musicLinks?.parse(query) ?? null;
+    if (musicLink) return await this.resolveMusicLink(query, musicLink);
+
     const resolved = await this.resolver.resolve(query, { sessionId });
     // Failures are never cached: a transient extractor error must not stick.
     this.resolveCache.set(query, resolved);
     this.rememberStream(resolved);
     return resolved;
+  }
+
+  /**
+   * Map a provider link to playable YouTube tracks. Each source track either
+   * already carries a YouTube id (song.link fast path) or costs exactly one
+   * search; the queue keeps the source title/artist/thumbnail either way.
+   */
+  private async resolveMusicLink(
+    query: string,
+    detected: DetectedMusicLink,
+  ): Promise<ResolvedTrack> {
+    const musicLinks = this.musicLinks;
+    if (!musicLinks) throw new MediaError("EXTRACTOR_FAILED", "Music links are not configured.");
+
+    const startedAt = Date.now();
+    let resolution: MusicLinkResolution;
+    try {
+      resolution = await musicLinks.resolve(query, this.musicLinkMaxTracks);
+    } catch (error) {
+      const message =
+        error instanceof MusicLinkError
+          ? error.message
+          : error instanceof Error && error.message
+            ? error.message
+            : "Could not resolve that music link.";
+      logger.warn("provider_resolve_failed", {
+        provider: detected.provider,
+        kind: detected.kind,
+        error: message,
+      });
+      throw new MediaError("EXTRACTOR_FAILED", message);
+    }
+
+    const searchStartedAt = Date.now();
+    const settled = await Promise.allSettled(
+      resolution.tracks
+        .slice(0, this.musicLinkMaxTracks)
+        .map((track) => this.resolveProviderTrack(track)),
+    );
+    const searchMs = Date.now() - searchStartedAt;
+
+    const entries: ResolvedTrack[] = [];
+    for (const result of settled) {
+      if (result.status === "fulfilled") entries.push(result.value);
+    }
+    const failed = settled.length - entries.length;
+    if (failed > 0) {
+      logger.debug("provider_track_skipped", {
+        provider: resolution.provider,
+        count: failed,
+      });
+    }
+    if (entries.length === 0) {
+      throw new MediaError("NOT_FOUND", "No YouTube matches were found for that link.");
+    }
+
+    const single = resolution.kind === "track" && entries.length === 1;
+    const resolved: ResolvedTrack = single
+      ? (entries[0] as ResolvedTrack)
+      : {
+          videoId: null,
+          title: resolution.title ?? collectionFallbackTitle(resolution),
+          webpageUrl: query.trim(),
+          durationSec: null,
+          thumbnailUrl: null,
+          isPlaylist: true,
+          entries,
+        };
+
+    this.resolveCache.set(query, resolved);
+    this.rememberStream(resolved);
+    logger.debug("provider_resolved", {
+      provider: resolution.provider,
+      kind: resolution.kind,
+      tracks: entries.length,
+      searchMs,
+      totalMs: Date.now() - startedAt,
+    });
+    return resolved;
+  }
+
+  private async resolveProviderTrack(track: ProviderTrack): Promise<ResolvedTrack> {
+    const artist = providerArtist(track);
+    if (track.youtubeVideoId) {
+      return {
+        videoId: track.youtubeVideoId,
+        title: track.title,
+        artist,
+        webpageUrl: `https://www.youtube.com/watch?v=${track.youtubeVideoId}`,
+        durationSec: track.durationSec,
+        thumbnailUrl: track.thumbnailUrl,
+        isPlaylist: false,
+      };
+    }
+
+    const hits = await this.resolver.resolveSearch(buildTrackSearchQuery(track), 1);
+    const hit = hits[0];
+    const videoId = hit?.videoId ?? (hit ? youtubeVideoIdFromUrl(hit.webpageUrl) : null);
+    if (!hit || !videoId) {
+      throw new MediaError("NOT_FOUND", `No YouTube match found for "${track.title}".`);
+    }
+    return {
+      videoId,
+      title: track.title,
+      artist,
+      webpageUrl: hit.webpageUrl || `https://www.youtube.com/watch?v=${videoId}`,
+      durationSec: track.durationSec ?? hit.durationSec,
+      thumbnailUrl: track.thumbnailUrl ?? hit.thumbnailUrl,
+      isPlaylist: false,
+    };
   }
 
   async resolveSearch(query: string, limit: number): Promise<ResolvedTrack[]> {

@@ -39,6 +39,8 @@ export interface YtdlpOptions {
 export interface ResolvedTrack {
   videoId: string | null;
   title: string;
+  /** Source artist(s) when the query was a Spotify/Apple Music link. */
+  artist?: string | null;
   webpageUrl: string;
   durationSec: number | null;
   thumbnailUrl: string | null;
