@@ -109,7 +109,7 @@ async function handleRequest(
       return;
     }
 
-    const match = /^\/guilds\/([^/]+)\/(state|actions)$/.exec(pathname);
+    const match = /^\/guilds\/([^/]+)\/(state|actions|downloads)$/.exec(pathname);
     if (!match) {
       sendJson(response, 404, {
         ok: false,
@@ -142,6 +142,19 @@ async function handleRequest(
       const player = await getPlayer(guildId);
       await player.ensureSettings();
       sendJson(response, 200, player.getState());
+      return;
+    }
+
+    if (route === "downloads") {
+      if (method !== "GET") {
+        sendJson(response, 405, {
+          ok: false,
+          error: { code: "METHOD_NOT_ALLOWED", message: "Use GET." },
+        });
+        return;
+      }
+      const player = await getPlayer(guildId);
+      sendJson(response, 200, player.downloadsSnapshot());
       return;
     }
 

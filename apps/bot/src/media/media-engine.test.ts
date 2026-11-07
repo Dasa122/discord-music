@@ -7,6 +7,8 @@ import { PassThrough } from "node:stream";
 import { MediaError } from "../errors.js";
 import { AudioCache } from "./audio-cache.js";
 import type { AudioStore } from "./audio-store.js";
+import { DownloadRegistry } from "./download-registry.js";
+import { buildMeasuredFilter, computeGainDb, type LoudnessSettings } from "./ffmpeg.js";
 import {
   CACHE_PREBUFFER_BYTES,
   type MediaEngineDeps,
@@ -55,11 +57,17 @@ function makeEngine(overrides: {
   cache?: AudioCache;
   deps?: Partial<MediaEngineDeps>;
   prefetchEnabled?: boolean;
+  twoPass?: boolean;
+  maxGainDb?: number;
+  normalization?: LoudnessSettings;
 }) {
   return new YtdlpMediaEngine({
     ytdlp: { path: "yt-dlp", denoPath: "deno" },
     ffmpegPath: "ffmpeg",
     cache: overrides.cache,
+    normalization: overrides.normalization,
+    twoPass: overrides.twoPass,
+    maxGainDb: overrides.maxGainDb,
     prefetchEnabled: overrides.prefetchEnabled,
     prebufferTimeoutMs: 500,
     deps: {
@@ -71,6 +79,7 @@ function makeEngine(overrides: {
       openAudioStream: async () => ({ process: fakeProcess(), stream: pcmStream(200_000) }),
       toPcm: () => pcmStream(200_000),
       toPcmFromFile: () => ({ stream: pcmStream(60_000), kill: () => undefined }),
+      analyzeLoudness: async () => null,
       ...overrides.deps,
     },
   });
@@ -453,5 +462,213 @@ describe("media engine background cancellation", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("media engine two-pass gain", () => {
+  const measurement = { inputLufs: -23, inputTp: -4, inputLra: 7, inputThresh: -33 };
+  const configured = "loudnorm=I=-16:TP=-1.5:LRA=11";
+
+  function captureFileFilter() {
+    const captured: { filter: string | null | undefined } = { filter: "unset" };
+    return {
+      captured,
+      toPcmFromFile: (_path: string, options?: { filter?: string | null }) => {
+        captured.filter = options?.filter;
+        return {
+          stream: pcmStream(CACHE_PREBUFFER_BYTES + 1_000),
+          kill: () => undefined,
+        };
+      },
+    };
+  }
+
+  test("a cached track replays with its measured gain instead of the live filter", async () => {
+    const cache = makeCache(new MemoryStore());
+    let analyzedPath = "";
+    const { captured, toPcmFromFile } = captureFileFilter();
+
+    const engine = makeEngine({
+      cache,
+      deps: {
+        analyzeLoudness: async (path) => {
+          analyzedPath = path;
+          return measurement;
+        },
+        toPcmFromFile,
+      },
+    });
+
+    await engine.ensureCached(track, "s");
+    expect(analyzedPath).toBe("/tmp/produced");
+
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(opened.source).toBe("cache");
+    const gain = computeGainDb(-23, -4, -16, -1.5, 12);
+    expect(gain).toBe(2.5);
+    expect(captured.filter).toBe(buildMeasuredFilter(gain));
+  });
+
+  test("a cached track with no measurement falls back to the configured filter", async () => {
+    const { captured, toPcmFromFile } = captureFileFilter();
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      deps: { toPcmFromFile },
+    });
+
+    await engine.ensureCached(track, "s");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(opened.source).toBe("cache");
+    expect(captured.filter).toBe(configured);
+  });
+
+  test("analysis is skipped when two-pass is disabled", async () => {
+    let analyses = 0;
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      twoPass: false,
+      deps: {
+        analyzeLoudness: async () => {
+          analyses += 1;
+          return measurement;
+        },
+      },
+    });
+
+    await engine.ensureCached(track, "s");
+    expect(analyses).toBe(0);
+
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+    expect(opened.source).toBe("cache");
+  });
+
+  test("a live track is never downloaded or analyzed", async () => {
+    let analyses = 0;
+    let downloads = 0;
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      deps: {
+        downloadAudio: async () => {
+          downloads += 1;
+          return { path: "/tmp/produced", info: null };
+        },
+        analyzeLoudness: async () => {
+          analyses += 1;
+          return measurement;
+        },
+      },
+    });
+
+    const opened = await engine.open({ ...track, isLive: true }, { sessionId: "s" });
+    opened.stop();
+
+    expect(opened.source).toBe("stream");
+    expect(downloads).toBe(0);
+    expect(analyses).toBe(0);
+  });
+
+  test("a failed analysis still caches the track and leaves playback unaffected", async () => {
+    const { captured, toPcmFromFile } = captureFileFilter();
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      deps: {
+        analyzeLoudness: async () => {
+          throw new Error("ffmpeg exploded");
+        },
+        toPcmFromFile,
+      },
+    });
+
+    // The background job must swallow the failure, not reject.
+    await engine.ensureCached(track, "s");
+
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(opened.source).toBe("cache");
+    expect(captured.filter).toBe(configured);
+  });
+
+  test("normalization off emits no filter even when a gain was measured", async () => {
+    const { captured, toPcmFromFile } = captureFileFilter();
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      normalization: { mode: "off", targetLufs: -16, truePeakDb: -1.5, lra: 11, dynFrameMs: 150 },
+      deps: {
+        analyzeLoudness: async () => measurement,
+        toPcmFromFile,
+      },
+    });
+
+    await engine.ensureCached(track, "s");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(opened.source).toBe("cache");
+    expect(captured.filter).toBeNull();
+  });
+});
+
+describe("media engine download reporting", () => {
+  const measurement = { inputLufs: -23, inputTp: -4, inputLra: 7, inputThresh: -33 };
+
+  function registry() {
+    return new DownloadRegistry({ maxBytes: 1_000, store: "local" });
+  }
+
+  test("the stream-fill job reports ready with the measured gain", async () => {
+    const downloads = registry();
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      deps: { analyzeLoudness: async () => measurement },
+    });
+
+    await engine.ensureCached(track, "s", downloads);
+
+    const snapshot = downloads.snapshot();
+    const entry = snapshot.entries[0];
+    expect(snapshot.sessionId).toBe("s");
+    expect(entry).toMatchObject({
+      trackId: "vid",
+      title: "Track",
+      state: "ready",
+      gainDb: 2.5,
+      percent: 100,
+    });
+    expect(snapshot.totalBytes).toBe(10);
+  });
+
+  test("prefetch reports into the same registry", async () => {
+    const downloads = registry();
+    const engine = makeEngine({ cache: makeCache(new MemoryStore()) });
+
+    await engine.prefetch(track, "s", downloads);
+
+    const entry = downloads.snapshot().entries[0];
+    expect(entry?.state).toBe("ready");
+    expect(entry?.gainDb).toBeNull();
+  });
+
+  test("a failed download reports a short error code", async () => {
+    const downloads = registry();
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      deps: {
+        downloadAudio: async () => {
+          throw new MediaError("DOWNLOAD_ABORTED", "cancelled");
+        },
+      },
+    });
+
+    await engine.ensureCached(track, "s", downloads);
+
+    const entry = downloads.snapshot().entries[0];
+    expect(entry?.state).toBe("failed");
+    expect(entry?.error).toBe("DOWNLOAD_ABORTED");
   });
 });

@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
+import { basename } from "node:path";
 import type { Readable } from "node:stream";
+import { logger } from "../logger.js";
 
 export type LoudnessMode = "loudnorm" | "dynaudnorm" | "off";
 
@@ -24,6 +26,9 @@ export const DEFAULT_LOUDNESS_SETTINGS: LoudnessSettings = {
   dynFrameMs: 150,
 };
 
+/** Upper bound on a measured gain boost (dB); attenuation uses the same limit. */
+export const DEFAULT_MAX_GAIN_DB = 12;
+
 /**
  * The single source of truth for the loudness filter. Returns `null` for
  * `off`, which means the caller must not emit an `-af` argument at all.
@@ -39,10 +44,198 @@ export function buildAudioFilter(settings: LoudnessSettings): string | null {
   }
 }
 
+/** Round to 2 decimals so a measured gain stays readable in logs and argv. */
+function roundGain(gainDb: number): number {
+  return Math.round(gainDb * 100) / 100;
+}
+
+/**
+ * Gain that brings `inputLufs` to `targetLufs`, kept within `±maxGainDb` and
+ * then reduced so the true peak does not exceed `truePeakLimitDb`.
+ */
+export function computeGainDb(
+  inputLufs: number,
+  truePeakDb: number,
+  targetLufs: number,
+  truePeakLimitDb: number,
+  maxGainDb: number,
+): number {
+  const clamped = Math.min(maxGainDb, Math.max(-maxGainDb, targetLufs - inputLufs));
+  return Math.min(clamped, truePeakLimitDb - truePeakDb);
+}
+
+/** A fixed gain plus a brick-wall limiter at 0.891 (~-1 dBFS). */
+export function buildMeasuredFilter(gainDb: number): string {
+  return `volume=${roundGain(gainDb)}dB,alimiter=limit=0.891:level=false`;
+}
+
+export type PlayFilterKind = "measured" | "configured" | "off";
+
+export interface PlayFilterSelection {
+  /** The `-af` value, or `null` when no filter must be emitted at all. */
+  filter: string | null;
+  kind: PlayFilterKind;
+  gainDb?: number;
+}
+
+/**
+ * Pick the playback filter. A cached track with a measured gain gets that
+ * exact gain; anything else falls back to the configured live filter. `off`
+ * always means no filter, even for a measured track.
+ */
+export function selectPlaybackFilter(input: {
+  source: "cache" | "stream";
+  settings: LoudnessSettings;
+  gainDb?: number | null;
+}): PlayFilterSelection {
+  if (input.settings.mode === "off") return { filter: null, kind: "off" };
+
+  if (
+    input.source === "cache" &&
+    typeof input.gainDb === "number" &&
+    Number.isFinite(input.gainDb)
+  ) {
+    return {
+      filter: buildMeasuredFilter(input.gainDb),
+      kind: "measured",
+      gainDb: input.gainDb,
+    };
+  }
+
+  const configured = buildAudioFilter(input.settings);
+  return configured ? { filter: configured, kind: "configured" } : { filter: null, kind: "off" };
+}
+
+/** The loudnorm figures the analysis pass prints as its trailing JSON block. */
+export interface LoudnessMeasurement {
+  inputLufs: number;
+  inputTp: number;
+  inputLra: number;
+  inputThresh: number;
+}
+
+function finiteNumber(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value !== "string") return null;
+  const parsed = Number(value.trim());
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * Extract the last loudnorm JSON object from ffmpeg stderr. Returns `null` for
+ * a silent input (`-inf`), missing/invalid keys, or no JSON at all.
+ */
+export function parseLoudnormJson(stderr: string): LoudnessMeasurement | null {
+  const blocks = [...stderr.matchAll(/\{[^{}]*\}/g)];
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const block = blocks[index];
+    if (!block) continue;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(block[0]);
+    } catch {
+      continue;
+    }
+    if (typeof raw !== "object" || raw === null) continue;
+    const record = raw as Record<string, unknown>;
+    const inputLufs = finiteNumber(record.input_i);
+    const inputTp = finiteNumber(record.input_tp);
+    const inputLra = finiteNumber(record.input_lra);
+    const inputThresh = finiteNumber(record.input_thresh);
+    if (inputLufs === null || inputTp === null || inputLra === null || inputThresh === null) {
+      continue;
+    }
+    return { inputLufs, inputTp, inputLra, inputThresh };
+  }
+  return null;
+}
+
+export interface AnalyzeLoudnessOptions {
+  ffmpegPath?: string;
+}
+
+function logAnalysisFailure(filePath: string, reason: string): void {
+  logger.debug("loudness_analysis_failed", { file: basename(filePath), reason });
+}
+
+/**
+ * Measure a local file with a loudnorm analysis pass. Best-effort by contract:
+ * every failure resolves to `null` so playback is never blocked by analysis.
+ */
+export async function analyzeLoudness(
+  filePath: string,
+  settings: LoudnessSettings = DEFAULT_LOUDNESS_SETTINGS,
+  options: AnalyzeLoudnessOptions = {},
+): Promise<LoudnessMeasurement | null> {
+  const ffmpegPath = options.ffmpegPath ?? process.env.FFMPEG_PATH?.trim() ?? "ffmpeg";
+  const args = [
+    "-hide_banner",
+    "-nostats",
+    "-i",
+    filePath,
+    "-af",
+    `loudnorm=I=${settings.targetLufs}:TP=${settings.truePeakDb}:LRA=${settings.lra}:print_format=json`,
+    "-f",
+    "null",
+    "-",
+  ];
+
+  return new Promise<LoudnessMeasurement | null>((resolvePromise) => {
+    let settled = false;
+    let stderr = "";
+
+    const finish = (value: LoudnessMeasurement | null): void => {
+      if (settled) return;
+      settled = true;
+      resolvePromise(value);
+    };
+
+    try {
+      const child = spawn(ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
+
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        stderr = `${stderr}${chunk}`.slice(-16_000);
+      });
+
+      child.on("error", (error) => {
+        logAnalysisFailure(filePath, `could not start ffmpeg: ${error.message}`);
+        finish(null);
+      });
+
+      child.on("close", (code) => {
+        const measurement = parseLoudnormJson(stderr);
+        if (measurement) {
+          finish(measurement);
+          return;
+        }
+        const silent = /"input_i"\s*:\s*"-?inf"/i.test(stderr);
+        logAnalysisFailure(
+          filePath,
+          silent
+            ? "the input is silent"
+            : code === 0
+              ? "no readable loudnorm JSON in the output"
+              : `ffmpeg exited with code ${code}`,
+        );
+        finish(null);
+      });
+    } catch (error) {
+      logAnalysisFailure(
+        filePath,
+        error instanceof Error ? error.message : "the analysis pass could not start",
+      );
+      finish(null);
+    }
+  });
+}
+
 export interface FfmpegOptions {
   ffmpegPath?: string;
   /** Defaults to loudnorm so every decoded track is normalised. */
   normalization?: LoudnessSettings;
+  /** Per-call filter override; `null` means no `-af` at all. */
+  filter?: string | null;
 }
 
 export interface FfmpegFileStream {
@@ -52,7 +245,10 @@ export interface FfmpegFileStream {
 }
 
 function appendOutputTail(args: string[], options: FfmpegOptions): void {
-  const filter = buildAudioFilter(options.normalization ?? DEFAULT_LOUDNESS_SETTINGS);
+  const filter =
+    options.filter !== undefined
+      ? options.filter
+      : buildAudioFilter(options.normalization ?? DEFAULT_LOUDNESS_SETTINGS);
   if (filter) args.push("-af", filter);
   args.push("-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1");
 }

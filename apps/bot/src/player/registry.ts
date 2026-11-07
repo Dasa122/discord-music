@@ -3,6 +3,7 @@ import type { Client } from "discord.js";
 import { config } from "../config.js";
 import { getGuildSettings, recordPlay } from "../db/client.js";
 import { PlayerError } from "../errors.js";
+import { DownloadRegistry } from "../media/download-registry.js";
 import type { MediaEngine } from "../media/media-engine.js";
 import { forgetGuild, notifyPlaybackError, notifyStateChange } from "../now-playing.js";
 import { configureStreamLimit, GuildPlayer, globalStreamSemaphore } from "./guild-player.js";
@@ -54,6 +55,10 @@ export async function getPlayer(guildId: string): Promise<GuildPlayer> {
   const player = new GuildPlayer({
     guildId,
     media: getMedia(),
+    downloads: new DownloadRegistry({
+      maxBytes: config.audioCacheMaxBytes,
+      store: config.audioStore,
+    }),
     adapterCreator: guild.voiceAdapterCreator,
     semaphore: globalStreamSemaphore,
     idleTimeoutSeconds: config.idleTimeoutSeconds,

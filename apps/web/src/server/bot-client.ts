@@ -1,4 +1,11 @@
-import type { ControlAction, ControlResponse, GuildSummary, PlayerState } from "@music/shared";
+import type {
+  ControlAction,
+  ControlResponse,
+  DownloadsResponse,
+  GuildSummary,
+  PlayerState,
+} from "@music/shared";
+import { downloadsResponseSchema } from "@music/shared";
 import { config } from "./config.js";
 
 /**
@@ -15,6 +22,7 @@ export type BotResult<T> = { ok: true; data: T } | { ok: false; error: BotError 
 
 export const BOT_TIMEOUTS = {
   state: 5_000,
+  downloads: 5_000,
   health: 5_000,
   action: 90_000,
 } as const;
@@ -142,6 +150,24 @@ export const botClient = {
       {},
       BOT_TIMEOUTS.state,
     );
+  },
+
+  async downloads(guildId: string): Promise<BotResult<DownloadsResponse>> {
+    const result = await request<unknown>(
+      `/guilds/${encodeURIComponent(guildId)}/downloads`,
+      {},
+      BOT_TIMEOUTS.downloads,
+    );
+    if (!result.ok) return result;
+
+    const parsed = downloadsResponseSchema.safeParse(result.data);
+    if (!parsed.success) {
+      return {
+        ok: false,
+        error: { code: "BOT_ERROR", message: "The bot returned invalid download data" },
+      };
+    }
+    return { ok: true, data: parsed.data };
   },
 
   async action(guildId: string, action: ControlAction): Promise<BotResult<PlayerState>> {

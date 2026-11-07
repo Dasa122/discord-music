@@ -5,6 +5,7 @@ describe("queryKeys", () => {
   test("is stable for the same arguments", () => {
     expect(queryKeys.guilds()).toEqual(queryKeys.guilds());
     expect(queryKeys.state("guild-1")).toEqual(queryKeys.state("guild-1"));
+    expect(queryKeys.downloads("guild-1")).toEqual(queryKeys.downloads("guild-1"));
     expect(queryKeys.settings("guild-1")).toEqual(queryKeys.settings("guild-1"));
     expect(queryKeys.playlists("guild-1")).toEqual(queryKeys.playlists("guild-1"));
     expect(queryKeys.playlist("playlist-1")).toEqual(queryKeys.playlist("playlist-1"));
@@ -13,6 +14,7 @@ describe("queryKeys", () => {
 
   test("changes when the guild or page changes", () => {
     expect(queryKeys.state("guild-1")).not.toEqual(queryKeys.state("guild-2"));
+    expect(queryKeys.downloads("guild-1")).not.toEqual(queryKeys.downloads("guild-2"));
     expect(queryKeys.settings("guild-1")).not.toEqual(queryKeys.settings("guild-2"));
     expect(queryKeys.history("guild-1", 1)).not.toEqual(queryKeys.history("guild-1", 2));
   });

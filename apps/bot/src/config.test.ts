@@ -78,6 +78,14 @@ describe("loadConfig loudness normalization", () => {
     expect(config.audioTruePeakDb).toBe(-1.5);
     expect(config.audioLra).toBe(11);
     expect(config.audioDynFrameMs).toBe(150);
+    expect(config.audioTwoPass).toBe(true);
+    expect(config.audioMaxGainDb).toBe(12);
+  });
+
+  test("two-pass can be disabled and the gain cap is configurable", () => {
+    const disabled = loadConfig(baseEnv({ AUDIO_TWO_PASS: " FALSE\n", AUDIO_MAX_GAIN_DB: " 6 " }));
+    expect(disabled.audioTwoPass).toBe(false);
+    expect(disabled.audioMaxGainDb).toBe(6);
   });
 
   test("trims and accepts every mode and its knobs", () => {
@@ -115,6 +123,8 @@ describe("loadConfig loudness normalization", () => {
       [{ AUDIO_LRA: "21" }, /AUDIO_LRA: must be between 1 and 20/],
       [{ AUDIO_DYN_FRAME_MS: "9" }, /AUDIO_DYN_FRAME_MS: must be between 10 and 500/],
       [{ AUDIO_DYN_FRAME_MS: "501" }, /AUDIO_DYN_FRAME_MS: must be between 10 and 500/],
+      [{ AUDIO_MAX_GAIN_DB: "-1" }, /AUDIO_MAX_GAIN_DB: must be between 0 and 24/],
+      [{ AUDIO_MAX_GAIN_DB: "25" }, /AUDIO_MAX_GAIN_DB: must be between 0 and 24/],
     ];
     for (const [overrides, expected] of cases) {
       expect(() => loadConfig(baseEnv(overrides))).toThrow(expected);

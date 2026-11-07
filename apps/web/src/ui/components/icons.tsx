@@ -223,6 +223,16 @@ export function ListIcon(props: IconProps) {
   );
 }
 
+export function DownloadIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M12 4.5v10.5" />
+      <path d="m7.5 10.5 4.5 4.5 4.5-4.5" />
+      <path d="M4.5 19.5h15" />
+    </Icon>
+  );
+}
+
 export function HistoryIcon(props: IconProps) {
   return (
     <Icon {...props}>

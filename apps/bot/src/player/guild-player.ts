@@ -16,6 +16,7 @@ import {
 import type { GuildSettings, LoopMode, PlayerState, QueueTrack } from "@music/shared";
 import { isTransientPlaybackError, MediaError, PlayerError } from "../errors.js";
 import { logger, sanitizeProcessOutput } from "../logger.js";
+import type { DownloadRegistry, DownloadsResponse } from "../media/download-registry.js";
 import type { MediaEngine, OpenedStream } from "../media/media-engine.js";
 import { enrichTrack } from "../media/track.js";
 import {
@@ -109,6 +110,8 @@ export function configureStreamLimit(limit: number): void {
 export interface GuildPlayerOptions {
   guildId: string;
   media: MediaEngine;
+  /** Per-guild download state reported over the control API. */
+  downloads: DownloadRegistry;
   adapterCreator: DiscordGatewayAdapterCreator;
   loadSettings?: () => Promise<GuildSettings>;
   recordPlay?: (track: QueueTrack) => Promise<void>;
@@ -341,8 +344,16 @@ export class GuildPlayer {
 
   /** Start (or reuse) the voice session that scopes the audio cache. */
   beginSession(): string {
-    if (!this.sessionId) this.sessionId = randomUUID();
+    if (!this.sessionId) {
+      this.sessionId = randomUUID();
+      this.options.downloads.setSession(this.sessionId);
+    }
     return this.sessionId;
+  }
+
+  /** Snapshot of this guild's downloads for the dashboard. */
+  downloadsSnapshot(): DownloadsResponse {
+    return this.options.downloads.snapshot();
   }
 
   /** The single teardown path: it also deletes this session's cached audio. */
@@ -722,7 +733,11 @@ export class GuildPlayer {
 
     let opened: OpenedStream;
     try {
-      opened = await this.options.media.open(track, { startSec, sessionId });
+      opened = await this.options.media.open(track, {
+        startSec,
+        sessionId,
+        downloads: this.options.downloads,
+      });
     } catch (error) {
       this.releaseSlot(slot);
       throw error;
@@ -975,6 +990,7 @@ export class GuildPlayer {
     this.stopInternal();
     this.queue.stop();
     this.sessionId = null;
+    this.options.downloads.clear();
 
     const connection = this.connection;
     this.connection = null;
@@ -1020,13 +1036,15 @@ export class GuildPlayer {
     const next = this.queue.queue[0];
     if (next) {
       // Fire-and-forget: a failed prefetch never delays the command response.
-      void this.options.media.prefetch?.(next, sessionId).catch((error: unknown) =>
-        logger.warn("prefetch failed", {
-          guildId: this.guildId,
-          trackId: next.id,
-          error: error instanceof Error ? error.message : String(error),
-        }),
-      );
+      void this.options.media
+        .prefetch?.(next, sessionId, this.options.downloads)
+        .catch((error: unknown) =>
+          logger.warn("prefetch failed", {
+            guildId: this.guildId,
+            trackId: next.id,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
     }
   }
 

@@ -6,6 +6,7 @@ import { Login } from "./components/login";
 import { ToastProvider } from "./components/toast";
 import { ApiError } from "./lib/api";
 import { DashboardPage } from "./pages/dashboard";
+import { DownloadsPage } from "./pages/downloads";
 import { ForbiddenPage } from "./pages/forbidden";
 import { HistoryPage } from "./pages/history";
 import { NotFoundPage } from "./pages/not-found";
@@ -60,6 +61,7 @@ function AppProviders() {
           <Route element={<AppShell />}>
             <Route index element={<DashboardPage />} />
             <Route path="queue" element={<QueuePage />} />
+            <Route path="downloads" element={<DownloadsPage />} />
             <Route path="playlists" element={<PlaylistsPage />} />
             <Route path="playlists/:id" element={<PlaylistDetailPage />} />
             <Route path="history" element={<HistoryPage />} />

@@ -1,4 +1,5 @@
 import type {
+  DownloadsResponse,
   GuildSettings,
   GuildSettingsUpdate,
   GuildSummary,
@@ -225,6 +226,7 @@ export const queryKeys = {
   me: () => ["me"] as const,
   guilds: () => ["guilds"] as const,
   state: (guildId: string | null) => ["guilds", guildId, "state"] as const,
+  downloads: (guildId: string | null) => ["guilds", guildId, "downloads"] as const,
   settings: (guildId: string | null) => ["guilds", guildId, "settings"] as const,
   playlists: (guildId: string | null) => ["guilds", guildId, "playlists"] as const,
   playlist: (playlistId: string | null) => ["playlists", playlistId] as const,
@@ -241,6 +243,7 @@ export const api = {
   me: () => apiGet<Me>("/api/me"),
   guilds: () => apiGet<GuildSummary[]>("/api/guilds"),
   state: (guildId: string) => apiGet<PlayerState>(`${guildPath(guildId)}/state`),
+  downloads: (guildId: string) => apiGet<DownloadsResponse>(`${guildPath(guildId)}/downloads`),
   action: (guildId: string, body: GuildActionBody) =>
     apiPost<PlayerState>(`${guildPath(guildId)}/actions`, body),
   settings: (guildId: string) => apiGet<GuildSettings>(`${guildPath(guildId)}/settings`),

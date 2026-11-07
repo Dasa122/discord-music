@@ -2,8 +2,11 @@ import { describe, expect, test } from "bun:test";
 import {
   clamp,
   formatActorLabel,
+  formatBytes,
   formatDuration,
+  formatDurationMs,
   formatNumber,
+  formatPercent,
   formatRelativeTime,
 } from "./format";
 
@@ -71,6 +74,55 @@ describe("formatNumber", () => {
 
   test("returns an em dash for non-finite input", () => {
     expect(formatNumber(Number.POSITIVE_INFINITY)).toBe("—");
+  });
+});
+
+describe("formatBytes", () => {
+  test("uses 1000-based units with one decimal above 1 KB", () => {
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(999)).toBe("999 B");
+    expect(formatBytes(1000)).toBe("1.0 KB");
+    expect(formatBytes(1500)).toBe("1.5 KB");
+    expect(formatBytes(1_000_000)).toBe("1.0 MB");
+    expect(formatBytes(2_500_000_000)).toBe("2.5 GB");
+  });
+
+  test("returns an em dash for missing or negative values", () => {
+    expect(formatBytes(null)).toBe("—");
+    expect(formatBytes(undefined)).toBe("—");
+    expect(formatBytes(-1)).toBe("—");
+    expect(formatBytes(Number.NaN)).toBe("—");
+  });
+});
+
+describe("formatPercent", () => {
+  test("rounds to a whole-number label", () => {
+    expect(formatPercent(0)).toBe("0%");
+    expect(formatPercent(42.4)).toBe("42%");
+    expect(formatPercent(99.6)).toBe("100%");
+  });
+
+  test("returns an em dash for missing or non-finite values", () => {
+    expect(formatPercent(null)).toBe("—");
+    expect(formatPercent(undefined)).toBe("—");
+    expect(formatPercent(Number.POSITIVE_INFINITY)).toBe("—");
+  });
+});
+
+describe("formatDurationMs", () => {
+  test("formats milliseconds, seconds, and minutes", () => {
+    expect(formatDurationMs(0)).toBe("0 ms");
+    expect(formatDurationMs(500)).toBe("500 ms");
+    expect(formatDurationMs(1500)).toBe("1.5s");
+    expect(formatDurationMs(59_900)).toBe("59.9s");
+    expect(formatDurationMs(65_000)).toBe("1m 05s");
+    expect(formatDurationMs(125_000)).toBe("2m 05s");
+  });
+
+  test("returns an em dash for missing or negative values", () => {
+    expect(formatDurationMs(null)).toBe("—");
+    expect(formatDurationMs(-1)).toBe("—");
+    expect(formatDurationMs(Number.NaN)).toBe("—");
   });
 });
 

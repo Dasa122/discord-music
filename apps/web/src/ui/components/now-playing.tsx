@@ -14,8 +14,8 @@ import {
 } from "../lib/actions";
 import type { GuildActionBody } from "../lib/api";
 import { cn } from "../lib/cn";
-import { clamp, formatDuration } from "../lib/format";
-import { useGuildAction } from "../lib/queries";
+import { clamp, formatDuration, formatPercent } from "../lib/format";
+import { useDownloads, useGuildAction } from "../lib/queries";
 import { Badge } from "./badge";
 import { ConfirmDialog } from "./confirm-dialog";
 import { ErrorBanner } from "./error-banner";
@@ -79,8 +79,20 @@ type NowPlayingProps = {
 
 export function NowPlaying({ guildId, state }: NowPlayingProps) {
   const action = useGuildAction(guildId);
+  const downloadsQuery = useDownloads(guildId);
   const current = state.current;
   const duration = current?.durationSec ?? null;
+
+  const cachingEntry = current
+    ? (downloadsQuery.data?.entries.find(
+        (entry) => entry.trackId === current.id && entry.state === "downloading",
+      ) ?? null)
+    : null;
+  const cachingLabel = cachingEntry
+    ? cachingEntry.percent === null
+      ? "Caching…"
+      : `Caching ${formatPercent(cachingEntry.percent)}`
+    : null;
 
   const [nowMs, setNowMs] = useState(() => Date.now());
   const anchorRef = useRef({ position: state.positionSec, at: Date.now() });
@@ -236,6 +248,15 @@ export function NowPlaying({ guildId, state }: NowPlayingProps) {
               >
                 {current.title}
               </a>
+              {cachingLabel ? (
+                <p className="mt-1.5 inline-flex items-center gap-1.5 rounded-full border border-accent/30 bg-accent/10 px-2 py-0.5 text-xs font-medium text-accent-strong">
+                  <span
+                    aria-hidden="true"
+                    className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent"
+                  />
+                  {cachingLabel}
+                </p>
+              ) : null}
               <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted">
                 <Badge variant={current.source === "youtube" ? "accent" : "neutral"}>
                   {SOURCE_LABELS[current.source]}

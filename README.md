@@ -69,6 +69,36 @@ The bot's HTTP control API binds `BOT_CONTROL_HOST` (default `127.0.0.1`). Docke
 `0.0.0.0` so the web container can reach `music-bot:3001`; leave the default for bare-metal runs
 so port 3001 stays on the loopback interface.
 
+Every route requires the `X-Control-Secret` header. `GET /guilds/:guildId/downloads` returns the
+guild's current download state for the dashboard:
+
+```json
+{
+  "sessionId": "…",
+  "entries": [
+    {
+      "trackId": "vid",
+      "title": "Track",
+      "state": "downloading",
+      "bytes": 1048576,
+      "totalBytes": 4194304,
+      "percent": 25,
+      "startedAt": "2026-11-07T00:00:00.000Z",
+      "finishedAt": null,
+      "gainDb": null,
+      "error": null
+    }
+  ],
+  "totalBytes": 0,
+  "maxBytes": 1610612736,
+  "store": "local"
+}
+```
+
+`state` is one of `queued`, `downloading`, `ready`, `failed`; `percent` (and `totalBytes`) are
+`null` when yt-dlp cannot know the size, and `gainDb` fills in once the cached file has been
+measured. With no active session the route returns `sessionId: null` and `entries: []`.
+
 `DISCORD_ALLOWED_GUILD_IDS` is an optional comma-separated allow-list. When set, commands and
 buttons from any other guild are ignored (and logged once); leave it empty to serve every guild
 the bot is invited to.
@@ -124,6 +154,15 @@ on both playback paths: the yt-dlp stream (the first play of a track) and the ca
   itself uneven, but is less exact at matching the target level across tracks. Its window is
   `AUDIO_DYN_FRAME_MS` (default `150`, range `10..500`).
 - **`off`** — no filter at all; the decoder emits untouched PCM.
+
+The first play of a track is a stream, so it cannot be measured before it starts: it always uses
+the configured live filter above. Once the background download fills the cache, the bot runs a
+loudnorm analysis pass on the local file and stores the result for the session. A cached replay
+then applies that exact gain (`volume=<gain>dB` plus a −1 dBFS limiter) instead of a live
+one-pass normalization, which is more accurate and cheaper at playback time. `AUDIO_TWO_PASS`
+(default `true`) turns the analysis pass off; `AUDIO_MAX_GAIN_DB` (default `12`, range `0..24`)
+caps the applied gain in both directions, and the true peak still cannot exceed
+`AUDIO_TRUE_PEAK_DB`. A failed or silent analysis just falls back to the configured filter.
 
 `/volume` is applied after normalization on the AudioResource's inline volume, so it stays a live
 per-guild setting and is never baked into the ffmpeg filter. Normalization costs roughly a few

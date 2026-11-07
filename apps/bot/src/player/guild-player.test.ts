@@ -3,6 +3,7 @@ import { PassThrough } from "node:stream";
 import type { DiscordGatewayAdapterCreator } from "@discordjs/voice";
 import type { QueueTrack } from "@music/shared";
 import { MediaError } from "../errors.js";
+import { DownloadRegistry } from "../media/download-registry.js";
 import type { MediaEngine } from "../media/media-engine.js";
 import { GuildPlayer, StreamSemaphore } from "./guild-player.js";
 
@@ -42,6 +43,7 @@ function makePlayer(
   return new GuildPlayer({
     guildId: "guild-1",
     media,
+    downloads: new DownloadRegistry({ maxBytes: 1_000, store: "local" }),
     adapterCreator: (() => undefined) as unknown as DiscordGatewayAdapterCreator,
     semaphore,
     idleTimeoutSeconds: 0,

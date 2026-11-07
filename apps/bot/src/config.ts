@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { parseAllowedGuildIds } from "./guild-allowlist.js";
-import { DEFAULT_LOUDNESS_SETTINGS } from "./media/ffmpeg.js";
+import { DEFAULT_LOUDNESS_SETTINGS, DEFAULT_MAX_GAIN_DB } from "./media/ffmpeg.js";
 
 /**
  * Pasted values routinely carry a trailing newline or surrounding quotes; both
@@ -81,6 +81,19 @@ const envSchema = z.object({
     .min(10, "must be between 10 and 500")
     .max(500, "must be between 10 and 500")
     .default(DEFAULT_LOUDNESS_SETTINGS.dynFrameMs),
+  /** Measure cached tracks once and replay their exact gain; false skips analysis. */
+  AUDIO_TWO_PASS: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .default("true")
+    .transform((value) => !["false", "0", "no", "off"].includes(value)),
+  /** Symmetric bound on a measured gain, in dB. */
+  AUDIO_MAX_GAIN_DB: z.coerce
+    .number()
+    .min(0, "must be between 0 and 24")
+    .max(24, "must be between 0 and 24")
+    .default(DEFAULT_MAX_GAIN_DB),
   S3_ENDPOINT: z.url().optional(),
   S3_REGION: z.string().trim().min(1).default("garage"),
   S3_BUCKET: z.string().trim().min(1).optional(),
@@ -132,6 +145,8 @@ export interface AppConfig {
   audioTruePeakDb: number;
   audioLra: number;
   audioDynFrameMs: number;
+  audioTwoPass: boolean;
+  audioMaxGainDb: number;
   s3Endpoint: string | undefined;
   s3Region: string;
   s3Bucket: string | undefined;
@@ -215,6 +230,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     audioTruePeakDb: value.AUDIO_TRUE_PEAK_DB,
     audioLra: value.AUDIO_LRA,
     audioDynFrameMs: value.AUDIO_DYN_FRAME_MS,
+    audioTwoPass: value.AUDIO_TWO_PASS,
+    audioMaxGainDb: value.AUDIO_MAX_GAIN_DB,
     s3Endpoint: value.S3_ENDPOINT,
     s3Region: value.S3_REGION,
     s3Bucket: value.S3_BUCKET,

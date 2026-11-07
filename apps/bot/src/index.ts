@@ -79,6 +79,8 @@ async function main(): Promise<void> {
       dynFrameMs: config.audioDynFrameMs,
     },
     cache: audioCache,
+    twoPass: config.audioTwoPass,
+    maxGainDb: config.audioMaxGainDb,
     prefetchEnabled: config.prefetchEnabled,
     prefetchMaxConcurrent: config.prefetchMaxConcurrent,
     maxCacheFileBytes: config.audioCacheMaxFileBytes,

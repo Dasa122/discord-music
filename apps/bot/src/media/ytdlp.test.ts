@@ -13,6 +13,7 @@ import {
   downloadAudio,
   MAX_EXTRACTION_STDOUT_BYTES,
   MAX_PLAYLIST_ENTRIES,
+  parseProgressLine,
   parseTrackInfo,
   stdoutExceedsLimit,
   thumbnailFromVideoId,
@@ -199,6 +200,80 @@ describe("download argv", () => {
     expect(args).toContain("--print-json");
     expect(args).toContain("--no-simulate");
     expect(args[args.indexOf("--cache-dir") + 1]).toBe("/tmp/yt-dlp-cache");
+  });
+
+  test("opts back into newline progress with a prefixed template", () => {
+    const args = buildDownloadArgs(
+      { id: "vid", url: "https://www.youtube.com/watch?v=vid", durationSec: 30 },
+      "/tmp/audio",
+      baseOptions(),
+      1_000,
+    );
+
+    // `--no-progress` comes from the common args; `--progress` must win.
+    expect(args.indexOf("--progress")).toBeGreaterThan(args.indexOf("--no-progress"));
+    expect(args).toContain("--newline");
+    expect(args[args.indexOf("--progress-template") + 1]).toBe(
+      "dl:%(progress.downloaded_bytes)s/%(progress.total_bytes)s",
+    );
+  });
+});
+
+describe("parseProgressLine", () => {
+  test("parses downloaded and total bytes", () => {
+    expect(parseProgressLine("dl:123/456")).toEqual({ downloadedBytes: 123, totalBytes: 456 });
+    expect(parseProgressLine("  dl:0/0")).toEqual({ downloadedBytes: 0, totalBytes: 0 });
+  });
+
+  test("an unknown total is null", () => {
+    expect(parseProgressLine("dl:123/NA")).toEqual({ downloadedBytes: 123, totalBytes: null });
+    expect(parseProgressLine("dl:123/None")).toEqual({ downloadedBytes: 123, totalBytes: null });
+  });
+
+  test("garbage is ignored", () => {
+    expect(parseProgressLine("dl:abc/def")).toBeNull();
+    expect(parseProgressLine("dl:123")).toBeNull();
+    expect(parseProgressLine("dl:-1/456")).toBeNull();
+    expect(parseProgressLine("not a progress line")).toBeNull();
+    expect(parseProgressLine('{"id":"vid"}')).toBeNull();
+  });
+});
+
+describe("download progress streaming", () => {
+  test("reports progress without corrupting the info JSON", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "music-bot-progress-"));
+    writeFileSync(join(directory, "vid.webm"), "audio");
+
+    const spawnFn = (() => {
+      const child = new EventEmitter() as unknown as ChildProcess;
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      Object.assign(child, { stdout, stderr, kill: () => true, exitCode: null });
+      queueMicrotask(() => {
+        stdout.write('dl:100/1000\ndl:500/1000\n{"id":"vid","title":"A track","duration":30}\n');
+        stdout.end();
+        child.emit("close", 0);
+      });
+      return child;
+    }) as unknown as typeof spawn;
+
+    const progress: Array<{ downloadedBytes: number; totalBytes: number | null }> = [];
+    try {
+      const result = await downloadAudio(
+        { id: "vid", url: "https://www.youtube.com/watch?v=vid", durationSec: 30 },
+        directory,
+        { spawn: spawnFn, onProgress: (event) => progress.push(event) },
+      );
+
+      expect(result.path).toBe(join(directory, "vid.webm"));
+      expect(result.info?.title).toBe("A track");
+      expect(progress).toEqual([
+        { downloadedBytes: 100, totalBytes: 1000 },
+        { downloadedBytes: 500, totalBytes: 1000 },
+      ]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
 

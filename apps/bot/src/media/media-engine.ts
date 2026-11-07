@@ -2,7 +2,18 @@ import { PassThrough, type Readable } from "node:stream";
 import { MediaError } from "../errors.js";
 import { logger } from "../logger.js";
 import type { AudioCache } from "./audio-cache.js";
-import { type LoudnessSettings, toPcm, toPcmFromFile } from "./ffmpeg.js";
+import type { DownloadReporter } from "./download-registry.js";
+import {
+  analyzeLoudness,
+  computeGainDb,
+  DEFAULT_LOUDNESS_SETTINGS,
+  DEFAULT_MAX_GAIN_DB,
+  type LoudnessMeasurement,
+  type LoudnessSettings,
+  selectPlaybackFilter,
+  toPcm,
+  toPcmFromFile,
+} from "./ffmpeg.js";
 import { QueuedSemaphore } from "./limits.js";
 import {
   downloadAudio,
@@ -41,6 +52,8 @@ export interface OpenedStream {
 export interface OpenTrackOptions {
   startSec?: number;
   sessionId?: string;
+  /** Receives download state for the background cache job this open starts. */
+  downloads?: DownloadReporter;
 }
 
 export interface MediaEngine {
@@ -52,8 +65,8 @@ export interface MediaEngine {
   /** Metadata captured by the download that populated the cache. */
   preparedInfo?(track: MediaTrack, sessionId?: string): TrackInfo | null;
   /** Fire-and-forget cache fill for a track that is currently streaming. */
-  ensureCached?(track: MediaTrack, sessionId?: string): Promise<void>;
-  prefetch?(track: MediaTrack, sessionId?: string): Promise<void>;
+  ensureCached?(track: MediaTrack, sessionId?: string, downloads?: DownloadReporter): Promise<void>;
+  prefetch?(track: MediaTrack, sessionId?: string, downloads?: DownloadReporter): Promise<void>;
   cancelPrefetch?(sessionId?: string): void;
   pin?(sessionId: string, trackId: string): Promise<void>;
   unpin?(sessionId: string, trackId: string): Promise<void>;
@@ -67,6 +80,13 @@ export interface MediaEngineDeps {
   resolveSearch: typeof resolveSearch;
   toPcm: typeof toPcm;
   toPcmFromFile: typeof toPcmFromFile;
+  analyzeLoudness: typeof analyzeLoudness;
+}
+
+/** Exact gain measured for one cached track. */
+export interface TrackMeasurement {
+  gainDb: number;
+  inputLufs: number;
 }
 
 export interface YtdlpMediaEngineOptions {
@@ -74,6 +94,10 @@ export interface YtdlpMediaEngineOptions {
   ffmpegPath: string;
   /** Applied to every decoded track on both the stream and cached-file paths. */
   normalization?: LoudnessSettings;
+  /** Measure cached tracks once so replays use an exact gain (default on). */
+  twoPass?: boolean;
+  /** Symmetric bound on the measured gain, in dB. */
+  maxGainDb?: number;
   cache?: AudioCache | null;
   prefetchEnabled?: boolean;
   prefetchMaxConcurrent?: number;
@@ -144,6 +168,8 @@ export class YtdlpMediaEngine implements MediaEngine {
   private readonly ytdlpOptions: YtdlpOptions;
   private readonly ffmpegPath: string;
   private readonly normalization: LoudnessSettings | undefined;
+  private readonly twoPass: boolean;
+  private readonly maxGainDb: number;
   private readonly cache: AudioCache | null;
   private readonly prefetchEnabled: boolean;
   private readonly prefetchSemaphore: QueuedSemaphore;
@@ -156,6 +182,7 @@ export class YtdlpMediaEngine implements MediaEngine {
   private readonly preparing = new Map<string, Promise<void>>();
   private readonly prepareAborts = new Map<string, AbortController>();
   private readonly preparedInfoByKey = new Map<string, TrackInfo>();
+  private readonly measurementByKey = new Map<string, TrackMeasurement>();
   private readonly prefetching = new Map<string, Promise<void>>();
   private readonly prefetchAborts = new Map<string, AbortController>();
 
@@ -163,6 +190,8 @@ export class YtdlpMediaEngine implements MediaEngine {
     this.ytdlpOptions = options.ytdlp;
     this.ffmpegPath = options.ffmpegPath;
     this.normalization = options.normalization;
+    this.twoPass = options.twoPass ?? true;
+    this.maxGainDb = options.maxGainDb ?? DEFAULT_MAX_GAIN_DB;
     this.cache = options.cache ?? null;
     this.prefetchEnabled = options.prefetchEnabled ?? true;
     this.prefetchSemaphore = new QueuedSemaphore(
@@ -180,6 +209,7 @@ export class YtdlpMediaEngine implements MediaEngine {
       resolveSearch,
       toPcm,
       toPcmFromFile,
+      analyzeLoudness,
       ...options.deps,
     };
   }
@@ -271,24 +301,33 @@ export class YtdlpMediaEngine implements MediaEngine {
   }
 
   /** Background-download the next track through its own concurrency budget. */
-  async prefetch(track: MediaTrack, sessionId?: string): Promise<void> {
+  async prefetch(
+    track: MediaTrack,
+    sessionId?: string,
+    downloads?: DownloadReporter,
+  ): Promise<void> {
     if (!this.prefetchEnabled || !sessionId) return;
-    await this.requestCacheJob(track, sessionId, "prefetch");
+    await this.requestCacheJob(track, sessionId, "prefetch", downloads);
   }
 
   /**
    * Fill the cache for a track that is already streaming. Fire-and-forget by
    * contract: the live stream is never replaced, and a failure is only logged.
    */
-  async ensureCached(track: MediaTrack, sessionId?: string): Promise<void> {
+  async ensureCached(
+    track: MediaTrack,
+    sessionId?: string,
+    downloads?: DownloadReporter,
+  ): Promise<void> {
     if (!sessionId) return;
-    await this.requestCacheJob(track, sessionId, "background");
+    await this.requestCacheJob(track, sessionId, "background", downloads);
   }
 
   private requestCacheJob(
     track: MediaTrack,
     sessionId: string,
     kind: "prefetch" | "background",
+    downloads?: DownloadReporter,
   ): Promise<void> {
     const id = this.trackId(track);
     if (!this.cache || !this.cacheable(track)) return Promise.resolve();
@@ -301,10 +340,12 @@ export class YtdlpMediaEngine implements MediaEngine {
     if (kind === "background") {
       logger.debug("background_cache_started", { trackId: id });
     }
-    const run = this.runCacheJob(track, id, sessionId, key, controller, kind).finally(() => {
-      this.prefetching.delete(key);
-      this.prefetchAborts.delete(key);
-    });
+    const run = this.runCacheJob(track, id, sessionId, key, controller, kind, downloads).finally(
+      () => {
+        this.prefetching.delete(key);
+        this.prefetchAborts.delete(key);
+      },
+    );
 
     this.prefetching.set(key, run);
     this.prefetchAborts.set(key, controller);
@@ -318,27 +359,52 @@ export class YtdlpMediaEngine implements MediaEngine {
     key: string,
     controller: AbortController,
     kind: "prefetch" | "background",
+    downloads?: DownloadReporter,
   ): Promise<void> {
     let release: (() => void) | null = null;
+    downloads?.begin(sessionId, id, track.title ?? track.url);
     try {
       release = await this.prefetchSemaphore.acquire(
         () => new MediaError("DOWNLOAD_FAILED", "The prefetch queue is full."),
       );
       await this.cache?.claim(sessionId, id);
-      if (this.cache?.has(sessionId, id)) return;
+      if (this.cache?.has(sessionId, id)) {
+        downloads?.ready(id, {
+          bytes: this.cache.cachedBytes(sessionId, id) ?? 0,
+          gainDb: this.measurementByKey.get(key)?.gainDb ?? null,
+        });
+        return;
+      }
 
       const dir = this.cache?.tempDirFor(sessionId);
-      if (!this.cache || !dir) return;
+      if (!this.cache || !dir) {
+        downloads?.fail(id, "DOWNLOAD_FAILED");
+        return;
+      }
       const produced = await this.deps.downloadAudio(track, dir, {
         signal: controller.signal,
         maxBytes: this.maxCacheFileBytes,
+        onProgress: downloads
+          ? (progress) =>
+              downloads.progress(id, {
+                bytes: progress.downloadedBytes,
+                totalBytes: progress.totalBytes,
+              })
+          : undefined,
       });
       if (produced.info) this.preparedInfoByKey.set(key, produced.info);
+      const measurement = await this.measureTrack(produced.path, id);
+      if (measurement) this.measurementByKey.set(key, measurement);
       await this.cache.storeFile(sessionId, id, produced.path);
+      downloads?.ready(id, {
+        bytes: this.cache.cachedBytes(sessionId, id) ?? 0,
+        gainDb: measurement?.gainDb ?? null,
+      });
       if (kind === "background") {
         logger.debug("background_cache_completed", { trackId: id });
       }
     } catch (error) {
+      downloads?.fail(id, error instanceof MediaError ? error.code : "DOWNLOAD_FAILED");
       const message = error instanceof Error ? error.message : String(error);
       if (kind === "background") {
         logger.debug("background_cache_failed", { trackId: id, error: message });
@@ -351,6 +417,40 @@ export class YtdlpMediaEngine implements MediaEngine {
     } finally {
       release?.();
     }
+  }
+
+  /**
+   * Measure a downloaded file before it is uploaded/deleted. Best-effort: a
+   * failed analysis only costs the exact gain, never the cached copy.
+   */
+  private async measureTrack(filePath: string, trackId: string): Promise<TrackMeasurement | null> {
+    const settings = this.normalization ?? DEFAULT_LOUDNESS_SETTINGS;
+    if (!this.twoPass || settings.mode === "off") return null;
+
+    let measurement: LoudnessMeasurement | null = null;
+    try {
+      measurement = await this.deps.analyzeLoudness(filePath, settings, {
+        ffmpegPath: this.ffmpegPath,
+      });
+    } catch {
+      measurement = null;
+    }
+    if (!measurement) return null;
+
+    const gainDb = computeGainDb(
+      measurement.inputLufs,
+      measurement.inputTp,
+      settings.targetLufs,
+      settings.truePeakDb,
+      this.maxGainDb,
+    );
+    logger.debug("loudness_analyzed", {
+      trackId,
+      inputLufs: measurement.inputLufs,
+      inputTp: measurement.inputTp,
+      gainDb,
+    });
+    return { gainDb, inputLufs: measurement.inputLufs };
   }
 
   cancelPrefetch(sessionId?: string): void {
@@ -386,6 +486,9 @@ export class YtdlpMediaEngine implements MediaEngine {
     for (const key of [...this.preparedInfoByKey.keys()]) {
       if (key.startsWith(`${sessionId}:`)) this.preparedInfoByKey.delete(key);
     }
+    for (const key of [...this.measurementByKey.keys()]) {
+      if (key.startsWith(`${sessionId}:`)) this.measurementByKey.delete(key);
+    }
     await this.cache?.releaseSession(sessionId);
   }
 
@@ -398,12 +501,23 @@ export class YtdlpMediaEngine implements MediaEngine {
         try {
           const target = await this.cache.target(options.sessionId, id);
           if (target) {
+            const measurement = this.measurementByKey.get(this.cacheKey(options.sessionId, track));
+            const selected = selectPlaybackFilter({
+              settings: this.normalization ?? DEFAULT_LOUDNESS_SETTINGS,
+              source: "cache",
+              gainDb: measurement?.gainDb,
+            });
+            logger.debug("play_filter", {
+              source: "cache",
+              filter: selected.kind,
+              ...(selected.kind === "measured" ? { gainDb: selected.gainDb } : {}),
+            });
             logger.info("play_source", {
               source: "cache",
               trackId: id,
               cachedBytes: this.cache.cachedBytes(options.sessionId, id) ?? undefined,
             });
-            return await this.openFile(target, startSec);
+            return await this.openFile(target, startSec, selected.filter);
           }
         } catch (error) {
           logger.warn("cached audio unavailable; streaming instead", {
@@ -416,37 +530,54 @@ export class YtdlpMediaEngine implements MediaEngine {
 
     // Stream first, cache in the background: playback never waits for a
     // download and the live resource is never swapped mid-track.
-    const opened = await this.openStream(track, startSec);
+    const selected = selectPlaybackFilter({
+      settings: this.normalization ?? DEFAULT_LOUDNESS_SETTINGS,
+      source: "stream",
+    });
+    logger.debug("play_filter", { source: "stream", filter: selected.kind });
+    const opened = await this.openStream(track, startSec, selected.filter);
     logger.info("play_source", { source: "stream", trackId: id });
 
     if (this.cache && options.sessionId) {
-      void this.ensureCached(track, options.sessionId).catch((error: unknown) => {
-        logger.debug("background_cache_failed", {
-          trackId: id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      });
+      void this.ensureCached(track, options.sessionId, options.downloads).catch(
+        (error: unknown) => {
+          logger.debug("background_cache_failed", {
+            trackId: id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        },
+      );
     }
 
     return opened;
   }
 
-  private async openFile(target: string, startSec: number): Promise<OpenedStream> {
+  private async openFile(
+    target: string,
+    startSec: number,
+    filter: string | null,
+  ): Promise<OpenedStream> {
     const decoded = this.deps.toPcmFromFile(target, {
       ffmpegPath: this.ffmpegPath,
       startSec,
+      filter,
       normalization: this.normalization,
     });
     return this.finishOpened(decoded.stream, decoded.kill, this.cachePrebufferBytes, "cache");
   }
 
-  private async openStream(track: MediaTrack, startSec: number): Promise<OpenedStream> {
+  private async openStream(
+    track: MediaTrack,
+    startSec: number,
+    filter: string | null,
+  ): Promise<OpenedStream> {
     const ytdlp = await this.deps.openAudioStream(track, {
       startSec,
       options: this.ytdlpOptions,
     });
     const pcm = this.deps.toPcm(ytdlp.stream, {
       ffmpegPath: this.ffmpegPath,
+      filter,
       normalization: this.normalization,
     });
     const stopYtdlp = (): void => {

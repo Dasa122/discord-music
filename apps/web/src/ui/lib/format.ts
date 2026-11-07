@@ -77,6 +77,50 @@ export function formatNumber(value: number): string {
   return numberFormatter.format(value);
 }
 
+const BYTE_UNITS = ["B", "KB", "MB", "GB"] as const;
+
+/** Formats a byte count with 1000-based units and one decimal above 1 KB. */
+export function formatBytes(bytes: number | null | undefined): string {
+  if (bytes === null || bytes === undefined || !Number.isFinite(bytes) || bytes < 0) {
+    return "—";
+  }
+  if (bytes < 1000) {
+    return `${Math.round(bytes)} B`;
+  }
+
+  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1000)), BYTE_UNITS.length - 1);
+  return `${(bytes / 1000 ** exponent).toFixed(1)} ${BYTE_UNITS[exponent]}`;
+}
+
+/** Formats a 0–100 percentage as a whole-number label. */
+export function formatPercent(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "—";
+  }
+  return `${Math.round(value)}%`;
+}
+
+/** Formats an elapsed millisecond span compactly (`500 ms`, `1.5s`, `2m 05s`). */
+export function formatDurationMs(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value) || value < 0) {
+    return "—";
+  }
+
+  const ms = Math.round(value);
+  if (ms < 1000) {
+    return `${ms} ms`;
+  }
+
+  const totalSeconds = ms / 1000;
+  if (totalSeconds < 60) {
+    return `${totalSeconds.toFixed(1)}s`;
+  }
+
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = Math.floor(totalSeconds % 60);
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+}
+
 /**
  * Authentik subjects are not Discord identities, so they are never shown.
  * Admins see themselves as "You" and every other admin generically.

@@ -9,6 +9,7 @@ import { useLogout, useMe } from "../lib/queries";
 import { useGuildSelection } from "../lib/use-guild-selection";
 import {
   ChevronDownIcon,
+  DownloadIcon,
   GridIcon,
   HistoryIcon,
   ListIcon,
@@ -25,6 +26,7 @@ import { useToast } from "./toast";
 const NAV_ITEMS = [
   { to: "/", label: "Dashboard", icon: GridIcon, end: true },
   { to: "/queue", label: "Queue", icon: ListIcon, end: false },
+  { to: "/downloads", label: "Downloads", icon: DownloadIcon, end: false },
   { to: "/playlists", label: "Playlists", icon: PlaylistIcon, end: false },
   { to: "/history", label: "History", icon: HistoryIcon, end: false },
   { to: "/settings", label: "Settings", icon: SettingsIcon, end: false },

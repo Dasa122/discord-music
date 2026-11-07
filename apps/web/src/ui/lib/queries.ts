@@ -29,6 +29,22 @@ export function usePlayerState(guildId: string | null) {
   });
 }
 
+/**
+ * Session-scoped download cache. Polls no faster than every 2 s and stops
+ * while the tab is hidden; the same query key is shared with the dashboard
+ * chip and the downloads page, so mounting both does not double-poll.
+ */
+export function useDownloads(guildId: string | null) {
+  return useQuery({
+    queryKey: queryKeys.downloads(guildId),
+    queryFn: () => api.downloads(guildId as string),
+    enabled: Boolean(guildId),
+    staleTime: 0,
+    refetchInterval: 2_000,
+    refetchIntervalInBackground: false,
+  });
+}
+
 export function useSettings(guildId: string | null) {
   return useQuery({
     queryKey: queryKeys.settings(guildId),

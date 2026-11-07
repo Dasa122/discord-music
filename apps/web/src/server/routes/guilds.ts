@@ -27,6 +27,16 @@ guildRoutes.get("/guilds/:guildId/state", async (c) => {
   return c.json(success(result.data));
 });
 
+guildRoutes.get("/guilds/:guildId/downloads", async (c) => {
+  const result = await botClient.downloads(c.req.param("guildId"));
+  if (!result.ok)
+    return c.json(
+      failure(result.error.code, result.error.message),
+      botErrorStatus(result.error.code),
+    );
+  return c.json(success(result.data));
+});
+
 guildRoutes.post("/guilds/:guildId/actions", async (c) => {
   const body = await readJsonBody(c.req.raw);
   const session = c.get("session");

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { PassThrough } from "node:stream";
 import type { DiscordGatewayAdapterCreator } from "@discordjs/voice";
+import { DownloadRegistry } from "../media/download-registry.js";
 import type { MediaEngine } from "../media/media-engine.js";
 import { GuildPlayer, StreamSemaphore } from "./guild-player.js";
 import { endsSession, SESSION_IDLE_TIMEOUT_SECONDS, shouldCancelIdle } from "./lifecycle.js";
@@ -37,6 +38,7 @@ function makePlayer(media: MediaEngine): GuildPlayer {
   return new GuildPlayer({
     guildId: "guild-1",
     media,
+    downloads: new DownloadRegistry({ maxBytes: 1_000, store: "local" }),
     adapterCreator: (() => undefined) as unknown as DiscordGatewayAdapterCreator,
     semaphore: new StreamSemaphore(2),
     idleTimeoutSeconds: 0,

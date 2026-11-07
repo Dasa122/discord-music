@@ -577,8 +577,41 @@ export interface DownloadAudioOptions {
   signal?: AbortSignal;
   maxBytes?: number;
   options?: YtdlpOptions;
+  /** Streamed download progress; malformed lines are ignored. */
+  onProgress?: (progress: DownloadProgressEvent) => void;
   /** Injection point for tests; production always uses the real spawn. */
   spawn?: typeof spawn;
+}
+
+export interface DownloadProgressEvent {
+  downloadedBytes: number;
+  totalBytes: number | null;
+}
+
+/** Progress lines are prefixed so they never collide with the info JSON. */
+export const PROGRESS_PREFIX = "dl:";
+
+/**
+ * Parse one `--progress-template` line (`dl:123/456`, `dl:123/NA`) into
+ * numbers. Anything malformed is ignored rather than failing the download.
+ */
+export function parseProgressLine(line: string): DownloadProgressEvent | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith(PROGRESS_PREFIX)) return null;
+
+  const body = trimmed.slice(PROGRESS_PREFIX.length);
+  const slash = body.indexOf("/");
+  if (slash < 0) return null;
+
+  const downloaded = Number(body.slice(0, slash));
+  const totalRaw = body.slice(slash + 1).trim();
+  const total =
+    totalRaw === "" || totalRaw === "NA" || totalRaw === "None" ? null : Number(totalRaw);
+
+  if (!Number.isFinite(downloaded) || downloaded < 0) return null;
+  if (total !== null && (!Number.isFinite(total) || total < 0)) return null;
+
+  return { downloadedBytes: downloaded, totalBytes: total };
 }
 
 /** The produced file plus the authoritative metadata the download printed. */
@@ -609,6 +642,12 @@ export function buildDownloadArgs(
     "bestaudio[acodec=opus]/bestaudio/best",
     "--max-filesize",
     String(maxBytes),
+    // `--progress` re-enables the output that common args disable; the prefix
+    // keeps progress lines distinguishable from the info JSON on stdout.
+    "--newline",
+    "--progress",
+    "--progress-template",
+    "dl:%(progress.downloaded_bytes)s/%(progress.total_bytes)s",
     // One extraction for both the file and its metadata. `--print-json` maps to
     // the dump-json switch, which would simulate by default; `--no-simulate`
     // keeps the download and still prints the info JSON.
@@ -681,6 +720,7 @@ export async function downloadAudio(
     const stderrLines: string[] = [];
     let stderrRemainder = "";
     let stdout = "";
+    let stdoutRemainder = "";
     let settled = false;
 
     const cleanup = (): void => {
@@ -737,10 +777,21 @@ export async function downloadAudio(
       }
     });
 
+    const handleStdoutLine = (line: string): void => {
+      const progress = parseProgressLine(line);
+      if (progress) {
+        options.onProgress?.(progress);
+        return;
+      }
+      if (stdout.length >= MAX_DOWNLOAD_INFO_BYTES) return;
+      stdout += `${line}\n`;
+    };
+
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => {
-      if (stdout.length >= MAX_DOWNLOAD_INFO_BYTES) return;
-      stdout += chunk;
+      const parts = `${stdoutRemainder}${chunk}`.split(/\r?\n/);
+      stdoutRemainder = parts.pop() ?? "";
+      for (const part of parts) handleStdoutLine(part);
     });
     // A destroyed pipe must not surface as an unhandled stream error.
     child.stdout?.on("error", () => {});
@@ -756,6 +807,10 @@ export async function downloadAudio(
 
     child.on("close", (code) => {
       if (settled) return;
+      if (stdoutRemainder) {
+        handleStdoutLine(stdoutRemainder);
+        stdoutRemainder = "";
+      }
       if (stderrRemainder.trim()) stderrLines.push(stderrRemainder);
       const stderr = stderrLines.join("\n");
 

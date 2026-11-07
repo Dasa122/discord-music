@@ -116,12 +116,14 @@ describe("request timeouts", () => {
     try {
       await botClient.action("guild-1", { type: "pause" });
       await botClient.state("guild-1");
+      await botClient.downloads("guild-1");
     } finally {
       timeoutSpy.mockRestore();
     }
 
-    expect(seen).toEqual([BOT_TIMEOUTS.action, BOT_TIMEOUTS.state]);
+    expect(seen).toEqual([BOT_TIMEOUTS.action, BOT_TIMEOUTS.state, BOT_TIMEOUTS.downloads]);
     expect(BOT_TIMEOUTS.action).toBe(90_000);
     expect(BOT_TIMEOUTS.state).toBe(5_000);
+    expect(BOT_TIMEOUTS.downloads).toBe(5_000);
   });
 });
