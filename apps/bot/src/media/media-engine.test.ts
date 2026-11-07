@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { MediaError } from "../errors.js";
 import { AudioCache } from "./audio-cache.js";
@@ -60,7 +63,11 @@ function makeEngine(overrides: {
     prefetchEnabled: overrides.prefetchEnabled,
     prebufferTimeoutMs: 500,
     deps: {
-      downloadAudio: async () => "/tmp/produced",
+      downloadAudio: async () => ({ path: "/tmp/produced", info: null }),
+      resolve: async () => {
+        throw new Error("resolve must not run in this test");
+      },
+      resolveSearch: async () => [],
       openAudioStream: async () => ({ process: fakeProcess(), stream: pcmStream(200_000) }),
       toPcm: () => pcmStream(200_000),
       toPcmFromFile: () => ({ stream: pcmStream(60_000), kill: () => undefined }),
@@ -69,13 +76,13 @@ function makeEngine(overrides: {
   });
 }
 
-function makeCache(store: MemoryStore): AudioCache {
+function makeCache(store: MemoryStore, overrides: { cacheDir?: string } = {}): AudioCache {
   return new AudioCache({
     store,
     mode: "local",
     maxBytes: 10_000_000,
     prefix: "",
-    cacheDir: "/cache",
+    cacheDir: overrides.cacheDir ?? "/cache",
     tempRoot: "/tmp/music-audio-engine-test",
     statFile: async () => ({ size: 10 }),
   });
@@ -158,7 +165,7 @@ describe("media engine prefetch", () => {
       deps: {
         downloadAudio: async () => {
           downloads += 1;
-          return "/tmp/produced";
+          return { path: "/tmp/produced", info: null };
         },
       },
     });
@@ -173,7 +180,7 @@ describe("media engine prefetch", () => {
       cache: makeCache(new MemoryStore()),
       deps: {
         downloadAudio: (_track, _dir, options) =>
-          new Promise<string>((_resolve, reject) => {
+          new Promise<{ path: string; info: null }>((_resolve, reject) => {
             if (options.signal?.aborted) {
               aborted = true;
               reject(new MediaError("DOWNLOAD_ABORTED", "cancelled"));
@@ -201,12 +208,250 @@ describe("media engine prefetch", () => {
       deps: {
         downloadAudio: async () => {
           downloads += 1;
-          return "/tmp/produced";
+          return { path: "/tmp/produced", info: null };
         },
       },
     });
 
     await engine.prefetch(track, "s");
     expect(downloads).toBe(0);
+  });
+});
+
+async function tick(ms = 15): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+describe("media engine stream-first cache policy", () => {
+  test("a not-cached track streams and starts exactly one background cache job", async () => {
+    let downloads = 0;
+    let release!: (value: { path: string; info: null }) => void;
+
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      deps: {
+        downloadAudio: () => {
+          downloads += 1;
+          return new Promise<{ path: string; info: null }>((resolve) => {
+            release = resolve;
+          });
+        },
+      },
+    });
+
+    const first = await engine.open(track, { sessionId: "s" });
+    expect(first.source).toBe("stream");
+
+    // The job is in flight; a second open for the same id must not add one.
+    const second = await engine.open(track, { sessionId: "s" });
+    expect(second.source).toBe("stream");
+    await tick();
+    expect(downloads).toBe(1);
+
+    release({ path: "/tmp/produced", info: null });
+    await tick();
+    first.stop();
+    second.stop();
+  });
+
+  test("a cached track opens from the cache and starts no download", async () => {
+    const store = new MemoryStore();
+    const cache = makeCache(store);
+    await cache.storeFile("s", "vid", "/tmp/produced");
+
+    let downloads = 0;
+    const engine = makeEngine({
+      cache,
+      deps: {
+        downloadAudio: async () => {
+          downloads += 1;
+          return { path: "/tmp/produced", info: null };
+        },
+      },
+    });
+
+    const opened = await engine.open(track, { sessionId: "s" });
+    expect(opened.source).toBe("cache");
+    await tick();
+    expect(downloads).toBe(0);
+    opened.stop();
+  });
+
+  test("the background download never replaces or stops the live stream", async () => {
+    let release!: (value: { path: string; info: null }) => void;
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      deps: {
+        downloadAudio: () =>
+          new Promise<{ path: string; info: null }>((resolve) => {
+            release = resolve;
+          }),
+      },
+    });
+
+    const opened = await engine.open(track, { sessionId: "s" });
+    const stream = opened.stream;
+    const startedAt = Date.now();
+    while (typeof release !== "function") {
+      if (Date.now() - startedAt > 2_000) throw new Error("background job never started");
+      await tick(5);
+    }
+    let stopped = 0;
+    const stop = opened.stop;
+    opened.stop = () => {
+      stopped += 1;
+      stop();
+    };
+
+    release({ path: "/tmp/produced", info: null });
+    await tick();
+
+    // Same live resource: untouched and still open; the cache is only for later plays.
+    expect(opened.stream).toBe(stream);
+    expect(stream.destroyed).toBe(false);
+    expect(stopped).toBe(0);
+
+    opened.stop();
+    expect(stopped).toBe(1);
+  });
+});
+
+describe("media engine cache-first resolution", () => {
+  const videoId = "dQw4w9WgXcQ";
+  const cachedTrack = {
+    ...track,
+    id: videoId,
+    url: `https://www.youtube.com/watch?v=${videoId}`,
+  };
+  const info = {
+    videoId,
+    title: "Authoritative Title",
+    durationSec: 42,
+    thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+  };
+
+  test("a cached YouTube URL resolves from the download metadata without yt-dlp", async () => {
+    let ytdlpResolves = 0;
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      deps: {
+        downloadAudio: async () => ({ path: "/tmp/produced", info }),
+        resolve: async () => {
+          ytdlpResolves += 1;
+          throw new Error("yt-dlp must not run for a cached track");
+        },
+      },
+    });
+
+    await engine.prepare(cachedTrack, "s");
+    const resolved = await engine.resolve(cachedTrack.url, "s");
+
+    expect(resolved.title).toBe("Authoritative Title");
+    expect(resolved.durationSec).toBe(42);
+    expect(resolved.thumbnailUrl).toBe(info.thumbnailUrl);
+    expect(resolved.videoId).toBe(videoId);
+    expect(ytdlpResolves).toBe(0);
+  });
+
+  test("search queries still resolve normally", async () => {
+    let ytdlpResolves = 0;
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      deps: {
+        resolve: async (query) => {
+          ytdlpResolves += 1;
+          return {
+            videoId: null,
+            title: query,
+            webpageUrl: "https://example.com/song",
+            durationSec: 10,
+            thumbnailUrl: null,
+            isPlaylist: false,
+          };
+        },
+      },
+    });
+
+    const resolved = await engine.resolve("never gonna give you up", "s");
+    expect(resolved.title).toBe("never gonna give you up");
+    expect(ytdlpResolves).toBe(1);
+  });
+
+  test("releasing one session keeps another session's cached metadata", async () => {
+    let ytdlpResolves = 0;
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      deps: {
+        downloadAudio: async () => ({ path: "/tmp/produced", info }),
+        resolve: async () => {
+          ytdlpResolves += 1;
+          return {
+            videoId: "vid",
+            title: "From yt-dlp",
+            webpageUrl: track.url,
+            durationSec: 1,
+            thumbnailUrl: null,
+            isPlaylist: false,
+          };
+        },
+      },
+    });
+
+    await engine.prepare(cachedTrack, "a");
+    await engine.prepare(cachedTrack, "b");
+    await engine.releaseSession("a");
+
+    const stillCached = await engine.resolve(cachedTrack.url, "b");
+    expect(stillCached.title).toBe("Authoritative Title");
+    expect(ytdlpResolves).toBe(0);
+
+    // The released session lost its cache and falls back to the extractor.
+    const released = await engine.resolve(cachedTrack.url, "a");
+    expect(released.title).toBe("From yt-dlp");
+    expect(ytdlpResolves).toBe(1);
+  });
+});
+
+describe("media engine background cancellation", () => {
+  test("endSession aborts the job and leaves no partial file or stored object", async () => {
+    const root = mkdtempSync(join(tmpdir(), "music-engine-cancel-"));
+    const store = new MemoryStore();
+    const cache = makeCache(store, { cacheDir: root });
+    const partPath = join(root, "s", "vid.webm.part");
+
+    let aborted = false;
+    const engine = makeEngine({
+      cache,
+      deps: {
+        downloadAudio: async (_track, destDir, options) => {
+          mkdirSync(destDir, { recursive: true });
+          writeFileSync(join(destDir, "vid.webm.part"), "partial");
+          return new Promise<{ path: string; info: null }>((_resolve, reject) => {
+            options.signal?.addEventListener("abort", () => {
+              aborted = true;
+              reject(new MediaError("DOWNLOAD_ABORTED", "cancelled"));
+            });
+          });
+        },
+      },
+    });
+
+    try {
+      const opened = await engine.open(track, { sessionId: "s" });
+      const startedAt = Date.now();
+      while (!existsSync(partPath)) {
+        if (Date.now() - startedAt > 2_000) throw new Error("background job never started");
+        await tick(5);
+      }
+
+      await engine.releaseSession("s");
+
+      expect(aborted).toBe(true);
+      expect(store.objects.size).toBe(0);
+      expect(existsSync(join(root, "s"))).toBe(false);
+      opened.stop();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

@@ -17,6 +17,7 @@ import type { GuildSettings, LoopMode, PlayerState, QueueTrack } from "@music/sh
 import { isTransientPlaybackError, MediaError, PlayerError } from "../errors.js";
 import { logger, sanitizeProcessOutput } from "../logger.js";
 import type { MediaEngine, OpenedStream } from "../media/media-engine.js";
+import { enrichTrack } from "../media/track.js";
 import {
   endsSession,
   failureNotice,
@@ -166,6 +167,8 @@ export class GuildPlayer {
   /** One voice session; the audio cache is scoped to it. */
   private sessionId: string | null = null;
   private pinnedTrackId: string | null = null;
+  /** True while a deferred playback start is queued or running. */
+  private isStarting = false;
   /** Serializes every mutating command so two guild actions never interleave. */
   private pending: Promise<unknown> = Promise.resolve();
 
@@ -385,16 +388,68 @@ export class GuildPlayer {
     this.clearIdleTimer();
     this.emitState();
 
+    // Queueing is all this command does now: playback preparation (download,
+    // upload) happens after the reply, so Discord stops showing "thinking".
     if (!this.queue.current && !this.paused) {
-      try {
-        await this.playNextInternal();
-      } catch (error) {
-        if (!(error instanceof PlayerError)) this.registerFailure();
-        throw error;
-      }
+      this.scheduleStart(added);
     }
 
     return added;
+  }
+
+  /**
+   * Start playback outside the current exclusive section. `setImmediate`
+   * defers past the in-flight mutation, then `serialized` keeps the start
+   * ordered with every other command. A single flag prevents two concurrent
+   * enqueues from starting two streams.
+   */
+  private scheduleStart(tracks: number): void {
+    if (this.isStarting || this.destroyed) return;
+
+    this.isStarting = true;
+    logger.debug("enqueue_scheduled", {
+      guildId: this.guildId,
+      tracks,
+      queueLength: this.queue.queue.length,
+    });
+
+    setImmediate(() => {
+      if (this.destroyed) {
+        this.isStarting = false;
+        return;
+      }
+
+      const run = this.serialized(() => this.playNextInternal()).catch((error: unknown) =>
+        this.handleScheduledStartFailure(error),
+      );
+      void run.finally(() => {
+        this.isStarting = false;
+      });
+    });
+  }
+
+  /**
+   * A deferred start has no command reply to report into, so failures take the
+   * same path as playback failures: one error notice, then the next track.
+   */
+  private async handleScheduledStartFailure(error: unknown): Promise<void> {
+    if (isTransientPlaybackError(error)) {
+      // Busy/cooldown is not a failure: the track is already back at the head.
+      logger.warn("scheduled playback start deferred", {
+        guildId: this.guildId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+
+    try {
+      await this.serialized(() => this.handlePlaybackFailure(error, true));
+    } catch (handlerError) {
+      logger.error("scheduled playback failure handler failed", {
+        guildId: this.guildId,
+        error: handlerError instanceof Error ? handlerError.message : String(handlerError),
+      });
+    }
   }
 
   private async playNextInternal(): Promise<void> {
@@ -654,21 +709,9 @@ export class GuildPlayer {
 
     const sessionId = this.sessionId ?? this.beginSession();
 
-    // Preparation is required for playback: a failed download simply means the
-    // track streams instead.
-    logger.debug("preparing track", { guildId: this.guildId, trackId: track.id });
-    if (this.options.media.prepare) {
-      try {
-        await this.options.media.prepare(track, sessionId);
-      } catch (error) {
-        logger.warn("prepare failed; streaming instead", {
-          guildId: this.guildId,
-          trackId: track.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-
+    // Playback starts immediately: a cached track opens from disk, anything
+    // else streams while the cache fills in the background. `prepare()` is
+    // only for explicit prefetch and never blocks a start.
     const slot = this.acquireSlot();
     if (slot === null) {
       throw new PlayerError(
@@ -683,6 +726,12 @@ export class GuildPlayer {
     } catch (error) {
       this.releaseSlot(slot);
       throw error;
+    }
+
+    // A cache hit carries the download's authoritative metadata; update the
+    // queued track before the now-playing embed reads it.
+    if (this.options.media.preparedInfo) {
+      enrichTrack(track, this.options.media.preparedInfo(track, sessionId));
     }
 
     if (this.destroyed || this.queue.current !== track) {

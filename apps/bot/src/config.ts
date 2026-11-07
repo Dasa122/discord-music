@@ -38,6 +38,8 @@ const envSchema = z.object({
   YTDLP_COOKIES_FILE: z.string().min(1).optional(),
   YTDLP_PROXY: z.url().optional(),
   POT_PROVIDER_URL: z.url().optional(),
+  /** Persists the extractor's player/challenge work across invocations. */
+  YTDLP_CACHE_DIR: z.string().trim().min(1).default("/tmp/yt-dlp-cache"),
   /** `local` keeps files on disk; `s3` uploads them to Garage/MinIO. */
   AUDIO_STORE: z.enum(["local", "s3"]).default("local"),
   /** Where downloaded audio is cached for the lifetime of a voice session. */
@@ -93,6 +95,7 @@ export interface AppConfig {
   ytdlpCookiesFile: string | undefined;
   ytdlpProxy: string | undefined;
   potProviderUrl: string | undefined;
+  ytdlpCacheDir: string;
   audioStore: "local" | "s3";
   audioCacheDir: string;
   audioCacheMaxBytes: number;
@@ -170,6 +173,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ytdlpCookiesFile: value.YTDLP_COOKIES_FILE,
     ytdlpProxy: value.YTDLP_PROXY,
     potProviderUrl: value.POT_PROVIDER_URL,
+    ytdlpCacheDir: value.YTDLP_CACHE_DIR,
     audioStore: value.AUDIO_STORE,
     audioCacheDir: value.AUDIO_CACHE_DIR,
     audioCacheMaxBytes: value.AUDIO_CACHE_MAX_BYTES,

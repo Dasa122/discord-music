@@ -148,9 +148,15 @@ export class S3AudioStore implements AudioStore {
   }
 
   async playbackTarget(key: string): Promise<string> {
-    return this.presign(this.client, new GetObjectCommand({ Bucket: this.bucket, Key: key }), {
-      expiresIn: PRESIGN_EXPIRY_SECONDS,
-    });
+    const startedAt = Date.now();
+    const url = await this.presign(
+      this.client,
+      new GetObjectCommand({ Bucket: this.bucket, Key: key }),
+      { expiresIn: PRESIGN_EXPIRY_SECONDS },
+    );
+    // Never log the URL: it carries a signature in its query string.
+    logger.debug("presign_ms", { ms: Date.now() - startedAt });
+    return url;
   }
 
   async listPrefix(prefix: string): Promise<string[]> {

@@ -7,11 +7,15 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import {
   buildCommonArgs,
+  buildDownloadArgs,
   buildResolveArgs,
+  buildSearchArgs,
   downloadAudio,
   MAX_EXTRACTION_STDOUT_BYTES,
   MAX_PLAYLIST_ENTRIES,
+  parseTrackInfo,
   stdoutExceedsLimit,
+  thumbnailFromVideoId,
   type YtdlpOptions,
 } from "./ytdlp.js";
 
@@ -95,6 +99,106 @@ describe("buildResolveArgs", () => {
     const args = buildResolveArgs("ytsearch1:lofi", baseOptions());
     expect(args[args.length - 1]).toBe("ytsearch1:lofi");
     expect(args[args.length - 2]).toBe("--");
+  });
+
+  test("a search uses a flat listing, so no per-result page extraction", () => {
+    const args = buildResolveArgs("ytsearch1:lofi", baseOptions());
+    expect(args).toContain("--flat-playlist");
+  });
+
+  test("a single video URL is not flat", () => {
+    const args = buildResolveArgs("https://youtu.be/abc123", baseOptions());
+    expect(args).not.toContain("--flat-playlist");
+  });
+});
+
+describe("buildSearchArgs", () => {
+  test("bounds the search and stays flat", () => {
+    const args = buildSearchArgs("lofi", 3, baseOptions());
+    expect(args).toContain("--flat-playlist");
+    expect(args[args.length - 1]).toBe("ytsearch3:lofi");
+    expect(args[args.length - 2]).toBe("--");
+  });
+
+  test("clamps the requested limit", () => {
+    expect(
+      buildSearchArgs("lofi", 99, baseOptions())[
+        buildSearchArgs("lofi", 99, baseOptions()).length - 1
+      ],
+    ).toBe("ytsearch10:lofi");
+  });
+});
+
+describe("buildCommonArgs cache dir", () => {
+  test("passes --cache-dir when configured", () => {
+    const args = buildCommonArgs(baseOptions({ cacheDir: "/tmp/yt-dlp-cache" }));
+    expect(args[args.indexOf("--cache-dir") + 1]).toBe("/tmp/yt-dlp-cache");
+  });
+
+  test("omits --cache-dir when unset", () => {
+    expect(buildCommonArgs(baseOptions())).not.toContain("--cache-dir");
+  });
+});
+
+describe("thumbnailFromVideoId", () => {
+  test("derives the static YouTube thumbnail", () => {
+    expect(thumbnailFromVideoId("dQw4w9WgXcQ")).toBe(
+      "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
+    );
+  });
+
+  test("rejects a missing or malformed id", () => {
+    expect(thumbnailFromVideoId(null)).toBeNull();
+    expect(thumbnailFromVideoId("")).toBeNull();
+    expect(thumbnailFromVideoId("not a video id")).toBeNull();
+  });
+});
+
+describe("parseTrackInfo", () => {
+  test("reads the downloaded track's metadata", () => {
+    const info = parseTrackInfo(
+      JSON.stringify({
+        id: "dQw4w9WgXcQ",
+        title: "Never Gonna Give You Up",
+        duration: 213.5,
+        webpage_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      }),
+    );
+
+    expect(info?.videoId).toBe("dQw4w9WgXcQ");
+    expect(info?.title).toBe("Never Gonna Give You Up");
+    expect(info?.durationSec).toBe(213.5);
+    expect(info?.thumbnailUrl).toBe("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg");
+  });
+
+  test("ignores empty, garbage, and truncated output without throwing", () => {
+    expect(parseTrackInfo("")).toBeNull();
+    expect(parseTrackInfo("   \n\n")).toBeNull();
+    expect(parseTrackInfo("not json")).toBeNull();
+    expect(parseTrackInfo("{oops")).toBeNull();
+    expect(parseTrackInfo('{"id": "abc"')).toBeNull();
+  });
+
+  test("keeps an explicit thumbnail when present", () => {
+    const info = parseTrackInfo(
+      JSON.stringify({ id: "abc", title: "x", thumbnail: "https://cdn.example/t.jpg" }),
+    );
+    expect(info?.thumbnailUrl).toBe("https://cdn.example/t.jpg");
+  });
+});
+
+describe("download argv", () => {
+  test("downloads and prints JSON in one pass through the cache dir", () => {
+    const args = buildDownloadArgs(
+      { id: "vid", url: "https://www.youtube.com/watch?v=vid", durationSec: 30 },
+      "/tmp/audio",
+      baseOptions({ cacheDir: "/tmp/yt-dlp-cache" }),
+      1_000,
+    );
+
+    expect(args).toContain("--print-json");
+    expect(args).toContain("--no-simulate");
+    expect(args[args.indexOf("--cache-dir") + 1]).toBe("/tmp/yt-dlp-cache");
   });
 });
 

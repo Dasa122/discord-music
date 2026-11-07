@@ -1,4 +1,5 @@
 import { MessageFlags, SlashCommandBuilder } from "discord.js";
+import { logger } from "../logger.js";
 import { checkCommandRateLimit } from "../media/limits.js";
 import { toQueueTracks } from "../media/track.js";
 import { getMedia, getPlayer } from "../player/registry.js";
@@ -44,20 +45,35 @@ export const playCommand: Command = {
       player.setTextChannel(interaction.channelId);
       await player.ensureConnection(voiceChannel);
 
-      const resolved = await getMedia().resolve(query);
+      const startedAt = Date.now();
+      const resolved = await getMedia().resolve(query, player.beginSession());
+      const resolveMs = Date.now() - startedAt;
+
       const tracks = toQueueTracks(resolved, requestor(interaction));
       if (tracks.length === 0) {
         await respondError(interaction, "No playable tracks were found.");
         return;
       }
 
+      const enqueueStartedAt = Date.now();
       const added = await player.enqueue(tracks);
+      const enqueueMs = Date.now() - enqueueStartedAt;
+
+      // Reply as soon as the tracks are queued; playback preparation (download,
+      // upload) continues in the background.
       const first = tracks[0];
       if (added === 1 && first) {
         await interaction.editReply({ content: `✅ Added **${first.title}** to the queue.` });
       } else {
         await interaction.editReply({ content: `✅ Added ${added} tracks to the queue.` });
       }
+
+      logger.debug("play_timing", {
+        guildId: interaction.guildId,
+        resolveMs,
+        enqueueMs,
+        totalMs: Date.now() - startedAt,
+      });
     } catch (error) {
       await respondError(interaction, commandErrorMessage(error));
     }

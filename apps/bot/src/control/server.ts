@@ -201,7 +201,7 @@ async function applyAction(guildId: string, action: ControlAction): Promise<Guil
       }
       if (action.textChannelId) player.setTextChannel(action.textChannelId);
 
-      const resolved = await getMedia().resolve(action.query);
+      const resolved = await getMedia().resolve(action.query, player.beginSession());
       const tracks = toQueueTracks(resolved, action.requestedBy);
       if (tracks.length === 0) {
         throw new MediaError("NOT_FOUND", "No playable tracks were found.");

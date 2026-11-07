@@ -4,6 +4,7 @@ import { mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { Readable } from "node:stream";
 import { MediaError } from "../errors.js";
+import { logger } from "../logger.js";
 import { toCacheId } from "./audio-cache.js";
 import { QueuedSemaphore } from "./limits.js";
 import { assertSafeMediaQuery } from "./url-guard.js";
@@ -31,6 +32,8 @@ export interface YtdlpOptions {
   cookiesFile?: string;
   proxy?: string;
   potProviderUrl?: string;
+  /** Persists the extractor's challenge/player work across invocations. */
+  cacheDir?: string;
 }
 
 export interface ResolvedTrack {
@@ -41,6 +44,14 @@ export interface ResolvedTrack {
   thumbnailUrl: string | null;
   isPlaylist: boolean;
   entries?: ResolvedTrack[];
+}
+
+/** Authoritative metadata printed by a download (`--print-json`). */
+export interface TrackInfo {
+  videoId: string | null;
+  title: string | null;
+  durationSec: number | null;
+  thumbnailUrl: string | null;
 }
 
 export interface OpenAudioStreamOptions {
@@ -61,6 +72,7 @@ export function ytdlpOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): Ytdlp
     cookiesFile: env.YTDLP_COOKIES_FILE?.trim() || undefined,
     proxy: env.YTDLP_PROXY?.trim() || undefined,
     potProviderUrl: env.POT_PROVIDER_URL?.trim() || undefined,
+    cacheDir: env.YTDLP_CACHE_DIR?.trim() || undefined,
   };
 }
 
@@ -73,6 +85,11 @@ export function buildCommonArgs(options: YtdlpOptions = ytdlpOptionsFromEnv()): 
     `deno:${options.denoPath}`,
   ];
 
+  if (options.cacheDir) {
+    // The cache lives for the container's lifetime, so the player/JS challenge
+    // work is solved once instead of on every extraction.
+    args.push("--cache-dir", options.cacheDir);
+  }
   if (options.cookiesFile && existsSync(options.cookiesFile)) {
     args.push("--cookies", options.cookiesFile);
   }
@@ -92,6 +109,22 @@ function isHttpUrl(value: string): boolean {
 
 function isPlaylistUrl(value: string): boolean {
   return isHttpUrl(value) && /(?:[?&]list=|\/playlist\/|\/sets\/)/i.test(value);
+}
+
+/** Extract the video id from the YouTube URL shapes users paste. */
+export function youtubeVideoIdFromUrl(value: string): string | null {
+  const trimmed = value.trim();
+  const patterns = [
+    /[?&]v=([A-Za-z0-9_-]{6,32})/,
+    /youtu\.be\/([A-Za-z0-9_-]{6,32})/,
+    /\/shorts\/([A-Za-z0-9_-]{6,32})/,
+    /\/embed\/([A-Za-z0-9_-]{6,32})/,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(trimmed);
+    if (match?.[1]) return match[1];
+  }
+  return null;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -121,6 +154,19 @@ function thumbnailFrom(raw: Record<string, unknown>): string | null {
   return null;
 }
 
+/**
+ * A flat search result has no thumbnails list; YouTube's static id URL is the
+ * same image, so it can be derived without visiting the video page.
+ */
+export function thumbnailFromVideoId(videoId: string | null): string | null {
+  if (!videoId || !/^[A-Za-z0-9_-]{6,32}$/.test(videoId)) return null;
+  return `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+}
+
+function isYoutubeUrl(value: string): boolean {
+  return /youtube\.com|youtu\.be/i.test(value);
+}
+
 function normalizeWebpageUrl(raw: Record<string, unknown>, videoId: string | null): string | null {
   const webpageUrl = stringValue(raw.webpage_url) ?? stringValue(raw.original_url);
   if (webpageUrl) return webpageUrl;
@@ -147,9 +193,44 @@ function mapEntry(raw: unknown): ResolvedTrack | null {
     title,
     webpageUrl,
     durationSec: numberValue(record.duration),
-    thumbnailUrl: thumbnailFrom(record),
+    thumbnailUrl:
+      thumbnailFrom(record) ?? (isYoutubeUrl(webpageUrl) ? thumbnailFromVideoId(videoId) : null),
     isPlaylist: false,
   };
+}
+
+function trackInfoFrom(raw: Record<string, unknown>): TrackInfo | null {
+  const videoId = stringValue(raw.id);
+  const title = stringValue(raw.title) ?? stringValue(raw.fulltitle);
+  const durationSec = numberValue(raw.duration);
+  const webpageUrl = normalizeWebpageUrl(raw, videoId);
+  const thumbnailUrl =
+    thumbnailFrom(raw) ??
+    (webpageUrl && isYoutubeUrl(webpageUrl) ? thumbnailFromVideoId(videoId) : null);
+
+  if (title === null && durationSec === null && thumbnailUrl === null) return null;
+  return { videoId, title, durationSec, thumbnailUrl };
+}
+
+/**
+ * Parse the JSON a download prints (`--print-json`). Best effort by design:
+ * a truncated or non-JSON line only costs the metadata, never the playback.
+ */
+export function parseTrackInfo(stdout: string): TrackInfo | null {
+  const lines = stdout.split(/\r?\n/);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]?.trim();
+    if (!line?.startsWith("{")) continue;
+    try {
+      const raw = asRecord(JSON.parse(line));
+      if (!raw) continue;
+      const info = trackInfoFrom(raw);
+      if (info) return info;
+    } catch {
+      // Ignore garbage: the caller falls back to the queued metadata.
+    }
+  }
+  return null;
 }
 
 function parseJsonOutput(stdout: string): Record<string, unknown> {
@@ -280,14 +361,31 @@ function runYtdlp(args: string[], options: YtdlpOptions): Promise<string> {
 /** Args for one metadata extraction; exported so the playlist bound is testable. */
 export function buildResolveArgs(target: string, options: YtdlpOptions): string[] {
   const playlistRequest = isPlaylistUrl(target);
+  const searchRequest = /^ytsearch\d*:/i.test(target);
   return [
     ...buildCommonArgs(options),
     "--dump-single-json",
     ...(playlistRequest
       ? ["--yes-playlist", "--flat-playlist", "--playlist-end", String(MAX_PLAYLIST_ENTRIES)]
-      : []),
+      : searchRequest
+        ? // Search results already carry title/duration, so a flat listing avoids
+          // visiting (and extracting) each video page.
+          ["--flat-playlist"]
+        : []),
     "--",
     target,
+  ];
+}
+
+/** Args for a bounded flat search; exported so the argv contract stays testable. */
+export function buildSearchArgs(query: string, limit: number, options: YtdlpOptions): string[] {
+  const bounded = Math.max(1, Math.min(10, Math.trunc(limit)));
+  return [
+    ...buildCommonArgs(options),
+    "--dump-single-json",
+    "--flat-playlist",
+    "--",
+    `ytsearch${bounded}:${query}`,
   ];
 }
 
@@ -318,7 +416,12 @@ export async function resolve(
       : `ytsearch1:${target}`;
   const args = buildResolveArgs(ytdlpTarget, options);
 
+  const startedAt = Date.now();
   const stdout = await withExtractionSlot(() => runYtdlp(args, options));
+  logger.debug("resolve_ms", {
+    ms: Date.now() - startedAt,
+    kind: playlistRequest ? "playlist" : /^ytsearch\d*:/i.test(ytdlpTarget) ? "search" : "single",
+  });
   const raw = parseJsonOutput(stdout);
   const type = stringValue(raw._type);
 
@@ -366,15 +469,11 @@ export async function resolveSearch(
   await assertSafeMediaQuery(trimmed);
 
   const bounded = Math.max(1, Math.min(10, Math.trunc(limit)));
-  const args = [
-    ...buildCommonArgs(options),
-    "--dump-single-json",
-    "--flat-playlist",
-    "--",
-    `ytsearch${bounded}:${trimmed}`,
-  ];
+  const args = buildSearchArgs(trimmed, bounded, options);
 
+  const startedAt = Date.now();
   const stdout = await withExtractionSlot(() => runYtdlp(args, options));
+  logger.debug("resolve_ms", { ms: Date.now() - startedAt, kind: "search" });
   const raw = parseJsonOutput(stdout);
   const type = stringValue(raw._type);
 
@@ -482,8 +581,16 @@ export interface DownloadAudioOptions {
   spawn?: typeof spawn;
 }
 
+/** The produced file plus the authoritative metadata the download printed. */
+export interface DownloadResult {
+  path: string;
+  info: TrackInfo | null;
+}
+
 export const DEFAULT_DOWNLOAD_MAX_BYTES = 64 * 1024 * 1024;
 export const DOWNLOAD_TIMEOUT_MS = 300_000;
+/** `--print-json` output for one video is small; anything past this is ignored. */
+export const MAX_DOWNLOAD_INFO_BYTES = 1024 * 1024;
 
 function downloadId(track: DownloadTrack): string {
   return toCacheId(track.videoId ?? track.id ?? track.url);
@@ -502,6 +609,11 @@ export function buildDownloadArgs(
     "bestaudio[acodec=opus]/bestaudio/best",
     "--max-filesize",
     String(maxBytes),
+    // One extraction for both the file and its metadata. `--print-json` maps to
+    // the dump-json switch, which would simulate by default; `--no-simulate`
+    // keeps the download and still prints the info JSON.
+    "--print-json",
+    "--no-simulate",
     "--output",
     join(destDir, `${downloadId(track)}.%(ext)s`),
     "--",
@@ -529,14 +641,15 @@ async function removeLeftovers(destDir: string, id: string, keep?: string): Prom
 }
 
 /**
- * Download one track's audio into `destDir` and return the produced file.
+ * Download one track's audio into `destDir` and return the produced file plus
+ * the metadata yt-dlp printed during the same extraction.
  * The caller owns the file from that point (the cache atomically renames it).
  */
 export async function downloadAudio(
   track: DownloadTrack,
   destDir: string,
   options: DownloadAudioOptions = {},
-): Promise<string> {
+): Promise<DownloadResult> {
   if (track.isLive) {
     throw new MediaError("DOWNLOAD_FAILED", "Live streams cannot be cached.");
   }
@@ -559,13 +672,15 @@ export async function downloadAudio(
   const args = buildDownloadArgs(track, destDir, ytdlpOptions, maxBytes);
   const spawnFn = options.spawn ?? spawn;
 
-  return new Promise<string>((resolve, reject) => {
+  return new Promise<DownloadResult>((resolve, reject) => {
+    const startedAt = Date.now();
     const child = spawnFn(ytdlpOptions.path, args, {
-      stdio: ["ignore", "ignore", "pipe"],
+      stdio: ["ignore", "pipe", "pipe"],
       shell: false,
     });
     const stderrLines: string[] = [];
     let stderrRemainder = "";
+    let stdout = "";
     let settled = false;
 
     const cleanup = (): void => {
@@ -577,7 +692,8 @@ export async function downloadAudio(
       if (settled) return;
       settled = true;
       cleanup();
-      resolve(path);
+      logger.debug("download_ms", { ms: Date.now() - startedAt, trackId: id });
+      resolve({ path, info: parseTrackInfo(stdout) });
     };
 
     const fail = (error: MediaError): void => {
@@ -620,6 +736,14 @@ export async function downloadAudio(
         if (stderrLines.length > 20) stderrLines.shift();
       }
     });
+
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      if (stdout.length >= MAX_DOWNLOAD_INFO_BYTES) return;
+      stdout += chunk;
+    });
+    // A destroyed pipe must not surface as an unhandled stream error.
+    child.stdout?.on("error", () => {});
 
     child.on("error", (error) => {
       fail(

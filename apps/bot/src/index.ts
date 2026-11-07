@@ -1,3 +1,4 @@
+import { mkdir } from "node:fs/promises";
 import type { Server } from "node:http";
 import { join } from "node:path";
 import type { Client } from "discord.js";
@@ -52,6 +53,14 @@ async function main(): Promise<void> {
   await audioCache.init();
   logger.info("audio store ready", { store: selection.mode });
 
+  // yt-dlp caches its player/JS-challenge work here; the directory must exist
+  // before the first extraction.
+  await mkdir(config.ytdlpCacheDir, { recursive: true }).catch((error: unknown) => {
+    logger.warn("could not create yt-dlp cache dir", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
+
   const media = new YtdlpMediaEngine({
     ytdlp: {
       path: config.ytdlpPath,
@@ -59,6 +68,7 @@ async function main(): Promise<void> {
       cookiesFile: config.ytdlpCookiesFile,
       proxy: config.ytdlpProxy,
       potProviderUrl: config.potProviderUrl,
+      cacheDir: config.ytdlpCacheDir,
     },
     ffmpegPath: config.ffmpegPath,
     cache: audioCache,

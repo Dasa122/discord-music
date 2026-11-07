@@ -126,6 +126,11 @@ export class AudioCache {
     return this.entries.has(this.keyFor(sessionId, trackId));
   }
 
+  /** Size of a cached object in bytes, or `null` when it is not cached. */
+  cachedBytes(sessionId: string, trackId: string): number | null {
+    return this.entries.get(this.keyFor(sessionId, trackId))?.size ?? null;
+  }
+
   /** Resolve a cached track to something ffmpeg can read (path or signed URL). */
   async target(sessionId: string, trackId: string): Promise<string | null> {
     const key = this.keyFor(sessionId, trackId);

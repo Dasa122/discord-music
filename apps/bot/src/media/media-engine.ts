@@ -10,10 +10,12 @@ import {
   type ResolvedTrack,
   resolve,
   resolveSearch,
+  type TrackInfo,
   type YtdlpOptions,
+  youtubeVideoIdFromUrl,
 } from "./ytdlp.js";
 
-export type { ResolvedTrack } from "./ytdlp.js";
+export type { ResolvedTrack, TrackInfo } from "./ytdlp.js";
 
 /** 250 ms of 48 kHz stereo s16le; a local file needs almost no head start. */
 export const CACHE_PREBUFFER_BYTES = 48_000;
@@ -42,10 +44,15 @@ export interface OpenTrackOptions {
 }
 
 export interface MediaEngine {
-  resolve(query: string): Promise<ResolvedTrack>;
+  /** `sessionId` enables the cache-first path for a YouTube URL. */
+  resolve(query: string, sessionId?: string): Promise<ResolvedTrack>;
   resolveSearch(query: string, limit: number): Promise<ResolvedTrack[]>;
   open(track: MediaTrack, options?: OpenTrackOptions): Promise<OpenedStream>;
   prepare?(track: MediaTrack, sessionId?: string): Promise<void>;
+  /** Metadata captured by the download that populated the cache. */
+  preparedInfo?(track: MediaTrack, sessionId?: string): TrackInfo | null;
+  /** Fire-and-forget cache fill for a track that is currently streaming. */
+  ensureCached?(track: MediaTrack, sessionId?: string): Promise<void>;
   prefetch?(track: MediaTrack, sessionId?: string): Promise<void>;
   cancelPrefetch?(sessionId?: string): void;
   pin?(sessionId: string, trackId: string): Promise<void>;
@@ -56,6 +63,8 @@ export interface MediaEngine {
 export interface MediaEngineDeps {
   downloadAudio: typeof downloadAudio;
   openAudioStream: typeof openAudioStream;
+  resolve: typeof resolve;
+  resolveSearch: typeof resolveSearch;
   toPcm: typeof toPcm;
   toPcmFromFile: typeof toPcmFromFile;
 }
@@ -143,6 +152,7 @@ export class YtdlpMediaEngine implements MediaEngine {
 
   private readonly preparing = new Map<string, Promise<void>>();
   private readonly prepareAborts = new Map<string, AbortController>();
+  private readonly preparedInfoByKey = new Map<string, TrackInfo>();
   private readonly prefetching = new Map<string, Promise<void>>();
   private readonly prefetchAborts = new Map<string, AbortController>();
 
@@ -162,18 +172,51 @@ export class YtdlpMediaEngine implements MediaEngine {
     this.deps = {
       downloadAudio,
       openAudioStream,
+      resolve,
+      resolveSearch,
       toPcm,
       toPcmFromFile,
       ...options.deps,
     };
   }
 
-  resolve(query: string): Promise<ResolvedTrack> {
-    return resolve(query, this.ytdlpOptions);
+  async resolve(query: string, sessionId?: string): Promise<ResolvedTrack> {
+    const cached = sessionId ? this.cachedResolution(query, sessionId) : null;
+    if (cached) return cached;
+    return this.deps.resolve(query, this.ytdlpOptions);
   }
 
   resolveSearch(query: string, limit: number): Promise<ResolvedTrack[]> {
-    return resolveSearch(query, limit, this.ytdlpOptions);
+    return this.deps.resolveSearch(query, limit, this.ytdlpOptions);
+  }
+
+  /**
+   * A YouTube URL whose audio is already in this session's cache needs no
+   * extractor run: the download that stored it printed authoritative metadata.
+   */
+  private cachedResolution(query: string, sessionId: string): ResolvedTrack | null {
+    if (!this.cache) return null;
+    const videoId = youtubeVideoIdFromUrl(query);
+    if (!videoId) return null;
+    if (!this.cache.has(sessionId, videoId)) return null;
+
+    const info = this.preparedInfoByKey.get(`${sessionId}:${videoId}`);
+    if (!info?.title) return null;
+
+    return {
+      videoId,
+      title: info.title,
+      webpageUrl: query.trim(),
+      durationSec: info.durationSec,
+      thumbnailUrl: info.thumbnailUrl,
+      isPlaylist: false,
+    };
+  }
+
+  /** Metadata captured by the download that populated the cache. */
+  preparedInfo(track: MediaTrack, sessionId?: string): TrackInfo | null {
+    if (!sessionId) return null;
+    return this.preparedInfoByKey.get(this.cacheKey(sessionId, track)) ?? null;
   }
 
   /** Download the track into the session cache before playback starts. */
@@ -181,11 +224,12 @@ export class YtdlpMediaEngine implements MediaEngine {
     const id = this.trackId(track);
     if (!this.cache || !sessionId || !this.cacheable(track)) return;
 
-    const key = `${sessionId}:${id}`;
+    const key = this.cacheKey(sessionId, track);
     const existing = this.preparing.get(key);
     if (existing) return existing;
 
     const controller = new AbortController();
+    const startedAt = Date.now();
     const run = (async (): Promise<void> => {
       await this.cache?.claim(sessionId, id);
       if (this.cache?.has(sessionId, id)) return;
@@ -196,12 +240,21 @@ export class YtdlpMediaEngine implements MediaEngine {
           signal: controller.signal,
           maxBytes: this.maxCacheFileBytes,
         });
-        await this.cache.storeFile(sessionId, id, produced);
+        // Best-effort: a failed/garbled print only costs the metadata.
+        if (produced.info) this.preparedInfoByKey.set(key, produced.info);
+
+        const uploadStartedAt = Date.now();
+        await this.cache.storeFile(sessionId, id, produced.path);
+        if (this.cache.mode === "s3") {
+          logger.debug("s3_put_ms", { ms: Date.now() - uploadStartedAt, trackId: id });
+        }
       } catch (error) {
         logger.warn("prepare failed; streaming instead", {
           trackId: id,
           error: error instanceof Error ? error.message : String(error),
         });
+      } finally {
+        logger.debug("prepare_ms", { ms: Date.now() - startedAt, trackId: id });
       }
     })().finally(() => {
       this.preparing.delete(key);
@@ -215,15 +268,36 @@ export class YtdlpMediaEngine implements MediaEngine {
 
   /** Background-download the next track through its own concurrency budget. */
   async prefetch(track: MediaTrack, sessionId?: string): Promise<void> {
-    const id = this.trackId(track);
-    if (!this.prefetchEnabled || !this.cache || !sessionId || !this.cacheable(track)) return;
+    if (!this.prefetchEnabled || !sessionId) return;
+    await this.requestCacheJob(track, sessionId, "prefetch");
+  }
 
-    const key = `${sessionId}:${id}`;
+  /**
+   * Fill the cache for a track that is already streaming. Fire-and-forget by
+   * contract: the live stream is never replaced, and a failure is only logged.
+   */
+  async ensureCached(track: MediaTrack, sessionId?: string): Promise<void> {
+    if (!sessionId) return;
+    await this.requestCacheJob(track, sessionId, "background");
+  }
+
+  private requestCacheJob(
+    track: MediaTrack,
+    sessionId: string,
+    kind: "prefetch" | "background",
+  ): Promise<void> {
+    const id = this.trackId(track);
+    if (!this.cache || !this.cacheable(track)) return Promise.resolve();
+
+    const key = this.cacheKey(sessionId, track);
     const existing = this.prefetching.get(key);
     if (existing) return existing;
 
     const controller = new AbortController();
-    const run = this.runPrefetch(track, id, sessionId, controller).finally(() => {
+    if (kind === "background") {
+      logger.debug("background_cache_started", { trackId: id });
+    }
+    const run = this.runCacheJob(track, id, sessionId, key, controller, kind).finally(() => {
       this.prefetching.delete(key);
       this.prefetchAborts.delete(key);
     });
@@ -233,11 +307,13 @@ export class YtdlpMediaEngine implements MediaEngine {
     return run;
   }
 
-  private async runPrefetch(
+  private async runCacheJob(
     track: MediaTrack,
     id: string,
     sessionId: string,
+    key: string,
     controller: AbortController,
+    kind: "prefetch" | "background",
   ): Promise<void> {
     let release: (() => void) | null = null;
     try {
@@ -253,12 +329,21 @@ export class YtdlpMediaEngine implements MediaEngine {
         signal: controller.signal,
         maxBytes: this.maxCacheFileBytes,
       });
-      await this.cache.storeFile(sessionId, id, produced);
+      if (produced.info) this.preparedInfoByKey.set(key, produced.info);
+      await this.cache.storeFile(sessionId, id, produced.path);
+      if (kind === "background") {
+        logger.debug("background_cache_completed", { trackId: id });
+      }
     } catch (error) {
-      logger.debug("prefetch failed; the track can still stream", {
-        trackId: id,
-        error: error instanceof Error ? error.message : String(error),
-      });
+      const message = error instanceof Error ? error.message : String(error);
+      if (kind === "background") {
+        logger.debug("background_cache_failed", { trackId: id, error: message });
+      } else {
+        logger.debug("prefetch failed; the track can still stream", {
+          trackId: id,
+          error: message,
+        });
+      }
     } finally {
       release?.();
     }
@@ -294,18 +379,28 @@ export class YtdlpMediaEngine implements MediaEngine {
         .map(([, run]) => run),
     ];
     await Promise.allSettled(pending);
+    for (const key of [...this.preparedInfoByKey.keys()]) {
+      if (key.startsWith(`${sessionId}:`)) this.preparedInfoByKey.delete(key);
+    }
     await this.cache?.releaseSession(sessionId);
   }
 
   async open(track: MediaTrack, options: OpenTrackOptions = {}): Promise<OpenedStream> {
     const startSec = options.startSec ?? 0;
+    const id = this.trackId(track);
 
-    if (this.cache && options.sessionId && this.cacheable(track)) {
-      const id = this.trackId(track);
+    if (this.cache && options.sessionId && !track.isLive) {
       if (this.cache.has(options.sessionId, id)) {
         try {
           const target = await this.cache.target(options.sessionId, id);
-          if (target) return await this.openFile(target, startSec);
+          if (target) {
+            logger.info("play_source", {
+              source: "cache",
+              trackId: id,
+              cachedBytes: this.cache.cachedBytes(options.sessionId, id) ?? undefined,
+            });
+            return await this.openFile(target, startSec);
+          }
         } catch (error) {
           logger.warn("cached audio unavailable; streaming instead", {
             trackId: id,
@@ -315,7 +410,21 @@ export class YtdlpMediaEngine implements MediaEngine {
       }
     }
 
-    return this.openStream(track, startSec);
+    // Stream first, cache in the background: playback never waits for a
+    // download and the live resource is never swapped mid-track.
+    const opened = await this.openStream(track, startSec);
+    logger.info("play_source", { source: "stream", trackId: id });
+
+    if (this.cache && options.sessionId) {
+      void this.ensureCached(track, options.sessionId).catch((error: unknown) => {
+        logger.debug("background_cache_failed", {
+          trackId: id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+
+    return opened;
   }
 
   private async openFile(target: string, startSec: number): Promise<OpenedStream> {
@@ -396,6 +505,10 @@ export class YtdlpMediaEngine implements MediaEngine {
 
   private trackId(track: MediaTrack): string {
     return track.videoId ?? track.id ?? track.url;
+  }
+
+  private cacheKey(sessionId: string, track: MediaTrack): string {
+    return `${sessionId}:${this.trackId(track)}`;
   }
 
   private cacheable(track: MediaTrack): boolean {
