@@ -58,6 +58,9 @@ jobs:
           scanners: vuln,secret,config
           severity: HIGH,CRITICAL
           ignore-unfixed: true
+          # Explicit repo-root path: don't rely on the action's cwd resolving
+          # the default .trivyignore.
+          trivyignores: .trivyignore
           exit-code: "1"
 
   deps:

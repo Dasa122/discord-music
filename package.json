@@ -23,5 +23,8 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.6"
+  },
+  "overrides": {
+    "tar": "^7.5.22"
   }
 }
