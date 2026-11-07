@@ -1,11 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { PassThrough } from "node:stream";
-import type { DiscordGatewayAdapterCreator } from "@discordjs/voice";
+import type { AudioResource, DiscordGatewayAdapterCreator } from "@discordjs/voice";
 import type { QueueTrack } from "@music/shared";
 import { MediaError } from "../errors.js";
 import { DownloadRegistry } from "../media/download-registry.js";
 import type { MediaEngine } from "../media/media-engine.js";
-import { GuildPlayer, StreamSemaphore, voiceStateLogFields } from "./guild-player.js";
+import {
+  GuildPlayer,
+  type GuildPlayerOptions,
+  StreamSemaphore,
+  voiceStateLogFields,
+} from "./guild-player.js";
 
 function track(id: string): QueueTrack {
   return {
@@ -39,6 +44,7 @@ function makePlayer(
   semaphore: StreamSemaphore,
   media: MediaEngine = playingMedia,
   onError?: (message: string) => void,
+  overrides: Partial<GuildPlayerOptions> = {},
 ): GuildPlayer {
   return new GuildPlayer({
     guildId: "guild-1",
@@ -48,7 +54,23 @@ function makePlayer(
     semaphore,
     idleTimeoutSeconds: 0,
     onError,
+    ...overrides,
   });
+}
+
+function tick(ms = 20): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A resource whose encoder is the only part playback cares about here. */
+function fakeResource(encoder: unknown): AudioResource {
+  return {
+    encoder,
+    volume: undefined,
+    playStream: new PassThrough(),
+    playbackDuration: 0,
+    read: () => null,
+  } as unknown as AudioResource;
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
@@ -193,5 +215,219 @@ describe("voiceStateLogFields", () => {
     expect(
       voiceStateLogFields({ status: "ready" }, { status: "disconnected", reason: null }),
     ).toEqual({ from: "ready", to: "disconnected" });
+  });
+});
+
+describe("GuildPlayer opus bitrate", () => {
+  test("applies the configured bitrate to every resource (second play included)", async () => {
+    const applied: number[] = [];
+    const player = makePlayer(new StreamSemaphore(4), playingMedia, undefined, {
+      audioBitrateKbps: 96,
+      createResource: () => fakeResource({ setBitrate: (bps: number) => applied.push(bps) }),
+    });
+
+    await player.enqueue([track("a"), track("b")]);
+    await waitFor(() => player.getState().current?.id === "a");
+
+    await player.skip();
+    await waitFor(() => player.getState().current?.id === "b");
+
+    // One encoder per resource: the track change had to re-apply it.
+    expect(applied).toEqual([96_000, 96_000]);
+  });
+
+  test("logs the encoder ceiling once when the request exceeds 128 kbps", async () => {
+    const applied: number[] = [];
+    const writes: string[] = [];
+    const spy = spyOn(process.stdout, "write").mockImplementation(((chunk: string | Uint8Array) => {
+      writes.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write);
+
+    try {
+      const player = makePlayer(new StreamSemaphore(4), playingMedia, undefined, {
+        audioBitrateKbps: 256,
+        createResource: () => fakeResource({ setBitrate: (bps: number) => applied.push(bps) }),
+      });
+
+      await player.enqueue([track("a"), track("b")]);
+      await waitFor(() => player.getState().current?.id === "a");
+      await player.skip();
+      await waitFor(() => player.getState().current?.id === "b");
+    } finally {
+      spy.mockRestore();
+    }
+
+    const capped = writes.filter((line) => line.includes("audio_bitrate_capped"));
+    expect(capped).toHaveLength(1);
+    expect(JSON.parse(capped[0] ?? "{}")).toMatchObject({
+      requestedKbps: 256,
+      effectiveKbps: 128,
+      reason: "encoder_ceiling",
+    });
+    expect(applied).toEqual([128_000, 128_000]);
+  });
+
+  test("warns once per session when the encoder has no bitrate control", async () => {
+    const writes: string[] = [];
+    const spy = spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
+      writes.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write);
+
+    try {
+      const player = makePlayer(new StreamSemaphore(4), playingMedia, undefined, {
+        createResource: () => fakeResource({}),
+      });
+
+      await player.enqueue([track("a"), track("b")]);
+      await waitFor(() => player.getState().current?.id === "a");
+      await player.skip();
+      await waitFor(() => player.getState().current?.id === "b");
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(writes.filter((line) => line.includes("audio_bitrate_unsupported"))).toHaveLength(1);
+  });
+});
+
+function prefetchMedia(
+  prefetched: string[],
+  cancelled: Array<{ sessionId?: string; trackId?: string }>,
+): MediaEngine {
+  return {
+    ...playingMedia,
+    prefetch: async (mediaTrack) => {
+      prefetched.push(mediaTrack.id ?? mediaTrack.url);
+    },
+    cancelPrefetch: (sessionId, trackId) => {
+      cancelled.push({ sessionId, trackId });
+    },
+  };
+}
+
+async function startWithQueued(player: GuildPlayer, ids: string[]): Promise<void> {
+  await player.enqueue(ids.map(track));
+  await waitFor(() => player.getState().current?.id === ids[0]);
+}
+
+describe("GuildPlayer prefetch scheduling", () => {
+  test("enqueueing behind a playing track prefetches the new head once", async () => {
+    const prefetched: string[] = [];
+    const cancelled: Array<{ sessionId?: string; trackId?: string }> = [];
+    const player = makePlayer(
+      new StreamSemaphore(4),
+      prefetchMedia(prefetched, cancelled),
+      undefined,
+      { prefetchDebounceMs: 0 },
+    );
+
+    await startWithQueued(player, ["a"]);
+    await player.enqueue([track("b")]);
+    await tick();
+
+    expect(prefetched).toEqual(["b"]);
+    expect(cancelled).toEqual([]);
+  });
+
+  test("enqueueing while idle does not prefetch", async () => {
+    const prefetched: string[] = [];
+    const cancelled: Array<{ sessionId?: string; trackId?: string }> = [];
+    const player = makePlayer(
+      new StreamSemaphore(4),
+      prefetchMedia(prefetched, cancelled),
+      undefined,
+      { prefetchDebounceMs: 0 },
+    );
+
+    await player.enqueue([track("a")]);
+    await tick();
+
+    expect(prefetched).toEqual([]);
+  });
+
+  test("a burst of enqueues schedules one debounced prefetch", async () => {
+    const prefetched: string[] = [];
+    const cancelled: Array<{ sessionId?: string; trackId?: string }> = [];
+    const player = makePlayer(
+      new StreamSemaphore(4),
+      prefetchMedia(prefetched, cancelled),
+      undefined,
+      { prefetchDebounceMs: 50 },
+    );
+
+    await startWithQueued(player, ["a"]);
+    await player.enqueue([track("b")]);
+    await player.enqueue([track("c")]);
+    await player.enqueue([track("d")]);
+    await tick(120);
+
+    expect(prefetched).toEqual(["b"]);
+  });
+
+  test("removing the prefetched head aborts it and moves to the new head", async () => {
+    const prefetched: string[] = [];
+    const cancelled: Array<{ sessionId?: string; trackId?: string }> = [];
+    const player = makePlayer(
+      new StreamSemaphore(4),
+      prefetchMedia(prefetched, cancelled),
+      undefined,
+      { prefetchDebounceMs: 0 },
+    );
+
+    await startWithQueued(player, ["a"]);
+    await player.enqueue([track("b"), track("c")]);
+    await tick();
+    expect(prefetched).toEqual(["b"]);
+
+    await player.remove(0);
+    await tick();
+
+    expect(cancelled).toEqual([{ sessionId: expect.any(String), trackId: "b" }]);
+    expect(prefetched).toEqual(["b", "c"]);
+  });
+
+  test("moving a track to the head aborts the old prefetch", async () => {
+    const prefetched: string[] = [];
+    const cancelled: Array<{ sessionId?: string; trackId?: string }> = [];
+    const player = makePlayer(
+      new StreamSemaphore(4),
+      prefetchMedia(prefetched, cancelled),
+      undefined,
+      { prefetchDebounceMs: 0 },
+    );
+
+    await startWithQueued(player, ["a"]);
+    await player.enqueue([track("b"), track("c")]);
+    await tick();
+
+    await player.move(1, 0);
+    await tick();
+
+    expect(cancelled.map((entry) => entry.trackId)).toEqual(["b"]);
+    expect(prefetched).toEqual(["b", "c"]);
+  });
+
+  test("shuffle recomputes the prefetch target", async () => {
+    const prefetched: string[] = [];
+    const cancelled: Array<{ sessionId?: string; trackId?: string }> = [];
+    const player = makePlayer(
+      new StreamSemaphore(4),
+      prefetchMedia(prefetched, cancelled),
+      undefined,
+      { prefetchDebounceMs: 0, rng: () => 0 },
+    );
+
+    await startWithQueued(player, ["a"]);
+    await player.enqueue([track("b"), track("c")]);
+    await tick();
+
+    await player.shuffle();
+    await tick();
+
+    // rng 0 swaps the two-item queue to [c, b].
+    expect(prefetched).toEqual(["b", "c"]);
+    expect(cancelled.map((entry) => entry.trackId)).toEqual(["b"]);
   });
 });

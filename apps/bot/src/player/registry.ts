@@ -62,6 +62,7 @@ export async function getPlayer(guildId: string): Promise<GuildPlayer> {
     adapterCreator: guild.voiceAdapterCreator,
     semaphore: globalStreamSemaphore,
     idleTimeoutSeconds: config.idleTimeoutSeconds,
+    audioBitrateKbps: config.audioBitrateKbps,
     loadSettings: () => getGuildSettings(guildId),
     recordPlay: (track) =>
       recordPlay({

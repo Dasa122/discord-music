@@ -225,6 +225,68 @@ describe("media engine prefetch", () => {
     await engine.prefetch(track, "s");
     expect(downloads).toBe(0);
   });
+
+  test("the registry shows queued immediately, then downloading on the first progress event", async () => {
+    const downloads = new DownloadRegistry({ maxBytes: 1_000, store: "local" });
+    let progress: ((value: { downloadedBytes: number; totalBytes: number | null }) => void) | null =
+      null;
+    let finish!: () => void;
+
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      deps: {
+        downloadAudio: (_track, _dir, options) =>
+          new Promise<{ path: string; info: null }>((resolve, reject) => {
+            progress = options.onProgress ?? null;
+            finish = () => resolve({ path: "/tmp/produced", info: null });
+            options.signal?.addEventListener("abort", () =>
+              reject(new MediaError("DOWNLOAD_ABORTED", "cancelled")),
+            );
+          }),
+      },
+    });
+
+    const run = engine.prefetch(track, "s", downloads);
+
+    // No byte has moved yet, but the dashboard already knows about the job.
+    expect(downloads.snapshot().entries[0]?.state).toBe("queued");
+
+    await tick();
+    expect(progress).not.toBeNull();
+    progress?.({ downloadedBytes: 25, totalBytes: 100 });
+
+    const entry = downloads.snapshot().entries[0];
+    expect(entry?.state).toBe("downloading");
+    expect(entry?.percent).toBe(25);
+
+    finish();
+    await run;
+    expect(downloads.snapshot().entries[0]?.state).toBe("ready");
+  });
+
+  test("a per-id cancel ends the job as failed instead of ready/downloading", async () => {
+    const downloads = new DownloadRegistry({ maxBytes: 1_000, store: "local" });
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      deps: {
+        downloadAudio: (_track, _dir, options) =>
+          new Promise<{ path: string; info: null }>((_resolve, reject) => {
+            options.signal?.addEventListener("abort", () =>
+              reject(new MediaError("DOWNLOAD_ABORTED", "cancelled")),
+            );
+          }),
+      },
+    });
+
+    const run = engine.prefetch(track, "s", downloads);
+    await tick();
+    engine.cancelPrefetch("s", "vid");
+    await run;
+
+    const entry = downloads.snapshot().entries[0];
+    expect(entry?.state).toBe("failed");
+    expect(entry?.error).toBe("ABORTED");
+  });
 });
 
 async function tick(ms = 15): Promise<void> {

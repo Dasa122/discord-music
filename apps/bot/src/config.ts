@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { parseAllowedGuildIds } from "./guild-allowlist.js";
 import { DEFAULT_LOUDNESS_SETTINGS, DEFAULT_MAX_GAIN_DB } from "./media/ffmpeg.js";
+import { DEFAULT_AUDIO_BITRATE_KBPS } from "./player/audio-bitrate.js";
 
 /**
  * Pasted values routinely carry a trailing newline or surrounding quotes; both
@@ -94,6 +95,13 @@ const envSchema = z.object({
     .min(0, "must be between 0 and 24")
     .max(24, "must be between 0 and 24")
     .default(DEFAULT_MAX_GAIN_DB),
+  /** Outgoing Opus bitrate; the encoder caps it at 128 and the channel may cap it lower. */
+  AUDIO_BITRATE_KBPS: z.coerce
+    .number()
+    .int()
+    .min(16, "must be between 16 and 128")
+    .max(128, "must be between 16 and 128")
+    .default(DEFAULT_AUDIO_BITRATE_KBPS),
   S3_ENDPOINT: z.url().optional(),
   S3_REGION: z.string().trim().min(1).default("garage"),
   S3_BUCKET: z.string().trim().min(1).optional(),
@@ -147,6 +155,7 @@ export interface AppConfig {
   audioDynFrameMs: number;
   audioTwoPass: boolean;
   audioMaxGainDb: number;
+  audioBitrateKbps: number;
   s3Endpoint: string | undefined;
   s3Region: string;
   s3Bucket: string | undefined;
@@ -232,6 +241,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     audioDynFrameMs: value.AUDIO_DYN_FRAME_MS,
     audioTwoPass: value.AUDIO_TWO_PASS,
     audioMaxGainDb: value.AUDIO_MAX_GAIN_DB,
+    audioBitrateKbps: value.AUDIO_BITRATE_KBPS,
     s3Endpoint: value.S3_ENDPOINT,
     s3Region: value.S3_REGION,
     s3Bucket: value.S3_BUCKET,

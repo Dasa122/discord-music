@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { Readable } from "node:stream";
 import {
   type AudioPlayer,
   AudioPlayerStatus,
@@ -19,6 +20,13 @@ import { logger, sanitizeProcessOutput } from "../logger.js";
 import type { DownloadRegistry, DownloadsResponse } from "../media/download-registry.js";
 import type { MediaEngine, OpenedStream } from "../media/media-engine.js";
 import { enrichTrack } from "../media/track.js";
+import {
+  applyEncoderBitrate,
+  DEFAULT_AUDIO_BITRATE_KBPS,
+  MAX_AUDIO_BITRATE_KBPS,
+  MIN_AUDIO_BITRATE_KBPS,
+  resolveEffectiveBitrateKbps,
+} from "./audio-bitrate.js";
 import {
   endsSession,
   failureNotice,
@@ -147,11 +155,18 @@ export interface GuildPlayerOptions {
   idleTimeoutSeconds?: number;
   semaphore?: StreamSemaphore;
   rng?: () => number;
+  /** Outgoing Opus bitrate; capped by the voice channel. Defaults to 96 kbps. */
+  audioBitrateKbps?: number;
+  /** Test seam for the resource (and its per-resource encoder) factory. */
+  createResource?: (stream: Readable) => AudioResource;
+  /** Debounce for queue-head prefetches, in milliseconds. */
+  prefetchDebounceMs?: number;
 }
 
 const DEFAULT_SETTINGS_VOLUME = 100;
 const DEFAULT_MAX_QUEUE_LENGTH = 100;
 const DEFAULT_IDLE_TIMEOUT_SECONDS = 60;
+const DEFAULT_PREFETCH_DEBOUNCE_MS = 250;
 const FAILURE_WINDOW_MS = 60_000;
 const FAILURE_THRESHOLD = 3;
 const COOLDOWN_MS = 60_000;
@@ -170,6 +185,9 @@ export class GuildPlayer {
   private readonly semaphore: StreamSemaphore;
   private readonly slotLease: SlotLease;
   private readonly idleTimeoutSeconds: number;
+  private readonly audioBitrateKbps: number;
+  private readonly createResource: (stream: Readable) => AudioResource;
+  private readonly prefetchDebounceMs: number;
 
   private settings: GuildSettings;
   private settingsLoadedAt: number | null = null;
@@ -199,6 +217,14 @@ export class GuildPlayer {
   private isStarting = false;
   /** Serializes every mutating command so two guild actions never interleave. */
   private pending: Promise<unknown> = Promise.resolve();
+  /** The voice channel's own bitrate, read when the connection is created. */
+  private channelBitrateBps: number | undefined;
+  /** Per-session log dedupe: one line each for applied/capped/clamped/unsupported. */
+  private bitrateLogged = { applied: false, capped: false, clamped: false, unsupported: false };
+  /** Queue-head track whose background download is scheduled or running. */
+  private prefetchTargetId: string | null = null;
+  private prefetchSessionId: string | null = null;
+  private prefetchTimer: NodeJS.Timeout | null = null;
 
   constructor(options: GuildPlayerOptions) {
     this.options = options;
@@ -207,6 +233,14 @@ export class GuildPlayer {
     this.semaphore = options.semaphore ?? globalStreamSemaphore;
     this.slotLease = new SlotLease(this.semaphore);
     this.idleTimeoutSeconds = options.idleTimeoutSeconds ?? DEFAULT_IDLE_TIMEOUT_SECONDS;
+    this.audioBitrateKbps = options.audioBitrateKbps ?? DEFAULT_AUDIO_BITRATE_KBPS;
+    this.prefetchDebounceMs = Math.max(
+      0,
+      options.prefetchDebounceMs ?? DEFAULT_PREFETCH_DEBOUNCE_MS,
+    );
+    this.createResource =
+      options.createResource ??
+      ((stream) => createAudioResource(stream, { inlineVolume: true, inputType: StreamType.Raw }));
     this.settings = {
       guildId: options.guildId,
       djRoleId: null,
@@ -284,7 +318,7 @@ export class GuildPlayer {
     );
   }
 
-  async ensureConnection(channel: { id: string }): Promise<void> {
+  async ensureConnection(channel: { id: string; bitrate?: number }): Promise<void> {
     if (
       this.voiceChannelId === channel.id &&
       this.connection !== null &&
@@ -320,6 +354,7 @@ export class GuildPlayer {
 
     this.connection = connection;
     this.voiceChannelId = channel.id;
+    this.channelBitrateBps = channel.bitrate;
     connection.subscribe(this.audioPlayer);
 
     connection.on("error", (error) => {
@@ -379,6 +414,7 @@ export class GuildPlayer {
   beginSession(): string {
     if (!this.sessionId) {
       this.sessionId = randomUUID();
+      this.bitrateLogged = { applied: false, capped: false, clamped: false, unsupported: false };
       this.options.downloads.setSession(this.sessionId);
     }
     return this.sessionId;
@@ -430,6 +466,7 @@ export class GuildPlayer {
     if (added === 0) return 0;
 
     this.clearIdleTimer();
+    this.refreshPrefetch();
     this.emitState();
 
     // Queueing is all this command does now: playback preparation (download,
@@ -572,6 +609,7 @@ export class GuildPlayer {
         throw error;
       }
     } else {
+      this.refreshPrefetch();
       this.scheduleIdle();
     }
 
@@ -591,6 +629,7 @@ export class GuildPlayer {
   clear(): Promise<number> {
     return this.serialized(() => {
       const cleared = this.queue.clear();
+      this.refreshPrefetch();
       if (!this.queue.current) this.scheduleIdle();
       this.emitState();
       return cleared;
@@ -645,6 +684,7 @@ export class GuildPlayer {
   shuffle(): Promise<void> {
     return this.serialized(() => {
       this.queue.shuffle();
+      this.refreshPrefetch();
       this.emitState();
     });
   }
@@ -655,6 +695,7 @@ export class GuildPlayer {
       if (!removed) {
         throw new PlayerError("INVALID_INDEX", "That queue position does not exist.");
       }
+      this.refreshPrefetch();
       this.emitState();
       return removed;
     });
@@ -665,6 +706,7 @@ export class GuildPlayer {
       if (!this.queue.move(from, to)) {
         throw new PlayerError("INVALID_INDEX", "Those queue positions do not exist.");
       }
+      this.refreshPrefetch();
       this.emitState();
     });
   }
@@ -791,10 +833,8 @@ export class GuildPlayer {
     }
 
     this.opened = opened;
-    const resource = createAudioResource(opened.stream, {
-      inlineVolume: true,
-      inputType: StreamType.Raw,
-    });
+    const resource = this.createResource(opened.stream);
+    this.applyAudioBitrate(resource);
     resource.volume?.setVolume(this.volumeValue / 100);
     this.resource = resource;
 
@@ -816,6 +856,7 @@ export class GuildPlayer {
     this.scheduleIdle();
 
     this.activateCache(sessionId, track);
+    this.refreshPrefetch();
 
     if (record && this.options.recordPlay) {
       void this.options.recordPlay(track).catch((error: unknown) => {
@@ -878,6 +919,7 @@ export class GuildPlayer {
       return;
     }
 
+    this.refreshPrefetch();
     this.scheduleIdle();
     this.emitState();
   }
@@ -915,6 +957,7 @@ export class GuildPlayer {
         tripped = this.registerFailure();
 
         this.queue.dropCurrent();
+        this.refreshPrefetch();
 
         if (tripped || this.queue.queue.length === 0 || this.destroyed) {
           this.scheduleIdle();
@@ -1023,6 +1066,7 @@ export class GuildPlayer {
     this.stopInternal();
     this.queue.stop();
     this.sessionId = null;
+    this.clearPrefetchTimer();
     this.options.downloads.clear();
 
     const connection = this.connection;
@@ -1047,7 +1091,7 @@ export class GuildPlayer {
     this.emitState();
   }
 
-  /** Pin the new current track, unpin the previous one, prefetch the next. */
+  /** Pin the new current track and unpin the previous one. */
   private activateCache(sessionId: string, track: QueueTrack): void {
     const previous = this.pinnedTrackId;
     this.pinnedTrackId = track.id;
@@ -1065,20 +1109,6 @@ export class GuildPlayer {
           logger.debug("failed to unpin cached track", { error: String(error) }),
         );
     }
-
-    const next = this.queue.queue[0];
-    if (next) {
-      // Fire-and-forget: a failed prefetch never delays the command response.
-      void this.options.media
-        .prefetch?.(next, sessionId, this.options.downloads)
-        .catch((error: unknown) =>
-          logger.warn("prefetch failed", {
-            guildId: this.guildId,
-            trackId: next.id,
-            error: error instanceof Error ? error.message : String(error),
-          }),
-        );
-    }
   }
 
   /** Cancel background work and drop pins; cached files are deleted by endSession. */
@@ -1088,6 +1118,9 @@ export class GuildPlayer {
     const previous = this.pinnedTrackId;
     this.pinnedTrackId = null;
 
+    this.clearPrefetchTimer();
+    this.prefetchTargetId = null;
+    this.prefetchSessionId = null;
     this.options.media.cancelPrefetch?.(sessionId);
     if (previous) {
       void this.options.media
@@ -1096,6 +1129,113 @@ export class GuildPlayer {
           logger.debug("failed to unpin cached track", { error: String(error) }),
         );
     }
+  }
+
+  /**
+   * Apply the configured bitrate to this resource's Opus encoder, capped by
+   * the channel. A new resource is created for every play/seek/track change,
+   * so this is the one place the setting has to land.
+   */
+  private applyAudioBitrate(resource: AudioResource): void {
+    const rawRequested = Number.isFinite(this.audioBitrateKbps)
+      ? Math.trunc(this.audioBitrateKbps)
+      : DEFAULT_AUDIO_BITRATE_KBPS;
+    const requested = Math.min(
+      MAX_AUDIO_BITRATE_KBPS,
+      Math.max(MIN_AUDIO_BITRATE_KBPS, rawRequested),
+    );
+    const effective = resolveEffectiveBitrateKbps(this.audioBitrateKbps, this.channelBitrateBps);
+    const channelKbps = this.channelBitrateBps
+      ? Math.floor(this.channelBitrateBps / 1000)
+      : undefined;
+
+    if (!this.bitrateLogged.capped && rawRequested > MAX_AUDIO_BITRATE_KBPS) {
+      this.bitrateLogged.capped = true;
+      logger.info("audio_bitrate_capped", {
+        guildId: this.guildId,
+        requestedKbps: rawRequested,
+        effectiveKbps: effective,
+        reason: "encoder_ceiling",
+      });
+    }
+
+    if (!this.bitrateLogged.clamped && channelKbps !== undefined && effective < requested) {
+      this.bitrateLogged.clamped = true;
+      logger.info("audio_bitrate_clamped", {
+        guildId: this.guildId,
+        requestedKbps: requested,
+        channelKbps,
+        effectiveKbps: effective,
+      });
+    }
+
+    const result = applyEncoderBitrate(resource.encoder, effective);
+    if (result.applied) {
+      if (!this.bitrateLogged.applied) {
+        this.bitrateLogged.applied = true;
+        logger.info("audio_bitrate", { guildId: this.guildId, kbps: effective });
+      }
+    } else if (!this.bitrateLogged.unsupported) {
+      this.bitrateLogged.unsupported = true;
+      logger.warn("audio_bitrate_unsupported", {
+        guildId: this.guildId,
+        kbps: effective,
+        reason: result.method,
+      });
+    }
+  }
+
+  private clearPrefetchTimer(): void {
+    if (this.prefetchTimer) {
+      clearTimeout(this.prefetchTimer);
+      this.prefetchTimer = null;
+    }
+  }
+
+  /**
+   * Keep the background download on the queue head. Called after every queue
+   * mutation and every start/end: the debounce collapses a burst of commands
+   * into one job, and a head that is no longer next is aborted.
+   */
+  private refreshPrefetch(): void {
+    const sessionId = this.sessionId;
+    const head = this.queue.current ? (this.queue.queue[0] ?? null) : null;
+    const targetId = head?.id ?? null;
+
+    if (targetId === this.prefetchTargetId && sessionId === this.prefetchSessionId) return;
+
+    const previousId = this.prefetchTargetId;
+    const previousSession = this.prefetchSessionId;
+    // A track that just became current keeps its in-flight job; anything else
+    // is orphaned and must be aborted.
+    const keepPrevious =
+      previousId !== null && (previousId === targetId || previousId === this.queue.current?.id);
+
+    this.clearPrefetchTimer();
+    if (previousId && previousSession && !keepPrevious) {
+      this.options.media.cancelPrefetch?.(previousSession, previousId);
+    }
+
+    this.prefetchTargetId = targetId;
+    this.prefetchSessionId = sessionId ?? null;
+    if (!sessionId || !head) return;
+
+    const timer = setTimeout(() => {
+      this.prefetchTimer = null;
+      if (this.sessionId !== sessionId || this.destroyed) return;
+      if (this.queue.current === null || this.queue.queue[0]?.id !== head.id) return;
+      void this.options.media
+        .prefetch?.(head, sessionId, this.options.downloads)
+        .catch((error: unknown) =>
+          logger.warn("prefetch failed", {
+            guildId: this.guildId,
+            trackId: head.id,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+    }, this.prefetchDebounceMs);
+    timer.unref?.();
+    this.prefetchTimer = timer;
   }
 
   private scheduleDisconnectTeardown(connection: VoiceConnection): void {
