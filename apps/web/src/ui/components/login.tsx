@@ -1,4 +1,5 @@
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
+import { ROUTE_PATHS } from "../lib/routes";
 import { AlertTriangleIcon, LogoIcon } from "./icons";
 
 /** Login card shown when the session is missing or the user signed out. */
@@ -56,6 +57,13 @@ export function Login() {
           Playback always happens in the Discord voice channel. This page never streams audio to
           your browser.
         </p>
+
+        <Link
+          to={ROUTE_PATHS.landing}
+          className="mt-4 inline-block text-xs font-medium text-accent underline-offset-4 hover:underline"
+        >
+          Back to the home page
+        </Link>
       </div>
     </main>
   );

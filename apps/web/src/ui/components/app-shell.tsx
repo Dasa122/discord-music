@@ -5,7 +5,9 @@ import { getErrorMessage } from "../lib/api";
 import { cn } from "../lib/cn";
 import { formatNumber } from "../lib/format";
 import { withGuild } from "../lib/guild-selection";
+import { NAV_ITEMS } from "../lib/navigation";
 import { useLogout, useMe } from "../lib/queries";
+import { ROUTE_PATHS } from "../lib/routes";
 import { useGuildSelection } from "../lib/use-guild-selection";
 import {
   ChevronDownIcon,
@@ -23,14 +25,14 @@ import {
 import { Skeleton } from "./skeleton";
 import { useToast } from "./toast";
 
-const NAV_ITEMS = [
-  { to: "/", label: "Dashboard", icon: GridIcon, end: true },
-  { to: "/queue", label: "Queue", icon: ListIcon, end: false },
-  { to: "/downloads", label: "Downloads", icon: DownloadIcon, end: false },
-  { to: "/playlists", label: "Playlists", icon: PlaylistIcon, end: false },
-  { to: "/history", label: "History", icon: HistoryIcon, end: false },
-  { to: "/settings", label: "Settings", icon: SettingsIcon, end: false },
-] as const;
+const NAV_ICONS = {
+  [ROUTE_PATHS.dashboard]: GridIcon,
+  [ROUTE_PATHS.queue]: ListIcon,
+  [ROUTE_PATHS.downloads]: DownloadIcon,
+  [ROUTE_PATHS.playlists]: PlaylistIcon,
+  [ROUTE_PATHS.history]: HistoryIcon,
+  [ROUTE_PATHS.settings]: SettingsIcon,
+} as const;
 
 function GuildAvatar({ guild, size = "md" }: { guild: GuildSummary | null; size?: "sm" | "md" }) {
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
@@ -203,7 +205,7 @@ function SidebarContent({
     <div className="flex h-full flex-col">
       <div className="flex items-center gap-2.5 px-4 pt-5 pb-4">
         <Link
-          to={withGuild("/", guildId)}
+          to={withGuild(ROUTE_PATHS.dashboard, guildId)}
           className="flex min-w-0 items-center gap-2.5 rounded-lg"
           aria-label="Discord Music dashboard"
         >
@@ -240,7 +242,7 @@ function SidebarContent({
 
       <nav aria-label="Main navigation" className="flex-1 space-y-1 overflow-y-auto px-3">
         {NAV_ITEMS.map((item) => {
-          const Icon = item.icon;
+          const Icon = NAV_ICONS[item.to];
           return (
             <NavLink
               key={item.to}
@@ -367,7 +369,7 @@ export function AppShell(): ReactNode {
           <MenuIcon className="h-5 w-5" />
         </button>
         <Link
-          to={withGuild("/", guildId)}
+          to={withGuild(ROUTE_PATHS.dashboard, guildId)}
           className="flex items-center gap-2 rounded-lg"
           aria-label="Discord Music dashboard"
         >
