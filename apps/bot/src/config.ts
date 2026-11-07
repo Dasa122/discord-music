@@ -40,12 +40,14 @@ const envSchema = z.object({
    */
   RESOLVER: z.enum(["ytdlp", "innertube"]).default("ytdlp"),
   /**
-   * InnerTube client used for playback. IOS is the only client that returns a
-   * playable googlevideo URL from a residential IP without a PO token: ANDROID
-   * and WEB answer with a ciphered format this library cannot decipher, and TV
-   * reports the page as unplayable.
+   * InnerTube client used for playback. VISIONOS is the only client measured to
+   * return URLs that ffmpeg can actually stream (10/10 sampled videos; IOS
+   * manages 1/8 because its URLs 403 above a ~1 MiB range, ANDROID/WEB fail to
+   * decipher and TV reports the page as unplayable). It is an undocumented
+   * client, so `RESOLVER` stays `ytdlp` by default and this only matters when
+   * the resolver is opted into.
    */
-  INNERTUBE_CLIENT: z.enum(["IOS", "ANDROID", "TV", "WEB"]).default("IOS"),
+  INNERTUBE_CLIENT: z.enum(["IOS", "ANDROID", "TV", "WEB", "VISIONOS"]).default("VISIONOS"),
   /** Consecutive innertube failures before every call is routed to yt-dlp. */
   RESOLVER_FAILURE_THRESHOLD: z.coerce
     .number()
@@ -182,7 +184,7 @@ export interface AppConfig {
   idleTimeoutSeconds: number;
   logLevel: "debug" | "info" | "warn" | "error";
   resolver: "ytdlp" | "innertube";
-  innertubeClient: "IOS" | "ANDROID" | "TV" | "WEB";
+  innertubeClient: "IOS" | "ANDROID" | "TV" | "WEB" | "VISIONOS";
   resolverFailureThreshold: number;
   resolverCooldownMs: number;
   ytdlpPath: string;

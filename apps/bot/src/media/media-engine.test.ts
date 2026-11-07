@@ -1016,6 +1016,69 @@ describe("media engine direct stream URLs", () => {
     expect(opened.source).toBe("stream");
   });
 
+  test("a 403 that only reaches stderr still re-resolves once, then falls back", async () => {
+    const resolved: string[] = [];
+    let urlAttempts = 0;
+    let ytdlpStreams = 0;
+
+    const engine = makeEngine({
+      resolver: streamResolver({ onResolve: (query) => resolved.push(query) }),
+      deps: {
+        // stdout closes before ffmpeg reports why: the 403 is only in `exit`.
+        toPcmFromUrl: () => {
+          urlAttempts += 1;
+          return {
+            stream: pcmStream(0, true),
+            kill: () => undefined,
+            exit: Promise.resolve({
+              code: 1,
+              stderr: "Server returned 403 Forbidden (access denied)",
+            }),
+          };
+        },
+        openAudioStream: async () => {
+          ytdlpStreams += 1;
+          return { process: fakeProcess(), stream: pcmStream(200_000) };
+        },
+      },
+    });
+
+    await engine.resolve("a song");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(resolved).toEqual(["a song", track.url]);
+    expect(urlAttempts).toBe(2);
+    expect(ytdlpStreams).toBe(1);
+  });
+
+  test("an empty file that ffmpeg exits cleanly on is not retried", async () => {
+    let urlAttempts = 0;
+    let resolves = 0;
+
+    const engine = makeEngine({
+      resolver: streamResolver({ onResolve: () => (resolves += 1) }),
+      deps: {
+        toPcmFromUrl: () => {
+          urlAttempts += 1;
+          return {
+            stream: pcmStream(0, true),
+            kill: () => undefined,
+            exit: Promise.resolve({ code: 0, stderr: "" }),
+          };
+        },
+        openAudioStream: async () => ({ process: fakeProcess(), stream: pcmStream(200_000) }),
+      },
+    });
+
+    await engine.resolve("a song");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(urlAttempts).toBe(1);
+    expect(resolves).toBe(1);
+  });
+
   test("a failure that a fresh URL cannot cure is not retried, but still degrades", async () => {
     let urlAttempts = 0;
     let resolves = 0;

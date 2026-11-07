@@ -152,6 +152,21 @@ export interface YtdlpMediaEngineOptions {
   deps?: Partial<MediaEngineDeps>;
 }
 
+/** Wait for ffmpeg's exit report, but never block a failure path on it. */
+const EXIT_WAIT_MS = 2_000;
+
+function raceExit(
+  exit: Promise<{ code: number | null; stderr: string }>,
+): Promise<{ code: number | null; stderr: string } | null> {
+  return Promise.race([
+    exit,
+    new Promise<null>((resolvePromise) => {
+      const timer = setTimeout(() => resolvePromise(null), EXIT_WAIT_MS);
+      timer.unref?.();
+    }),
+  ]);
+}
+
 function readFirstChunks(
   stream: Readable,
   minBytes: number,
@@ -847,15 +862,33 @@ export class YtdlpMediaEngine implements MediaEngine {
       filter,
       normalization: this.normalization,
     });
-    return this.finishOpened({
-      pcm: decoded.stream,
-      stopDecoder: decoded.kill,
-      prebufferBytes: Math.round(this.streamPrebufferMs * PCM_BYTES_PER_MS),
-      source: "stream",
-      timeoutMs: this.streamPrebufferMs * STREAM_PREBUFFER_TIMEOUT_FACTOR,
-      fallbackOnTimeout: true,
-      trackId,
-    });
+    try {
+      return await this.finishOpened({
+        pcm: decoded.stream,
+        stopDecoder: decoded.kill,
+        prebufferBytes: Math.round(this.streamPrebufferMs * PCM_BYTES_PER_MS),
+        source: "stream",
+        timeoutMs: this.streamPrebufferMs * STREAM_PREBUFFER_TIMEOUT_FACTOR,
+        fallbackOnTimeout: true,
+        trackId,
+      });
+    } catch (error) {
+      // A failed HTTP open closes stdout before ffmpeg reports why, so the
+      // "no audio" error alone cannot tell a stale URL from an empty file.
+      // Fold ffmpeg's own exit code and stderr back into the message.
+      const exit = decoded.exit ? await raceExit(decoded.exit) : null;
+      if (!exit || (exit.code === 0 && !exit.stderr.trim())) throw error;
+      const detail = exit.stderr
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .pop();
+      const base = error instanceof Error ? error.message : String(error);
+      throw new MediaError(
+        "EXTRACTOR_FAILED",
+        `${base} (ffmpeg exit ${exit.code ?? "null"}${detail ? `: ${detail}` : ""})`,
+      );
+    }
   }
 
   private async finishOpened(input: {

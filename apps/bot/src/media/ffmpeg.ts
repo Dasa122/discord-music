@@ -244,6 +244,15 @@ export interface FfmpegFileStream {
   kill(): void;
 }
 
+export interface FfmpegUrlStream extends FfmpegFileStream {
+  /**
+   * Settles when ffmpeg exits, carrying its stderr tail. A failed HTTP open
+   * closes stdout first, so the stderr reason arrives after the stream error —
+   * this is what lets the caller tell a stale 403 from a genuine empty file.
+   */
+  exit?: Promise<{ code: number | null; stderr: string }>;
+}
+
 function appendOutputTail(args: string[], options: FfmpegOptions): void {
   const filter =
     options.filter !== undefined
@@ -318,7 +327,7 @@ export function toPcmFromUrl(
   url: string,
   headers?: Record<string, string>,
   options: FfmpegOptions & { startSec?: number } = {},
-): FfmpegFileStream {
+): FfmpegUrlStream {
   const ffmpegPath = options.ffmpegPath ?? process.env.FFMPEG_PATH?.trim() ?? "ffmpeg";
 
   const child = spawn(ffmpegPath, toPcmFromUrlArgs(url, headers, options), {
@@ -326,6 +335,10 @@ export function toPcmFromUrl(
   });
   const output = child.stdout;
   let stderr = "";
+  let settleExit!: (value: { code: number | null; stderr: string }) => void;
+  const exit = new Promise<{ code: number | null; stderr: string }>((resolvePromise) => {
+    settleExit = resolvePromise;
+  });
 
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk: string) => {
@@ -337,6 +350,7 @@ export function toPcmFromUrl(
   });
 
   child.on("close", (code) => {
+    settleExit({ code, stderr });
     if (code !== 0 && code !== null && !output.destroyed) {
       const reason = stderr
         .split(/\r?\n/)
@@ -351,6 +365,7 @@ export function toPcmFromUrl(
 
   return {
     stream: output,
+    exit,
     kill: () => {
       if (child.exitCode === null) {
         try {

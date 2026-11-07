@@ -4,14 +4,15 @@ import { logger } from "../../logger.js";
 import { isPlaylistUrl, type ResolvedTrack, youtubeVideoIdFromUrl } from "../ytdlp.js";
 import { type ResolveOptions, type TrackResolver, UnsupportedQueryError } from "./types.js";
 
-/** The four clients the `INNERTUBE_CLIENT` flag exposes. */
-export type InnertubeClientType = "IOS" | "ANDROID" | "TV" | "WEB";
+/** The clients the `INNERTUBE_CLIENT` flag exposes. */
+export type InnertubeClientType = "IOS" | "ANDROID" | "TV" | "WEB" | "VISIONOS";
 
 const CLIENT_TYPES: Record<InnertubeClientType, ClientType> = {
   IOS: ClientType.IOS,
   ANDROID: ClientType.ANDROID,
   TV: ClientType.TV,
   WEB: ClientType.WEB,
+  VISIONOS: ClientType.VISIONOS,
 };
 
 /**
@@ -49,7 +50,7 @@ export class InnertubeResolver implements TrackResolver {
   private playerPromise: Promise<Innertube> | null = null;
 
   constructor(options: { client?: InnertubeClientType } = {}) {
-    this.client = options.client ?? "IOS";
+    this.client = options.client ?? "VISIONOS";
   }
 
   async resolve(query: string, _opts?: ResolveOptions): Promise<ResolvedTrack> {
@@ -174,7 +175,10 @@ export class InnertubeResolver implements TrackResolver {
     const startedAt = Date.now();
     const session = await Innertube.create({
       client_type: clientType,
-      generate_session_locally: true,
+      // Session data must come from YouTube: a locally fabricated visitor id
+      // gets the IP flagged with "Sign in to confirm you're not a bot" after a
+      // few player requests, while the real one keeps resolving.
+      generate_session_locally: false,
       enable_session_cache: false,
     });
     logger.info("innertube_session_ready", { client: label, ms: Date.now() - startedAt });
