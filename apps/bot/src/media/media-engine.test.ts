@@ -8,7 +8,12 @@ import { MediaError } from "../errors.js";
 import { AudioCache } from "./audio-cache.js";
 import type { AudioStore } from "./audio-store.js";
 import { DownloadRegistry } from "./download-registry.js";
-import { buildMeasuredFilter, computeGainDb, type LoudnessSettings } from "./ffmpeg.js";
+import {
+  buildMeasuredFilter,
+  computeGainDb,
+  type LoudnessSettings,
+  type StreamFilterMode,
+} from "./ffmpeg.js";
 import {
   CACHE_PREBUFFER_BYTES,
   type MediaEngineDeps,
@@ -64,6 +69,7 @@ function makeEngine(overrides: {
   twoPass?: boolean;
   maxGainDb?: number;
   normalization?: LoudnessSettings;
+  streamFilter?: StreamFilterMode;
   streamPrebufferMs?: number;
   resolver?: TrackResolver;
   resolveCache?: ResolveCache;
@@ -79,6 +85,7 @@ function makeEngine(overrides: {
     musicLinkMaxTracks: overrides.musicLinkMaxTracks,
     cache: overrides.cache,
     normalization: overrides.normalization,
+    streamFilter: overrides.streamFilter,
     twoPass: overrides.twoPass,
     maxGainDb: overrides.maxGainDb,
     prefetchEnabled: overrides.prefetchEnabled,
@@ -543,7 +550,7 @@ describe("media engine background cancellation", () => {
 
 describe("media engine two-pass gain", () => {
   const measurement = { inputLufs: -23, inputTp: -4, inputLra: 7, inputThresh: -33 };
-  const configured = "loudnorm=I=-16:TP=-1.5:LRA=11";
+  const configured = "loudnorm=I=-14:TP=-1:LRA=11";
 
   function captureFileFilter() {
     const captured: { filter: string | null | undefined } = { filter: "unset" };
@@ -582,9 +589,66 @@ describe("media engine two-pass gain", () => {
     opened.stop();
 
     expect(opened.source).toBe("cache");
-    const gain = computeGainDb(-23, -4, -16, -1.5, 12);
-    expect(gain).toBe(2.5);
+    const gain = computeGainDb(-23, -4, -14, -1, 12);
+    expect(gain).toBe(3);
     expect(captured.filter).toBe(buildMeasuredFilter(gain));
+  });
+
+  test("a cached track ignores AUDIO_STREAM_FILTER and replays its measured gain", async () => {
+    const { captured, toPcmFromFile } = captureFileFilter();
+    const engine = makeEngine({
+      cache: makeCache(new MemoryStore()),
+      // Would disable the stream path entirely; a measured cache must be blind to it.
+      streamFilter: "off",
+      deps: {
+        analyzeLoudness: async () => measurement,
+        toPcmFromFile,
+      },
+    });
+
+    await engine.ensureCached(track, "s");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(opened.source).toBe("cache");
+    const gain = computeGainDb(-23, -4, -14, -1, 12);
+    expect(captured.filter).toBe(buildMeasuredFilter(gain));
+  });
+
+  test("a streamed first play is peak-limited, never dynamically normalised", async () => {
+    const captured: { filter?: string | null } = {};
+    const engine = makeEngine({
+      deps: {
+        toPcm: (_stream, options) => {
+          captured.filter = options?.filter;
+          return pcmStream(200_000);
+        },
+      },
+    });
+
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(opened.source).toBe("stream");
+    expect(captured.filter).toBe("alimiter=limit=0.891:level=false");
+  });
+
+  test("AUDIO_STREAM_FILTER=off removes -af from the streamed path", async () => {
+    const captured: { filter?: string | null } = {};
+    const engine = makeEngine({
+      streamFilter: "off",
+      deps: {
+        toPcm: (_stream, options) => {
+          captured.filter = options?.filter;
+          return pcmStream(200_000);
+        },
+      },
+    });
+
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(captured.filter).toBeNull();
   });
 
   test("a cached track with no measurement falls back to the configured filter", async () => {
@@ -674,7 +738,7 @@ describe("media engine two-pass gain", () => {
     const { captured, toPcmFromFile } = captureFileFilter();
     const engine = makeEngine({
       cache: makeCache(new MemoryStore()),
-      normalization: { mode: "off", targetLufs: -16, truePeakDb: -1.5, lra: 11, dynFrameMs: 150 },
+      normalization: { mode: "off", targetLufs: -14, truePeakDb: -1, lra: 11, dynFrameMs: 150 },
       deps: {
         analyzeLoudness: async () => measurement,
         toPcmFromFile,
@@ -713,7 +777,7 @@ describe("media engine download reporting", () => {
       trackId: "vid",
       title: "Track",
       state: "ready",
-      gainDb: 2.5,
+      gainDb: 3,
       percent: 100,
     });
     expect(snapshot.totalBytes).toBe(10);
@@ -958,7 +1022,7 @@ describe("media engine direct stream URLs", () => {
 
     expect(capturedUrl).toBe(GOOGLEVIDEO);
     expect(capturedHeaders).toEqual({ "User-Agent": "com.google.ios.youtube/20.11.6" });
-    expect(capturedFilter).toBe("loudnorm=I=-16:TP=-1.5:LRA=11");
+    expect(capturedFilter).toBe("alimiter=limit=0.891:level=false");
     expect(ytdlpStreams).toBe(0);
     expect(opened.source).toBe("stream");
   });

@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { parseAllowedGuildIds } from "./guild-allowlist.js";
-import { DEFAULT_LOUDNESS_SETTINGS, DEFAULT_MAX_GAIN_DB } from "./media/ffmpeg.js";
+import {
+  DEFAULT_LOUDNESS_SETTINGS,
+  DEFAULT_MAX_GAIN_DB,
+  DEFAULT_STREAM_FILTER,
+  type StreamFilterMode,
+} from "./media/ffmpeg.js";
 import { DEFAULT_AUDIO_BITRATE_KBPS } from "./player/audio-bitrate.js";
 
 /**
@@ -120,6 +125,17 @@ const envSchema = z.object({
   AUDIO_NORMALIZE: z
     .enum(["loudnorm", "dynaudnorm", "off"])
     .default(DEFAULT_LOUDNESS_SETTINGS.mode),
+  /**
+   * Filter for the streamed first play of a track. A stream cannot be measured
+   * before it starts, so a one-pass `loudnorm` there dynamically ducks a hot
+   * master (a −8 LUFS / +2.6 dBTP track loses ~8 dB to reach the target, which
+   * is audible as "it goes quiet after ~10 s"). `limiter` only limits peaks:
+   * no gain change, no pumping. The tradeoff is that track 1 may be louder than
+   * the rest until its measured gain is available on a later play.
+   */
+  AUDIO_STREAM_FILTER: z
+    .enum(["limiter", "off", "loudnorm", "dynaudnorm"])
+    .default(DEFAULT_STREAM_FILTER),
   AUDIO_TARGET_LUFS: z.coerce
     .number()
     .min(-30, "must be between -30 and -5")
@@ -216,6 +232,7 @@ export interface AppConfig {
   streamPrebufferMs: number;
   audioCacheMaxFileBytes: number;
   audioNormalize: "loudnorm" | "dynaudnorm" | "off";
+  audioStreamFilter: StreamFilterMode;
   audioTargetLufs: number;
   audioTruePeakDb: number;
   audioLra: number;
@@ -317,6 +334,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     streamPrebufferMs: value.STREAM_PREBUFFER_MS,
     audioCacheMaxFileBytes: value.AUDIO_CACHE_MAX_FILE_BYTES,
     audioNormalize: value.AUDIO_NORMALIZE,
+    audioStreamFilter: value.AUDIO_STREAM_FILTER,
     audioTargetLufs: value.AUDIO_TARGET_LUFS,
     audioTruePeakDb: value.AUDIO_TRUE_PEAK_DB,
     audioLra: value.AUDIO_LRA,
