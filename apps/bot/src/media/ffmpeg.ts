@@ -274,6 +274,97 @@ export function toPcmArgs(options: FfmpegOptions = {}): string[] {
 }
 
 /**
+ * One `-headers` value for ffmpeg. A header value is attacker-adjacent input
+ * (it comes from the extractor), so CR/LF are stripped: a newline in a value
+ * would let it inject a second header or a whole extra request.
+ */
+export function sanitizeStreamHeaders(headers?: Record<string, string>): string | null {
+  if (!headers) return null;
+  const lines: string[] = [];
+  for (const [rawName, rawValue] of Object.entries(headers)) {
+    const name = String(rawName)
+      .replace(/[\r\n]/g, "")
+      .trim();
+    if (!name) continue;
+    const value = String(rawValue).replace(/[\r\n]/g, "");
+    lines.push(`${name}: ${value}`);
+  }
+  return lines.length > 0 ? lines.join("\r\n") : null;
+}
+
+/**
+ * Args for decoding a remote URL. `-headers` and `-ss` are input options, so
+ * both must precede `-i`; the output tail always comes last.
+ */
+export function toPcmFromUrlArgs(
+  url: string,
+  headers?: Record<string, string>,
+  options: FfmpegOptions & { startSec?: number } = {},
+): string[] {
+  const startSec = Math.max(0, Math.floor(options.startSec ?? 0));
+  const args = ["-hide_banner", "-loglevel", "error"];
+  const headerBlock = sanitizeStreamHeaders(headers);
+  if (headerBlock) args.push("-headers", headerBlock);
+  args.push("-ss", String(startSec), "-i", url);
+  appendOutputTail(args, options);
+  return args;
+}
+
+/**
+ * Decode a remote media URL to 48 kHz stereo s16le PCM on stdout. Used for a
+ * resolver-provided stream URL, which skips yt-dlp at playback time.
+ */
+export function toPcmFromUrl(
+  url: string,
+  headers?: Record<string, string>,
+  options: FfmpegOptions & { startSec?: number } = {},
+): FfmpegFileStream {
+  const ffmpegPath = options.ffmpegPath ?? process.env.FFMPEG_PATH?.trim() ?? "ffmpeg";
+
+  const child = spawn(ffmpegPath, toPcmFromUrlArgs(url, headers, options), {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const output = child.stdout;
+  let stderr = "";
+
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr = `${stderr}${chunk}`.slice(-4000);
+  });
+
+  child.on("error", (error) => {
+    output.destroy(new Error(`Could not start ffmpeg at "${ffmpegPath}": ${error.message}`));
+  });
+
+  child.on("close", (code) => {
+    if (code !== 0 && code !== null && !output.destroyed) {
+      const reason = stderr
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .pop();
+      output.destroy(new Error(`ffmpeg exited with code ${code}${reason ? `: ${reason}` : ""}`));
+    }
+  });
+
+  output.on("error", () => {});
+
+  return {
+    stream: output,
+    kill: () => {
+      if (child.exitCode === null) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+      output.destroy();
+    },
+  };
+}
+
+/**
  * Decode a local audio file to 48 kHz stereo s16le PCM on stdout.
  * `-ss` sits before `-i` so the seek is a fast input seek.
  */

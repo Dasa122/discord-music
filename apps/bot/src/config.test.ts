@@ -233,3 +233,39 @@ describe("loadConfig fast-start tuning", () => {
     );
   });
 });
+
+describe("loadConfig resolver selection", () => {
+  test("defaults to the yt-dlp resolver, so deploying changes nothing", () => {
+    const config = loadConfig(baseEnv());
+    expect(config.resolver).toBe("ytdlp");
+    expect(config.innertubeClient).toBe("IOS");
+    expect(config.resolverFailureThreshold).toBe(3);
+    expect(config.resolverCooldownMs).toBe(600_000);
+  });
+
+  test("accepts the innertube flag and its four client names", () => {
+    const config = loadConfig(baseEnv({ RESOLVER: " innertube\n" }));
+    expect(config.resolver).toBe("innertube");
+
+    for (const client of ["IOS", "ANDROID", "TV", "WEB"] as const) {
+      expect(loadConfig(baseEnv({ INNERTUBE_CLIENT: client })).innertubeClient).toBe(client);
+    }
+  });
+
+  test("accepts the breaker knobs and rejects values outside their range", () => {
+    const config = loadConfig(
+      baseEnv({ RESOLVER_FAILURE_THRESHOLD: "5", RESOLVER_COOLDOWN_MS: "30000" }),
+    );
+    expect(config.resolverFailureThreshold).toBe(5);
+    expect(config.resolverCooldownMs).toBe(30_000);
+
+    expect(() => loadConfig(baseEnv({ RESOLVER: "magic" }))).toThrow(/RESOLVER:/);
+    expect(() => loadConfig(baseEnv({ INNERTUBE_CLIENT: "MWEB" }))).toThrow(/INNERTUBE_CLIENT:/);
+    expect(() => loadConfig(baseEnv({ RESOLVER_FAILURE_THRESHOLD: "0" }))).toThrow(
+      /RESOLVER_FAILURE_THRESHOLD: must be between 1 and 100/,
+    );
+    expect(() => loadConfig(baseEnv({ RESOLVER_COOLDOWN_MS: "999" }))).toThrow(
+      /RESOLVER_COOLDOWN_MS: must be between 1000 and 86400000/,
+    );
+  });
+});

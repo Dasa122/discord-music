@@ -15,6 +15,8 @@ import {
   STREAM_PREBUFFER_BYTES,
   YtdlpMediaEngine,
 } from "./media-engine.js";
+import { ResolveCache } from "./resolve-cache.js";
+import type { TrackResolver } from "./resolver/types.js";
 
 class MemoryStore implements AudioStore {
   readonly objects = new Map<string, number>();
@@ -61,10 +63,14 @@ function makeEngine(overrides: {
   maxGainDb?: number;
   normalization?: LoudnessSettings;
   streamPrebufferMs?: number;
+  resolver?: TrackResolver;
+  resolveCache?: ResolveCache;
 }) {
   return new YtdlpMediaEngine({
     ytdlp: { path: "yt-dlp", denoPath: "deno" },
     ffmpegPath: "ffmpeg",
+    resolver: overrides.resolver,
+    resolveCache: overrides.resolveCache,
     cache: overrides.cache,
     normalization: overrides.normalization,
     twoPass: overrides.twoPass,
@@ -878,5 +884,209 @@ describe("media engine stream prebuffer", () => {
     expect(received.reduce((total, chunk) => total + chunk.length, 0)).toBeGreaterThan(0);
 
     opened.stop();
+  });
+});
+
+function failingStream(message: string): PassThrough {
+  const stream = new PassThrough();
+  queueMicrotask(() => stream.destroy(new Error(message)));
+  return stream;
+}
+
+const GOOGLEVIDEO = "https://rr1.googlevideo.com/videoplayback?itag=140&expire=1";
+
+function streamResolver(overrides: {
+  streamUrl?: string | null;
+  onResolve?: (query: string) => void;
+}): TrackResolver {
+  return {
+    async resolve(query) {
+      overrides.onResolve?.(query);
+      return {
+        videoId: "vid",
+        title: "Track",
+        webpageUrl: track.url,
+        durationSec: 30,
+        thumbnailUrl: null,
+        isPlaylist: false,
+        ...(overrides.streamUrl === null
+          ? {}
+          : {
+              streamUrl: overrides.streamUrl ?? GOOGLEVIDEO,
+              headers: { "User-Agent": "com.google.ios.youtube/20.11.6" },
+            }),
+      };
+    },
+    async resolveSearch() {
+      return [];
+    },
+  };
+}
+
+describe("media engine direct stream URLs", () => {
+  test("a resolver streamUrl plays through ffmpeg on the URL and skips yt-dlp", async () => {
+    let ytdlpStreams = 0;
+    let capturedUrl = "";
+    let capturedHeaders: Record<string, string> | undefined;
+    let capturedFilter: string | null | undefined;
+
+    const engine = makeEngine({
+      resolver: streamResolver({}),
+      deps: {
+        toPcmFromUrl: (url, headers, options) => {
+          capturedUrl = url;
+          capturedHeaders = headers;
+          capturedFilter = options?.filter;
+          return { stream: pcmStream(200_000), kill: () => undefined };
+        },
+        openAudioStream: async () => {
+          ytdlpStreams += 1;
+          return { process: fakeProcess(), stream: pcmStream(200_000) };
+        },
+      },
+    });
+
+    await engine.resolve("a song");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(capturedUrl).toBe(GOOGLEVIDEO);
+    expect(capturedHeaders).toEqual({ "User-Agent": "com.google.ios.youtube/20.11.6" });
+    expect(capturedFilter).toBe("loudnorm=I=-16:TP=-1.5:LRA=11");
+    expect(ytdlpStreams).toBe(0);
+    expect(opened.source).toBe("stream");
+  });
+
+  test("a resolver without a streamUrl keeps the yt-dlp pipe", async () => {
+    let urlAttempts = 0;
+    let ytdlpStreams = 0;
+
+    const engine = makeEngine({
+      resolver: streamResolver({ streamUrl: null }),
+      deps: {
+        toPcmFromUrl: () => {
+          urlAttempts += 1;
+          return { stream: pcmStream(200_000), kill: () => undefined };
+        },
+        openAudioStream: async () => {
+          ytdlpStreams += 1;
+          return { process: fakeProcess(), stream: pcmStream(200_000) };
+        },
+      },
+    });
+
+    await engine.resolve("a song");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(urlAttempts).toBe(0);
+    expect(ytdlpStreams).toBe(1);
+  });
+
+  test("a 403 re-resolves exactly once, then falls back to the yt-dlp pipe", async () => {
+    const resolved: string[] = [];
+    let urlAttempts = 0;
+    let ytdlpStreams = 0;
+
+    const engine = makeEngine({
+      resolver: streamResolver({ onResolve: (query) => resolved.push(query) }),
+      deps: {
+        toPcmFromUrl: () => {
+          urlAttempts += 1;
+          return {
+            stream: failingStream("ffmpeg exited with code 1: HTTP error 403 Forbidden"),
+            kill: () => undefined,
+          };
+        },
+        openAudioStream: async () => {
+          ytdlpStreams += 1;
+          return { process: fakeProcess(), stream: pcmStream(200_000) };
+        },
+      },
+    });
+
+    await engine.resolve("a song");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    // One resolve to queue the track, one re-resolve to re-mint the URL.
+    expect(resolved).toEqual(["a song", track.url]);
+    expect(urlAttempts).toBe(2);
+    expect(ytdlpStreams).toBe(1);
+    expect(opened.source).toBe("stream");
+  });
+
+  test("a failure that a fresh URL cannot cure is not retried, but still degrades", async () => {
+    let urlAttempts = 0;
+    let resolves = 0;
+    let ytdlpStreams = 0;
+
+    const engine = makeEngine({
+      resolver: streamResolver({ onResolve: () => (resolves += 1) }),
+      deps: {
+        toPcmFromUrl: () => {
+          urlAttempts += 1;
+          return {
+            stream: failingStream('Could not start ffmpeg at "ffmpeg": spawn ffmpeg ENOENT'),
+            kill: () => undefined,
+          };
+        },
+        openAudioStream: async () => {
+          ytdlpStreams += 1;
+          return { process: fakeProcess(), stream: pcmStream(200_000) };
+        },
+      },
+    });
+
+    await engine.resolve("a song");
+    const opened = await engine.open(track, { sessionId: "s" });
+    opened.stop();
+
+    expect(urlAttempts).toBe(1);
+    expect(resolves).toBe(1);
+    expect(ytdlpStreams).toBe(1);
+  });
+
+  test("the signed URL is never written to the resolve cache", async () => {
+    const resolveCache = new ResolveCache();
+    const engine = makeEngine({
+      resolveCache,
+      resolver: streamResolver({}),
+      deps: {
+        toPcmFromUrl: () => ({ stream: pcmStream(200_000), kill: () => undefined }),
+      },
+    });
+
+    await engine.resolve("a song");
+
+    const cached = resolveCache.get("a song");
+    expect(cached?.videoId).toBe("vid");
+    expect(JSON.stringify(cached)).not.toContain("googlevideo");
+  });
+
+  test("the stream URL is consumed by exactly one open", async () => {
+    let urlAttempts = 0;
+    let ytdlpStreams = 0;
+
+    const engine = makeEngine({
+      resolver: streamResolver({}),
+      deps: {
+        toPcmFromUrl: () => {
+          urlAttempts += 1;
+          return { stream: pcmStream(200_000), kill: () => undefined };
+        },
+        openAudioStream: async () => {
+          ytdlpStreams += 1;
+          return { process: fakeProcess(), stream: pcmStream(200_000) };
+        },
+      },
+    });
+
+    await engine.resolve("a song");
+    (await engine.open(track, { sessionId: "s" })).stop();
+    (await engine.open(track, { sessionId: "s" })).stop();
+
+    expect(urlAttempts).toBe(1);
+    expect(ytdlpStreams).toBe(1);
   });
 });

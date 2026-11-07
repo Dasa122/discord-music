@@ -13,9 +13,12 @@ import {
   selectPlaybackFilter,
   toPcm,
   toPcmFromFile,
+  toPcmFromUrl,
 } from "./ffmpeg.js";
 import { QueuedSemaphore } from "./limits.js";
 import { type CachedResolution, ResolveCache } from "./resolve-cache.js";
+import type { TrackResolver } from "./resolver/types.js";
+import { createYtdlpResolver } from "./resolver/ytdlp-resolver.js";
 import {
   downloadAudio,
   openAudioStream,
@@ -41,6 +44,29 @@ export const DEFAULT_PREBUFFER_TIMEOUT_MS = 15_000;
 
 /** A stream prebuffer that produces nothing within this multiple falls back to piping. */
 export const STREAM_PREBUFFER_TIMEOUT_FACTOR = 4;
+
+/** A direct-URL ffmpeg exit inside this window is treated as a stale URL. */
+export const STREAM_URL_FAST_FAIL_MS = 5_000;
+
+/** One queued stream URL per resolved track; the oldest is evicted past this. */
+export const MAX_PENDING_STREAMS = 64;
+
+/**
+ * Is a failed direct-URL attempt worth one re-resolve? An explicit 403/410 from
+ * googlevideo means the signed URL expired or was minted for another client;
+ * any other fast non-zero exit (bad manifest, rejected UA) may also be cured by
+ * a fresh URL. Anything slower is a network problem and belongs on yt-dlp.
+ */
+export function isRetryableStreamUrlFailure(message: string, elapsedMs: number): boolean {
+  if (/\b(403|410)\b/.test(message)) return true;
+  return elapsedMs < STREAM_URL_FAST_FAIL_MS && /ffmpeg exited with code/i.test(message);
+}
+
+/** A signed media URL handed from `resolve()` to the play that follows it. */
+interface PendingStream {
+  url: string;
+  headers?: Record<string, string>;
+}
 
 export interface MediaTrack {
   id?: string;
@@ -89,6 +115,7 @@ export interface MediaEngineDeps {
   resolveSearch: typeof resolveSearch;
   toPcm: typeof toPcm;
   toPcmFromFile: typeof toPcmFromFile;
+  toPcmFromUrl: typeof toPcmFromUrl;
   analyzeLoudness: typeof analyzeLoudness;
 }
 
@@ -117,6 +144,11 @@ export interface YtdlpMediaEngineOptions {
   prebufferTimeoutMs?: number;
   /** Shared across engines; injectable so a test can use a controlled clock. */
   resolveCache?: ResolveCache;
+  /**
+   * Where resolved metadata comes from. Defaults to the yt-dlp wrapper, so the
+   * pre-P2 behaviour is unchanged when RESOLVER is unset.
+   */
+  resolver?: TrackResolver;
   deps?: Partial<MediaEngineDeps>;
 }
 
@@ -228,6 +260,7 @@ export class YtdlpMediaEngine implements MediaEngine {
   private readonly streamPrebufferMs: number;
   private readonly prebufferTimeoutMs: number;
   private readonly resolveCache: ResolveCache;
+  private readonly resolver: TrackResolver;
   private readonly deps: MediaEngineDeps;
 
   private readonly preparing = new Map<string, Promise<void>>();
@@ -236,6 +269,12 @@ export class YtdlpMediaEngine implements MediaEngine {
   private readonly measurementByKey = new Map<string, TrackMeasurement>();
   private readonly prefetching = new Map<string, Promise<void>>();
   private readonly prefetchAborts = new Map<string, AbortController>();
+  /**
+   * Signed stream URLs keyed by track id, written by `resolve()` and consumed
+   * by exactly one `open()`. Never persisted, never sent to the client: a
+   * googlevideo URL is IP/UA-bound and expires.
+   */
+  private readonly pendingStreams = new Map<string, PendingStream>();
 
   constructor(options: YtdlpMediaEngineOptions) {
     this.ytdlpOptions = options.ytdlp;
@@ -261,9 +300,17 @@ export class YtdlpMediaEngine implements MediaEngine {
       resolveSearch,
       toPcm,
       toPcmFromFile,
+      toPcmFromUrl,
       analyzeLoudness,
       ...options.deps,
     };
+    this.resolver =
+      options.resolver ??
+      createYtdlpResolver({
+        options: this.ytdlpOptions,
+        resolve: this.deps.resolve,
+        resolveSearch: this.deps.resolveSearch,
+      });
   }
 
   async resolve(query: string, sessionId?: string): Promise<ResolvedTrack> {
@@ -281,14 +328,41 @@ export class YtdlpMediaEngine implements MediaEngine {
     }
 
     logger.debug("resolve_source", { source: "extractor" });
-    const resolved = await this.deps.resolve(query, this.ytdlpOptions);
+    const resolved = await this.resolver.resolve(query, { sessionId });
     // Failures are never cached: a transient extractor error must not stick.
     this.resolveCache.set(query, resolved);
+    this.rememberStream(resolved);
     return resolved;
   }
 
-  resolveSearch(query: string, limit: number): Promise<ResolvedTrack[]> {
-    return this.deps.resolveSearch(query, limit, this.ytdlpOptions);
+  async resolveSearch(query: string, limit: number): Promise<ResolvedTrack[]> {
+    const results = await this.resolver.resolveSearch(query, limit);
+    for (const result of results) this.rememberStream(result);
+    return results;
+  }
+
+  private rememberStream(track: ResolvedTrack): void {
+    if (track.streamUrl) {
+      const key = track.videoId ?? track.webpageUrl;
+      if (!this.pendingStreams.has(key) && this.pendingStreams.size >= MAX_PENDING_STREAMS) {
+        const oldest = this.pendingStreams.keys().next();
+        if (!oldest.done) this.pendingStreams.delete(oldest.value);
+      }
+      this.pendingStreams.set(key, {
+        url: track.streamUrl,
+        ...(track.headers ? { headers: track.headers } : {}),
+      });
+    }
+    for (const entry of track.entries ?? []) this.rememberStream(entry);
+  }
+
+  /** The one-shot hand-off for this play; a second play re-resolves. */
+  private takeStream(track: MediaTrack): PendingStream | null {
+    const key = this.trackId(track);
+    const pending = this.pendingStreams.get(key);
+    if (!pending) return null;
+    this.pendingStreams.delete(key);
+    return pending;
   }
 
   /**
@@ -571,6 +645,9 @@ export class YtdlpMediaEngine implements MediaEngine {
     const startSec = options.startSec ?? 0;
     const id = this.trackId(track);
     const openStartedAt = Date.now();
+    // Consumed here so a cache hit discards it and a second play re-resolves:
+    // the URL lives for exactly one open.
+    const pending = this.takeStream(track);
 
     if (this.cache && options.sessionId && !track.isLive) {
       if (this.cache.has(options.sessionId, id)) {
@@ -617,7 +694,7 @@ export class YtdlpMediaEngine implements MediaEngine {
       source: "stream",
     });
     logger.debug("play_filter", { source: "stream", filter: selected.kind });
-    const opened = await this.openStream(track, startSec, selected.filter, id);
+    const opened = await this.openStream(track, startSec, selected.filter, id, pending);
     logger.info("play_source", { source: "stream", trackId: id });
     logger.debug("open_ms", { ms: Date.now() - openStartedAt, source: "stream", trackId: id });
 
@@ -663,7 +740,13 @@ export class YtdlpMediaEngine implements MediaEngine {
     startSec: number,
     filter: string | null,
     trackId: string,
+    pending: PendingStream | null,
   ): Promise<OpenedStream> {
+    if (pending) {
+      const fromUrl = await this.openUrlWithRetry(track, pending, startSec, filter, trackId);
+      if (fromUrl) return fromUrl;
+    }
+
     const ytdlp = await this.deps.openAudioStream(track, {
       startSec,
       options: this.ytdlpOptions,
@@ -688,6 +771,85 @@ export class YtdlpMediaEngine implements MediaEngine {
         stopYtdlp();
         pcm.destroy();
       },
+      prebufferBytes: Math.round(this.streamPrebufferMs * PCM_BYTES_PER_MS),
+      source: "stream",
+      timeoutMs: this.streamPrebufferMs * STREAM_PREBUFFER_TIMEOUT_FACTOR,
+      fallbackOnTimeout: true,
+      trackId,
+    });
+  }
+
+  /**
+   * Play straight from the resolver's googlevideo URL. A stale URL is re-minted
+   * once, and if that fails too the caller falls back to the yt-dlp pipe — a
+   * resolver failure must never fail the command.
+   */
+  private async openUrlWithRetry(
+    track: MediaTrack,
+    pending: PendingStream,
+    startSec: number,
+    filter: string | null,
+    trackId: string,
+  ): Promise<OpenedStream | null> {
+    const startedAt = Date.now();
+    try {
+      logger.debug("play_transport", { trackId, transport: "url" });
+      return await this.openFromUrl(pending, startSec, filter, trackId);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const elapsedMs = Date.now() - startedAt;
+      if (!isRetryableStreamUrlFailure(reason, elapsedMs)) {
+        // Not something a fresh URL can cure (missing ffmpeg, broken network).
+        // The URL path is an optimisation, never a dependency: degrade instead
+        // of failing a command that yt-dlp can still serve.
+        logger.warn("stream_url_fallback", { trackId, reason: reason.slice(0, 240) });
+        return null;
+      }
+      logger.warn("stream_url_retry", {
+        trackId,
+        elapsedMs,
+        reason: reason.slice(0, 240),
+      });
+    }
+
+    try {
+      const refreshed = await this.resolver.resolve(track.url);
+      if (refreshed.streamUrl) {
+        return await this.openFromUrl(
+          {
+            url: refreshed.streamUrl,
+            ...(refreshed.headers ? { headers: refreshed.headers } : {}),
+          },
+          startSec,
+          filter,
+          trackId,
+        );
+      }
+      logger.warn("stream_url_fallback", { trackId, reason: "no_refreshed_url" });
+    } catch (error) {
+      logger.warn("stream_url_fallback", {
+        trackId,
+        reason: (error instanceof Error ? error.message : String(error)).slice(0, 240),
+      });
+    }
+    return null;
+  }
+
+  private async openFromUrl(
+    pending: PendingStream,
+    startSec: number,
+    filter: string | null,
+    trackId: string,
+  ): Promise<OpenedStream> {
+    const decoded = this.deps.toPcmFromUrl(pending.url, pending.headers, {
+      ffmpegPath: this.ffmpegPath,
+      startSec,
+      filter,
+      normalization: this.normalization,
+    });
+    return this.finishOpened({
+      pcm: decoded.stream,
+      stopDecoder: decoded.kill,
       prebufferBytes: Math.round(this.streamPrebufferMs * PCM_BYTES_PER_MS),
       source: "stream",
       timeoutMs: this.streamPrebufferMs * STREAM_PREBUFFER_TIMEOUT_FACTOR,
@@ -721,6 +883,9 @@ export class YtdlpMediaEngine implements MediaEngine {
     pcm.on("error", (error) => {
       if (!output.destroyed) output.destroy(error);
     });
+    // The decoder error is already surfaced by the prebuffer awaiting below;
+    // this listener only stops Node from treating it as unhandled.
+    output.on("error", () => {});
     output.on("close", () => {
       if (!stopped) stop();
     });
