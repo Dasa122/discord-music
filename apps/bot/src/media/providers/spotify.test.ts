@@ -129,9 +129,9 @@ describe("spotify provider with credentials", () => {
     });
 
     await provider.resolve(new URL(TRACK_URL));
-    expect(calls.some((url) => url.includes("api.spotify.com"))).toBe(true);
-    expect(calls.some((url) => url.startsWith("https://open.spotify.com/track/"))).toBe(false);
-    expect(calls.some((url) => url.startsWith("https://open.spotify.com/oembed"))).toBe(false);
+    expect(calls.some((url) => new URL(url).hostname === "api.spotify.com")).toBe(true);
+    expect(calls.some((url) => new URL(url).pathname.startsWith("/track/"))).toBe(false);
+    expect(calls.some((url) => new URL(url).pathname === "/oembed")).toBe(false);
   });
 
   test("maps an album with its name and album artwork fallback", async () => {

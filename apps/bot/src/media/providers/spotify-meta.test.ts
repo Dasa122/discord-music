@@ -140,6 +140,13 @@ describe("html sanitising", () => {
     expect(parseSpotifyPage(html, TRACK_URL)?.title).toBe("Real");
   });
 
+  test("strips end tags with trailing junk and nested constructs until stable", () => {
+    expect(stripScriptBlocks("<script>one</script\t\n bar>tail")).toBe("tail");
+    expect(stripScriptBlocks("<scr<script>ipt>alert(1)</script>").toLowerCase()).not.toContain(
+      "<script",
+    );
+  });
+
   test("caps the body at 512 KB", () => {
     expect(SPOTIFY_PAGE_MAX_BYTES).toBe(512 * 1024);
     const huge = "x".repeat(SPOTIFY_PAGE_MAX_BYTES + 10_000);

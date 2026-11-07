@@ -65,9 +65,16 @@ export function decodeHtmlEntities(value: string): string {
 
 /** Drop `<script>` bodies before parsing: they hold a Next.js blob of JSON. */
 export function stripScriptBlocks(html: string): string {
-  return html
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "")
-    .replace(/<script\b[^>]*\/>/gi, "");
+  // `</script` may be followed by whitespace, `/` or `>`, and nested constructs
+  // can leave a new `<script>` behind, so strip repeatedly until stable.
+  const block = /<script\b[^>]*>[\s\S]*?<\/script\b[^>]*>/gi;
+  const selfClosing = /<script\b[^>]*\/>/gi;
+  let current = html;
+  for (;;) {
+    const next = current.replace(block, "").replace(selfClosing, "");
+    if (next === current) return next;
+    current = next;
+  }
 }
 
 /** Cut the body at a byte boundary so a hostile page cannot exhaust memory. */
