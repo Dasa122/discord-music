@@ -12,9 +12,11 @@ import { buildMeasuredFilter, computeGainDb, type LoudnessSettings } from "./ffm
 import {
   CACHE_PREBUFFER_BYTES,
   type MediaEngineDeps,
+  type MusicLinkSource,
   STREAM_PREBUFFER_BYTES,
   YtdlpMediaEngine,
 } from "./media-engine.js";
+import { MusicLinkError, type ProviderTrack } from "./providers/types.js";
 import { ResolveCache } from "./resolve-cache.js";
 import type { TrackResolver } from "./resolver/types.js";
 
@@ -65,12 +67,16 @@ function makeEngine(overrides: {
   streamPrebufferMs?: number;
   resolver?: TrackResolver;
   resolveCache?: ResolveCache;
+  musicLinks?: MusicLinkSource;
+  musicLinkMaxTracks?: number;
 }) {
   return new YtdlpMediaEngine({
     ytdlp: { path: "yt-dlp", denoPath: "deno" },
     ffmpegPath: "ffmpeg",
     resolver: overrides.resolver,
     resolveCache: overrides.resolveCache,
+    musicLinks: overrides.musicLinks,
+    musicLinkMaxTracks: overrides.musicLinkMaxTracks,
     cache: overrides.cache,
     normalization: overrides.normalization,
     twoPass: overrides.twoPass,
@@ -1151,5 +1157,153 @@ describe("media engine direct stream URLs", () => {
 
     expect(urlAttempts).toBe(1);
     expect(ytdlpStreams).toBe(1);
+  });
+});
+
+describe("media engine music links", () => {
+  const spotifyUrl = "https://open.spotify.com/album/a1";
+
+  function providerTrack(overrides: Partial<ProviderTrack> = {}): ProviderTrack {
+    return {
+      title: "Source Title",
+      artists: ["Source Artist"],
+      durationSec: 222,
+      thumbnailUrl: "https://i.scdn.co/image/source",
+      sourceUrl: "https://open.spotify.com/track/t1",
+      provider: "spotify",
+      ...overrides,
+    };
+  }
+
+  function linkSource(
+    tracks: ProviderTrack[],
+    overrides: Partial<MusicLinkSource> = {},
+  ): MusicLinkSource {
+    return {
+      parse: (query) =>
+        query === spotifyUrl
+          ? { provider: "spotify", kind: "album", id: "a1", url: new URL(spotifyUrl) }
+          : null,
+      resolve: async () => ({ provider: "spotify", kind: "album", title: "Album", tracks }),
+      ...overrides,
+    };
+  }
+
+  test("a provider track with a youtube id performs zero searches", async () => {
+    let searches = 0;
+    const engine = makeEngine({
+      musicLinks: {
+        parse: (query) =>
+          query === spotifyUrl
+            ? { provider: "spotify", kind: "track", id: "t1", url: new URL(spotifyUrl) }
+            : null,
+        resolve: async () => ({
+          provider: "spotify",
+          kind: "track",
+          tracks: [providerTrack({ youtubeVideoId: "ytid1234567" })],
+        }),
+      },
+      deps: {
+        resolveSearch: async () => {
+          searches += 1;
+          return [];
+        },
+      },
+    });
+
+    const resolved = await engine.resolve(spotifyUrl);
+    expect(searches).toBe(0);
+    expect(resolved.isPlaylist).toBe(false);
+    expect(resolved.videoId).toBe("ytid1234567");
+    expect(resolved.webpageUrl).toBe("https://www.youtube.com/watch?v=ytid1234567");
+    // Source metadata wins over anything YouTube would say.
+    expect(resolved.title).toBe("Source Title");
+    expect(resolved.thumbnailUrl).toBe("https://i.scdn.co/image/source");
+  });
+
+  test("a provider track without a youtube id costs exactly one search", async () => {
+    const searches: string[] = [];
+    const engine = makeEngine({
+      musicLinks: linkSource([
+        providerTrack({ title: "One", artists: ["A"] }),
+        providerTrack({ title: "Two", artists: ["B", "C"] }),
+        providerTrack({ title: "Three", artists: [] }),
+      ]),
+      musicLinkMaxTracks: 10,
+      deps: {
+        resolveSearch: async (query) => {
+          searches.push(query);
+          return [
+            {
+              videoId: `yt${searches.length}`,
+              title: "YouTube title",
+              webpageUrl: `https://www.youtube.com/watch?v=yt${searches.length}`,
+              durationSec: 111,
+              thumbnailUrl: "https://i.ytimg.com/x.jpg",
+              isPlaylist: false,
+            },
+          ];
+        },
+      },
+    });
+
+    const resolved = await engine.resolve(spotifyUrl);
+    expect(searches).toEqual(["One A", "Two B C", "Three"]);
+    expect(resolved.isPlaylist).toBe(true);
+    expect(resolved.title).toBe("Album");
+    expect(resolved.entries?.map((entry) => entry.videoId)).toEqual(["yt1", "yt2", "yt3"]);
+    expect(resolved.entries?.[0]?.title).toBe("One");
+    expect(resolved.entries?.[0]?.artist).toBe("A");
+    expect(resolved.entries?.[0]?.durationSec).toBe(222);
+  });
+
+  test("the music link cap is enforced on the mapped collection", async () => {
+    const engine = makeEngine({
+      musicLinks: linkSource([
+        providerTrack({ youtubeVideoId: "yt1" }),
+        providerTrack({ youtubeVideoId: "yt2" }),
+        providerTrack({ youtubeVideoId: "yt3" }),
+      ]),
+      musicLinkMaxTracks: 2,
+    });
+
+    const resolved = await engine.resolve(spotifyUrl);
+    expect(resolved.entries).toHaveLength(2);
+  });
+
+  test("a provider failure surfaces as a typed MediaError", async () => {
+    const engine = makeEngine({
+      musicLinks: linkSource([], {
+        resolve: async () => {
+          throw new MusicLinkError("TRACK_NOT_FOUND", "Spotify could not find that track.");
+        },
+      }),
+    });
+
+    const error = await engine.resolve(spotifyUrl).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(MediaError);
+    expect((error as MediaError).code).toBe("EXTRACTOR_FAILED");
+    expect((error as MediaError).message).toBe("Spotify could not find that track.");
+  });
+
+  test("a resolve cache hit avoids a second provider call", async () => {
+    let providerCalls = 0;
+    const engine = makeEngine({
+      musicLinks: linkSource([providerTrack({ youtubeVideoId: "yt1" })], {
+        resolve: async () => {
+          providerCalls += 1;
+          return {
+            provider: "spotify",
+            kind: "album",
+            title: "Album",
+            tracks: [providerTrack({ youtubeVideoId: "yt1" })],
+          };
+        },
+      }),
+    });
+
+    await engine.resolve(spotifyUrl);
+    await engine.resolve(spotifyUrl);
+    expect(providerCalls).toBe(1);
   });
 });

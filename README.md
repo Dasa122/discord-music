@@ -150,6 +150,17 @@ bytes within four times that window it falls back to the raw pipe instead of fai
 The first track of each play logs `first_audio { ms, source, trackId }` at `info` when the player
 reaches `Playing`, which is the measurement to compare before and after these changes.
 
+### Playlists and music links
+
+- `/play` accepts `start_at` (1-based track number) or `start_from` (title substring) for YouTube,
+  Spotify and Apple Music collections; they are mutually exclusive.
+- A multi-track collection without a start point now shows a picker (first 10 previewed, up to 25
+  selectable) instead of queueing everything blindly; **Queue all** or a chosen track enqueues from
+  that point.
+- Spotify/Apple Music **tracks** resolve through song.link with no credentials; Spotify
+  **albums/playlists** need `SPOTIFY_CLIENT_ID`/`SPOTIFY_CLIENT_SECRET`. `MUSIC_LINK_MAX_TRACKS`
+  (default 50) caps how far one link expands.
+
 ### Loudness normalization
 
 Every decoded track passes through a loudness filter before the 48 kHz stereo s16le PCM reaches

@@ -70,6 +70,16 @@ const envSchema = z.object({
   POT_PROVIDER_URL: z.url().optional(),
   /** Persists the extractor's player/challenge work across invocations. */
   YTDLP_CACHE_DIR: z.string().trim().min(1).default("/tmp/yt-dlp-cache"),
+  /** Spotify Web API credentials; both or neither, validated below. */
+  SPOTIFY_CLIENT_ID: z.string().trim().min(1).optional(),
+  SPOTIFY_CLIENT_SECRET: z.string().trim().min(1).optional(),
+  /** Cap on tracks expanded from one album/playlist link (1..100). */
+  MUSIC_LINK_MAX_TRACKS: z.coerce
+    .number()
+    .int()
+    .min(1, "must be between 1 and 100")
+    .max(100, "must be between 1 and 100")
+    .default(50),
   /** `local` keeps files on disk; `s3` uploads them to Garage/MinIO. */
   AUDIO_STORE: z.enum(["local", "s3"]).default("local"),
   /** Where downloaded audio is cached for the lifetime of a voice session. */
@@ -194,6 +204,9 @@ export interface AppConfig {
   ytdlpProxy: string | undefined;
   potProviderUrl: string | undefined;
   ytdlpCacheDir: string;
+  spotifyClientId: string | undefined;
+  spotifyClientSecret: string | undefined;
+  musicLinkMaxTracks: number;
   audioStore: "local" | "s3";
   audioCacheDir: string;
   audioCacheMaxBytes: number;
@@ -264,6 +277,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     }
   }
 
+  if ((value.SPOTIFY_CLIENT_ID === undefined) !== (value.SPOTIFY_CLIENT_SECRET === undefined)) {
+    throw new Error(
+      "Invalid environment configuration: SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be set together.",
+    );
+  }
+
   return Object.freeze({
     discordToken: value.DISCORD_TOKEN,
     discordClientId: value.DISCORD_CLIENT_ID,
@@ -286,6 +305,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ytdlpProxy: value.YTDLP_PROXY,
     potProviderUrl: value.POT_PROVIDER_URL,
     ytdlpCacheDir: value.YTDLP_CACHE_DIR,
+    spotifyClientId: value.SPOTIFY_CLIENT_ID,
+    spotifyClientSecret: value.SPOTIFY_CLIENT_SECRET,
+    musicLinkMaxTracks: value.MUSIC_LINK_MAX_TRACKS,
     audioStore: value.AUDIO_STORE,
     audioCacheDir: value.AUDIO_CACHE_DIR,
     audioCacheMaxBytes: value.AUDIO_CACHE_MAX_BYTES,

@@ -8,6 +8,7 @@ import type { ResolvedTrack } from "./ytdlp.js";
 export interface CachedResolution {
   videoId: string | null;
   title: string;
+  artist?: string | null;
   durationSec: number | null;
   thumbnailUrl: string | null;
   isPlaylist: boolean;
@@ -45,6 +46,7 @@ function sanitizeMetadata(track: ResolvedTrack): CachedResolution {
   const cached: CachedResolution = {
     videoId: track.videoId,
     title: track.title,
+    ...(track.artist ? { artist: track.artist } : {}),
     durationSec: track.durationSec,
     thumbnailUrl:
       track.thumbnailUrl && !isStreamUrl(track.thumbnailUrl) ? track.thumbnailUrl : null,
