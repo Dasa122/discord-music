@@ -104,7 +104,11 @@ describe("music link resolver", () => {
       return jsonResponse({}, 404);
     };
 
-    const resolver = createMusicLinkResolver({ fetch: fetchFn });
+    const resolver = createMusicLinkResolver({
+      fetch: fetchFn,
+      spotifyClientId: "id",
+      spotifyClientSecret: "secret",
+    });
     const resolved = await resolver.resolve("https://open.spotify.com/track/abc", 50);
     expect(resolved.tracks).toHaveLength(1);
     expect(resolved.tracks[0]).toEqual({

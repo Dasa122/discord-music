@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { OdesliClient } from "./odesli.js";
-import { createSpotifyProvider, MISSING_CREDENTIALS_MESSAGE } from "./spotify.js";
+import {
+  createSpotifyProvider,
+  MISSING_CREDENTIALS_MESSAGE,
+  SPOTIFY_UNREADABLE_MESSAGE,
+} from "./spotify.js";
 import { type FetchLike, MusicLinkError } from "./types.js";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -8,6 +12,10 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+function htmlResponse(body: string, status = 200): Response {
+  return new Response(body, { status, headers: { "content-type": "text/html" } });
 }
 
 function trackPayload(id: string, title: string, durationMs = 222_000) {
@@ -26,6 +34,35 @@ function trackPayload(id: string, title: string, durationMs = 222_000) {
 }
 
 const TOKEN = "https://accounts.spotify.com/api/token";
+const TRACK_URL = "https://open.spotify.com/track/t1";
+const OEMBED_URL = `https://open.spotify.com/oembed?url=${encodeURIComponent(TRACK_URL)}`;
+
+function ogPage(
+  options: {
+    title?: string;
+    description?: string;
+    type?: string;
+    image?: string;
+    duration?: string;
+    url?: string;
+  } = {},
+): string {
+  const tags: string[] = [];
+  if (options.title !== undefined)
+    tags.push(`<meta property="og:title" content="${options.title}"/>`);
+  if (options.description !== undefined) {
+    tags.push(`<meta property="og:description" content="${options.description}"/>`);
+  }
+  if (options.type !== undefined) tags.push(`<meta property="og:type" content="${options.type}"/>`);
+  if (options.image !== undefined) {
+    tags.push(`<meta property="og:image" content="${options.image}"/>`);
+  }
+  if (options.duration !== undefined) {
+    tags.push(`<meta name="music:duration" content="${options.duration}"/>`);
+  }
+  tags.push(`<meta property="og:url" content="${options.url ?? TRACK_URL}"/>`);
+  return `<html><head>${tags.join("")}</head><body><script>window.__NEXT_DATA__={}</script></body></html>`;
+}
 
 function makeProvider(options: {
   calls: string[];
@@ -47,7 +84,7 @@ function makeProvider(options: {
   });
 }
 
-describe("spotify provider", () => {
+describe("spotify provider with credentials", () => {
   test("caches the client-credentials token across lookups", async () => {
     const calls: string[] = [];
     const provider = makeProvider({
@@ -56,8 +93,8 @@ describe("spotify provider", () => {
         url.endsWith("/v1/tracks/t1") ? jsonResponse(trackPayload("t1", "Song")) : undefined,
     });
 
-    const first = await provider.resolve(new URL("https://open.spotify.com/track/t1"));
-    const second = await provider.resolve(new URL("https://open.spotify.com/track/t1"));
+    const first = await provider.resolve(new URL(TRACK_URL));
+    const second = await provider.resolve(new URL(TRACK_URL));
 
     expect(first.kind).toBe("track");
     expect(calls.filter((url) => url === TOKEN)).toHaveLength(1);
@@ -72,15 +109,29 @@ describe("spotify provider", () => {
         url.endsWith("/v1/tracks/t1") ? jsonResponse(trackPayload("t1", "Song")) : undefined,
     });
 
-    const resolved = await provider.resolve(new URL("https://open.spotify.com/track/t1"));
+    const resolved = await provider.resolve(new URL(TRACK_URL));
     expect(resolved.tracks[0]).toEqual({
       title: "Song",
       artists: ["Artist One", "Artist Two"],
       durationSec: 222,
       thumbnailUrl: "https://i.scdn.co/image/large",
-      sourceUrl: "https://open.spotify.com/track/t1",
+      sourceUrl: TRACK_URL,
       provider: "spotify",
     });
+  });
+
+  test("resolves through the Web API and never fetches the public page", async () => {
+    const calls: string[] = [];
+    const provider = makeProvider({
+      calls,
+      handles: (url) =>
+        url.endsWith("/v1/tracks/t1") ? jsonResponse(trackPayload("t1", "Song")) : undefined,
+    });
+
+    await provider.resolve(new URL(TRACK_URL));
+    expect(calls.some((url) => url.includes("api.spotify.com"))).toBe(true);
+    expect(calls.some((url) => url.startsWith("https://open.spotify.com/track/"))).toBe(false);
+    expect(calls.some((url) => url.startsWith("https://open.spotify.com/oembed"))).toBe(false);
   });
 
   test("maps an album with its name and album artwork fallback", async () => {
@@ -134,55 +185,6 @@ describe("spotify provider", () => {
     expect(resolved.tracks.map((track) => track.title)).toEqual(["One", "Two"]);
   });
 
-  test("without credentials a track falls back to Odesli", async () => {
-    const calls: string[] = [];
-    const provider = makeProvider({
-      credentials: false,
-      calls,
-      handles: (url) => {
-        if (url.startsWith("https://api.song.link/")) {
-          return jsonResponse({
-            entityUniqueId: "SPOTIFY_SONG::t1",
-            entitiesByUniqueId: {
-              "SPOTIFY_SONG::t1": {
-                title: "Odesli Song",
-                artistName: "Odesli Artist",
-                thumbnailUrl: "https://i.scdn.co/image/odesli",
-              },
-            },
-            linksByPlatform: {
-              youtube: { url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ" },
-            },
-          });
-        }
-        return undefined;
-      },
-    });
-
-    const resolved = await provider.resolve(new URL("https://open.spotify.com/track/t1"));
-    expect(resolved.tracks[0]).toEqual({
-      title: "Odesli Song",
-      artists: ["Odesli Artist"],
-      durationSec: null,
-      thumbnailUrl: "https://i.scdn.co/image/odesli",
-      sourceUrl: "https://open.spotify.com/track/t1",
-      provider: "spotify",
-      youtubeVideoId: "dQw4w9WgXcQ",
-    });
-    // No token request, no Web API request.
-    expect(calls.some((url) => url.includes("api.spotify.com"))).toBe(false);
-  });
-
-  test("without credentials a collection fails with an actionable message", async () => {
-    const provider = makeProvider({ credentials: false, calls: [], handles: () => undefined });
-    const error = await provider
-      .resolve(new URL("https://open.spotify.com/album/a1"))
-      .catch((caught: unknown) => caught);
-    expect(error).toBeInstanceOf(MusicLinkError);
-    expect((error as MusicLinkError).code).toBe("PROVIDER_AUTH_REQUIRED");
-    expect((error as MusicLinkError).message).toBe(MISSING_CREDENTIALS_MESSAGE);
-  });
-
   test("an Odesli YouTube link short-circuits the Web API", async () => {
     const calls: string[] = [];
     const provider = makeProvider({
@@ -203,8 +205,141 @@ describe("spotify provider", () => {
       },
     });
 
-    const resolved = await provider.resolve(new URL("https://open.spotify.com/track/t1"));
+    const resolved = await provider.resolve(new URL(TRACK_URL));
     expect(resolved.tracks[0]?.youtubeVideoId).toBe("fast1234567");
     expect(calls.some((url) => url.includes("/v1/tracks/"))).toBe(false);
+  });
+});
+
+describe("spotify provider without credentials", () => {
+  test("scrapes the track page instead of calling any API", async () => {
+    const calls: string[] = [];
+    const provider = makeProvider({
+      credentials: false,
+      calls,
+      handles: (url) =>
+        url === TRACK_URL
+          ? htmlResponse(
+              ogPage({
+                title: "Blinding Lights",
+                description: "The Weeknd · After Hours · Song · 2020",
+                type: "music.song",
+                image: "https://i.scdn.co/image/abc",
+                duration: "200",
+              }),
+            )
+          : undefined,
+    });
+
+    const resolved = await provider.resolve(new URL(TRACK_URL));
+    expect(resolved.tracks[0]).toEqual({
+      title: "Blinding Lights",
+      artists: ["The Weeknd"],
+      durationSec: 200,
+      thumbnailUrl: "https://i.scdn.co/image/abc",
+      sourceUrl: TRACK_URL,
+      provider: "spotify",
+    });
+    // No token, no Web API, no deprecated song.link call.
+    expect(calls).toEqual([TRACK_URL]);
+  });
+
+  test("never invents a YouTube video id for a scraped track", async () => {
+    const provider = makeProvider({
+      credentials: false,
+      calls: [],
+      handles: () => htmlResponse(ogPage({ title: "Song", type: "music.song" })),
+    });
+
+    const resolved = await provider.resolve(new URL(TRACK_URL));
+    expect(resolved.tracks[0]?.youtubeVideoId).toBeUndefined();
+  });
+
+  test("falls back to oEmbed when the page carries no title", async () => {
+    const calls: string[] = [];
+    const provider = makeProvider({
+      credentials: false,
+      calls,
+      handles: (url) => {
+        if (url === TRACK_URL) return htmlResponse("<html><head></head><body>shell</body></html>");
+        if (url === OEMBED_URL) {
+          return jsonResponse({
+            title: "Oembed Song",
+            thumbnail_url: "https://i.scdn.co/image/oembed",
+          });
+        }
+        return undefined;
+      },
+    });
+
+    const resolved = await provider.resolve(new URL(TRACK_URL));
+    expect(resolved.tracks[0]).toEqual({
+      title: "Oembed Song",
+      artists: [],
+      durationSec: null,
+      thumbnailUrl: "https://i.scdn.co/image/oembed",
+      sourceUrl: TRACK_URL,
+      provider: "spotify",
+    });
+    expect(calls).toEqual([TRACK_URL, OEMBED_URL]);
+  });
+
+  test("falls back to oEmbed when the page request is not a 200", async () => {
+    const provider = makeProvider({
+      credentials: false,
+      calls: [],
+      handles: (url) => {
+        if (url === OEMBED_URL) return jsonResponse({ title: "Oembed Song" });
+        return htmlResponse("denied", 403);
+      },
+    });
+
+    const resolved = await provider.resolve(new URL(TRACK_URL));
+    expect(resolved.tracks[0]?.title).toBe("Oembed Song");
+    expect(resolved.tracks[0]?.artists).toEqual([]);
+    expect(resolved.tracks[0]?.thumbnailUrl).toBeNull();
+  });
+
+  test("scrape and oEmbed both failing is PROVIDER_UNAVAILABLE", async () => {
+    const provider = makeProvider({ credentials: false, calls: [], handles: () => undefined });
+    const error = await provider.resolve(new URL(TRACK_URL)).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(MusicLinkError);
+    expect((error as MusicLinkError).code).toBe("PROVIDER_UNAVAILABLE");
+    expect((error as MusicLinkError).message).toBe(SPOTIFY_UNREADABLE_MESSAGE);
+  });
+
+  test("a track page that reports an album is a collection: credentials required", async () => {
+    const provider = makeProvider({
+      credentials: false,
+      calls: [],
+      handles: () =>
+        htmlResponse(
+          ogPage({
+            title: "The Album",
+            description: "Artist · The Album · Song · 2020",
+            type: "music.album",
+          }),
+        ),
+    });
+
+    const error = await provider.resolve(new URL(TRACK_URL)).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(MusicLinkError);
+    expect((error as MusicLinkError).code).toBe("PROVIDER_AUTH_REQUIRED");
+    expect((error as MusicLinkError).message).toBe(MISSING_CREDENTIALS_MESSAGE);
+    expect((error as MusicLinkError).message).toContain("Premium");
+    expect((error as MusicLinkError).message).toContain("track");
+  });
+
+  test("a collection without credentials fails before any network call", async () => {
+    const calls: string[] = [];
+    const provider = makeProvider({ credentials: false, calls, handles: () => undefined });
+
+    const error = await provider
+      .resolve(new URL("https://open.spotify.com/album/a1"))
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(MusicLinkError);
+    expect((error as MusicLinkError).code).toBe("PROVIDER_AUTH_REQUIRED");
+    expect((error as MusicLinkError).message).toBe(MISSING_CREDENTIALS_MESSAGE);
+    expect(calls).toEqual([]);
   });
 });

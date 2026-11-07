@@ -21,6 +21,8 @@ import {
   STREAM_PREBUFFER_BYTES,
   YtdlpMediaEngine,
 } from "./media-engine.js";
+import { OdesliClient } from "./providers/odesli.js";
+import { createSpotifyProvider } from "./providers/spotify.js";
 import { MusicLinkError, type ProviderTrack } from "./providers/types.js";
 import { ResolveCache } from "./resolve-cache.js";
 import type { TrackResolver } from "./resolver/types.js";
@@ -1319,6 +1321,69 @@ describe("media engine music links", () => {
     expect(resolved.entries?.[0]?.title).toBe("One");
     expect(resolved.entries?.[0]?.artist).toBe("A");
     expect(resolved.entries?.[0]?.durationSec).toBe(222);
+  });
+
+  test("a scraped track goes through the normal YouTube search path, never an invented id", async () => {
+    const trackUrl = "https://open.spotify.com/track/t1";
+    const calls: string[] = [];
+    const provider = createSpotifyProvider({
+      odesli: new OdesliClient({
+        fetch: async (input) => {
+          calls.push(input);
+          return new Response("{}", { status: 404 });
+        },
+      }),
+      fetch: async (input) => {
+        calls.push(input);
+        if (input !== trackUrl) return new Response("{}", { status: 404 });
+        return new Response(
+          `<html><head>` +
+            `<meta property="og:title" content="Blinding Lights"/>` +
+            `<meta property="og:description" content="The Weeknd · After Hours · Song · 2020"/>` +
+            `<meta property="og:type" content="music.song"/>` +
+            `<meta property="og:image" content="https://i.scdn.co/image/abc"/>` +
+            `<meta name="music:duration" content="200"/>` +
+            `</head><body></body></html>`,
+          { status: 200 },
+        );
+      },
+    });
+
+    const searches: string[] = [];
+    const engine = makeEngine({
+      musicLinks: {
+        parse: (query) =>
+          query === trackUrl
+            ? { provider: "spotify", kind: "track", id: "t1", url: new URL(trackUrl) }
+            : null,
+        resolve: (query) => provider.resolve(new URL(query)),
+      },
+      deps: {
+        resolveSearch: async (query) => {
+          searches.push(query);
+          return [
+            {
+              videoId: "ytSearchHit1",
+              title: "YouTube title",
+              webpageUrl: "https://www.youtube.com/watch?v=ytSearchHit1",
+              durationSec: 200,
+              thumbnailUrl: "https://i.ytimg.com/yt.jpg",
+              isPlaylist: false,
+            },
+          ];
+        },
+      },
+    });
+
+    const resolved = await engine.resolve(trackUrl);
+    expect(searches).toEqual(["Blinding Lights The Weeknd"]);
+    expect(resolved.videoId).toBe("ytSearchHit1");
+    expect(resolved.title).toBe("Blinding Lights");
+    expect(resolved.artist).toBe("The Weeknd");
+    expect(resolved.durationSec).toBe(200);
+    expect(resolved.thumbnailUrl).toBe("https://i.scdn.co/image/abc");
+    // The scrape is the only network call: no token, no Web API, no oEmbed.
+    expect(calls).toEqual([trackUrl]);
   });
 
   test("the music link cap is enforced on the mapped collection", async () => {

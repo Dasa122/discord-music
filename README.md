@@ -157,7 +157,8 @@ reaches `Playing`, which is the measurement to compare before and after these ch
 - A multi-track collection without a start point now shows a picker (first 10 previewed, up to 25
   selectable) instead of queueing everything blindly; **Queue all** or a chosen track enqueues from
   that point.
-- Spotify/Apple Music **tracks** resolve through song.link with no credentials; Spotify
+- Single Spotify/Apple Music **tracks** resolve with no credentials (Spotify reads the public
+  page's OpenGraph tags, then falls back to oEmbed; Apple Music reads JSON-LD), but Spotify
   **albums/playlists** need `SPOTIFY_CLIENT_ID`/`SPOTIFY_CLIENT_SECRET`. `MUSIC_LINK_MAX_TRACKS`
   (default 50) caps how far one link expands.
 

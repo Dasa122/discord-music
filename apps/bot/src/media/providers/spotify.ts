@@ -1,5 +1,14 @@
+import { logger } from "../../logger.js";
 import { type DetectedMusicLink, detectMusicLink } from "./detect.js";
 import type { OdesliClient, OdesliLookup } from "./odesli.js";
+import {
+  capHtmlBytes,
+  parseSpotifyPage,
+  SPOTIFY_PAGE_MAX_BYTES,
+  SPOTIFY_SCRAPE_TIMEOUT_MS,
+  SPOTIFY_SCRAPE_USER_AGENT,
+  type SpotifyPageMeta,
+} from "./spotify-meta.js";
 import {
   type FetchLike,
   MUSIC_LINK_REQUEST_TIMEOUT_MS,
@@ -11,15 +20,19 @@ import {
 
 const ACCOUNTS_URL = "https://accounts.spotify.com/api/token";
 const API_BASE = "https://api.spotify.com";
+const OEMBED_URL = "https://open.spotify.com/oembed";
 /** One Spotify page; the album and playlist endpoints both cap at 50 in practice. */
 const PAGE_SIZE = 50;
 
 export const MISSING_CREDENTIALS_MESSAGE =
-  "Set SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET to expand Spotify albums and playlists.";
+  "Spotify albums and playlists need Web API credentials (a Premium Spotify account), which this bot is not configured with. Link a single track instead, or use the YouTube or Apple Music equivalent.";
 
-/** Songlink's public API is deprecated (HTTP 401), so tracks need credentials too. */
-export const MISSING_TRACK_CREDENTIALS_MESSAGE =
-  "Set SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET to resolve Spotify tracks (Songlink's public API is unavailable).";
+export const SPOTIFY_UNREADABLE_MESSAGE = "Could not read that Spotify link.";
+
+interface OembedTrack {
+  title: string;
+  thumbnailUrl: string | null;
+}
 
 export interface SpotifyProviderOptions {
   clientId?: string;
@@ -227,30 +240,124 @@ export function createSpotifyProvider(options: SpotifyProviderOptions): MusicLin
     }
   }
 
-  async function resolveTrack(target: DetectedMusicLink): Promise<ProviderTrack> {
-    const { track, error } = await lookupOdesli(target.url);
-    if (track?.youtubeVideoId) return mapOdesliTrack(track, target.url.toString());
+  /** Cap the body before `text()` so a hostile response cannot balloon memory. */
+  async function readCappedBody(response: Response): Promise<string> {
+    try {
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      const capped =
+        bytes.length > SPOTIFY_PAGE_MAX_BYTES ? bytes.subarray(0, SPOTIFY_PAGE_MAX_BYTES) : bytes;
+      return new TextDecoder().decode(capped);
+    } catch {
+      return capHtmlBytes(await response.text());
+    }
+  }
 
-    if (hasCredentials) {
-      const mapped = mapSpotifyTrack(
-        await apiGet(`/v1/tracks/${target.id}`),
-        target.url.toString(),
-      );
-      if (!mapped) {
-        throw new MusicLinkError("TRACK_NOT_FOUND", "Spotify returned no track metadata.");
+  function scrapeHeaders(accept: string): Record<string, string> {
+    // A desktop UA gets Spotify's generic web-player shell with no OG tags;
+    // link-preview crawlers get the prerendered tags (verified on real tracks).
+    return {
+      "user-agent": SPOTIFY_SCRAPE_USER_AGENT,
+      "accept-language": "en",
+      accept,
+    };
+  }
+
+  /** Step 2: OpenGraph tags from the track page. Never throws. */
+  async function scrapeTrackPage(url: URL): Promise<SpotifyPageMeta | null> {
+    const startedAt = Date.now();
+    let meta: SpotifyPageMeta | null = null;
+    try {
+      const response = await fetchFn(url.toString(), {
+        headers: scrapeHeaders("text/html,application/xhtml+xml"),
+        signal: AbortSignal.timeout(SPOTIFY_SCRAPE_TIMEOUT_MS),
+      });
+      if (response.ok) {
+        meta = parseSpotifyPage(await readCappedBody(response), url.toString());
       }
-      return mapped;
+    } catch {
+      // A timeout or network error is this step's failure, not the command's.
+    }
+    const ms = Date.now() - startedAt;
+    logger.debug("spotify_scrape", { ok: meta !== null, source: "meta", ms });
+    return meta;
+  }
+
+  /** Step 3: oEmbed gives a title and artwork, but never an artist. */
+  async function lookupOembed(url: URL): Promise<OembedTrack | null> {
+    const startedAt = Date.now();
+    let track: OembedTrack | null = null;
+    try {
+      const response = await fetchFn(`${OEMBED_URL}?url=${encodeURIComponent(url.toString())}`, {
+        headers: scrapeHeaders("application/json"),
+        signal: AbortSignal.timeout(SPOTIFY_SCRAPE_TIMEOUT_MS),
+      });
+      if (response.ok) {
+        const payload = asRecord(await response.json());
+        const title = stringValue(payload?.title)?.trim() ?? "";
+        if (title !== "") {
+          track = { title, thumbnailUrl: stringValue(payload?.thumbnail_url) };
+        }
+      }
+    } catch {
+      // Same rule as the scrape: this step failed, try the next one.
+    }
+    const ms = Date.now() - startedAt;
+    logger.debug("spotify_scrape", { ok: track !== null, source: "oembed", ms });
+    return track;
+  }
+
+  function mapScrapedTrack(meta: SpotifyPageMeta, fallbackUrl: string): ProviderTrack {
+    return {
+      title: meta.title,
+      artists: meta.artists,
+      durationSec: meta.durationSec,
+      thumbnailUrl: meta.thumbnailUrl,
+      sourceUrl: meta.sourceUrl || fallbackUrl,
+      provider: "spotify",
+    };
+  }
+
+  function collectionAuthError(): MusicLinkError {
+    return new MusicLinkError("PROVIDER_AUTH_REQUIRED", MISSING_CREDENTIALS_MESSAGE, "spotify");
+  }
+
+  /**
+   * No credentials: the page's OpenGraph tags, then oEmbed, then a typed
+   * failure. A page that reports a collection cannot be expanded without the
+   * Web API, so it fails honestly instead of resolving the wrong track.
+   */
+  async function resolveTrackWithoutCredentials(target: DetectedMusicLink): Promise<ProviderTrack> {
+    const meta = await scrapeTrackPage(target.url);
+    if (meta?.kind === "collection") throw collectionAuthError();
+    if (meta && meta.title !== "") return mapScrapedTrack(meta, target.url.toString());
+
+    const oembed = await lookupOembed(target.url);
+    if (oembed) {
+      return {
+        title: oembed.title,
+        // oEmbed has no artist: the engine searches with the title alone.
+        artists: [],
+        durationSec: null,
+        thumbnailUrl: oembed.thumbnailUrl,
+        sourceUrl: target.url.toString(),
+        provider: "spotify",
+      };
     }
 
-    if (track) return mapOdesliTrack(track, target.url.toString());
-    if (error?.code === "TRACK_NOT_FOUND" || error?.code === "PROVIDER_RATE_LIMITED") throw error;
-    // Songlink can no longer answer anonymously, so for a Spotify track the Web
-    // API is the only reliable path: say exactly which variables fix it.
-    throw new MusicLinkError(
-      "PROVIDER_AUTH_REQUIRED",
-      MISSING_TRACK_CREDENTIALS_MESSAGE,
-      "spotify",
-    );
+    throw new MusicLinkError("PROVIDER_UNAVAILABLE", SPOTIFY_UNREADABLE_MESSAGE, "spotify");
+  }
+
+  async function resolveTrack(target: DetectedMusicLink): Promise<ProviderTrack> {
+    if (!hasCredentials) return await resolveTrackWithoutCredentials(target);
+
+    const { track } = await lookupOdesli(target.url);
+    if (track?.youtubeVideoId) return mapOdesliTrack(track, target.url.toString());
+
+    const mapped = mapSpotifyTrack(await apiGet(`/v1/tracks/${target.id}`), target.url.toString());
+    if (!mapped) {
+      throw new MusicLinkError("TRACK_NOT_FOUND", "Spotify returned no track metadata.");
+    }
+    return mapped;
   }
 
   async function resolveAlbum(
