@@ -27,6 +27,7 @@ import {
   MIN_AUDIO_BITRATE_KBPS,
   resolveEffectiveBitrateKbps,
 } from "./audio-bitrate.js";
+import { FirstAudioTimer } from "./first-audio.js";
 import {
   endsSession,
   failureNotice,
@@ -161,12 +162,16 @@ export interface GuildPlayerOptions {
   createResource?: (stream: Readable) => AudioResource;
   /** Debounce for queue-head prefetches, in milliseconds. */
   prefetchDebounceMs?: number;
+  /** How many upcoming queue tracks to prefetch (1..3). Defaults to 2. */
+  prefetchDepth?: number;
 }
 
 const DEFAULT_SETTINGS_VOLUME = 100;
 const DEFAULT_MAX_QUEUE_LENGTH = 100;
 const DEFAULT_IDLE_TIMEOUT_SECONDS = 60;
 const DEFAULT_PREFETCH_DEBOUNCE_MS = 250;
+const DEFAULT_PREFETCH_DEPTH = 2;
+const MAX_PREFETCH_DEPTH = 3;
 const FAILURE_WINDOW_MS = 60_000;
 const FAILURE_THRESHOLD = 3;
 const COOLDOWN_MS = 60_000;
@@ -188,6 +193,7 @@ export class GuildPlayer {
   private readonly audioBitrateKbps: number;
   private readonly createResource: (stream: Readable) => AudioResource;
   private readonly prefetchDebounceMs: number;
+  private readonly prefetchDepth: number;
 
   private settings: GuildSettings;
   private settingsLoadedAt: number | null = null;
@@ -221,10 +227,15 @@ export class GuildPlayer {
   private channelBitrateBps: number | undefined;
   /** Per-session log dedupe: one line each for applied/capped/clamped/unsupported. */
   private bitrateLogged = { applied: false, capped: false, clamped: false, unsupported: false };
-  /** Queue-head track whose background download is scheduled or running. */
-  private prefetchTargetId: string | null = null;
+  /** Tracks in the current prefetch window, in queue order. */
+  private prefetchTargets: string[] = [];
+  /** Tracks already handed to the engine and not cancelled since. */
+  private readonly prefetchRequested = new Set<string>();
+  private prefetchSignature = "";
   private prefetchSessionId: string | null = null;
   private prefetchTimer: NodeJS.Timeout | null = null;
+  /** Per-track marker for the first `Playing` transition; never outlives its track. */
+  private readonly firstAudio = new FirstAudioTimer();
 
   constructor(options: GuildPlayerOptions) {
     this.options = options;
@@ -237,6 +248,10 @@ export class GuildPlayer {
     this.prefetchDebounceMs = Math.max(
       0,
       options.prefetchDebounceMs ?? DEFAULT_PREFETCH_DEBOUNCE_MS,
+    );
+    this.prefetchDepth = Math.max(
+      1,
+      Math.min(MAX_PREFETCH_DEPTH, options.prefetchDepth ?? DEFAULT_PREFETCH_DEPTH),
     );
     this.createResource =
       options.createResource ??
@@ -255,7 +270,8 @@ export class GuildPlayer {
     this.audioPlayer.on("stateChange", (oldState, newState) => {
       logger.debug("audio_player_state", { from: oldState.status, to: newState.status });
       const previousResource = "resource" in oldState ? (oldState.resource ?? null) : null;
-      this.onPlayerStateChange(oldState.status, newState.status, previousResource);
+      const nextResource = "resource" in newState ? (newState.resource ?? null) : null;
+      this.onPlayerStateChange(oldState.status, newState.status, previousResource, nextResource);
     });
     this.audioPlayer.on("error", (error) => {
       if (!this.queue.current || this.destroyed) return;
@@ -585,6 +601,7 @@ export class GuildPlayer {
 
   private async skipInternal(count: number): Promise<number> {
     this.stopAudioPlayer();
+    this.firstAudio.clear();
     this.releaseSlot();
     this.destroyOpened();
     this.playing = false;
@@ -645,6 +662,7 @@ export class GuildPlayer {
     const target = Math.max(0, Math.floor(positionSec));
 
     this.stopAudioPlayer();
+    this.firstAudio.clear();
     this.releaseSlot();
     this.destroyOpened();
     this.playing = false;
@@ -789,10 +807,13 @@ export class GuildPlayer {
   private async startCurrent(startSec: number, record = true): Promise<void> {
     const track = this.queue.current;
     if (!track) {
+      this.firstAudio.clear();
       this.handleEmpty();
       return;
     }
 
+    // Time the whole start, from the first byte of work to the first audio.
+    this.firstAudio.start(track.id);
     const sessionId = this.sessionId ?? this.beginSession();
 
     // Playback starts immediately: a cached track opens from disk, anything
@@ -800,6 +821,7 @@ export class GuildPlayer {
     // only for explicit prefetch and never blocks a start.
     const slot = this.acquireSlot();
     if (slot === null) {
+      this.firstAudio.clear();
       throw new PlayerError(
         "PLAYBACK_BUSY",
         "The bot is already streaming the maximum number of tracks. Try again shortly.",
@@ -815,8 +837,11 @@ export class GuildPlayer {
       });
     } catch (error) {
       this.releaseSlot(slot);
+      this.firstAudio.clear();
       throw error;
     }
+
+    this.firstAudio.setSource(track.id, opened.source);
 
     // A cache hit carries the download's authoritative metadata; update the
     // queued track before the now-playing embed reads it.
@@ -826,6 +851,7 @@ export class GuildPlayer {
 
     if (this.destroyed || this.queue.current !== track) {
       opened.stop();
+      this.firstAudio.clear();
       // Release only our own generation: a newer stream may already hold the
       // slot, and a late release must not free it.
       this.releaseSlot(slot);
@@ -872,7 +898,22 @@ export class GuildPlayer {
     previous: AudioPlayerStatus,
     next: AudioPlayerStatus,
     previousResource: AudioResource | null,
+    nextResource: AudioResource | null = null,
   ): void {
+    if (next === AudioPlayerStatus.Playing) {
+      const measurement = this.firstAudio.markPlaying(
+        nextResource !== null && nextResource === this.resource,
+      );
+      if (measurement) {
+        logger.info("first_audio", {
+          guildId: this.guildId,
+          ms: measurement.ms,
+          source: measurement.source,
+          trackId: measurement.trackId,
+        });
+      }
+    }
+
     if (next === AudioPlayerStatus.Idle && previous !== AudioPlayerStatus.Idle) {
       if (this.handlingFailure) return;
       if (isSuppressedIdle(previousResource, this.expectedStopResource)) {
@@ -898,6 +939,7 @@ export class GuildPlayer {
   }
 
   private async advanceAfterEnd(): Promise<void> {
+    this.firstAudio.clear();
     this.releaseSlot();
     this.destroyOpened();
     this.playing = false;
@@ -936,6 +978,7 @@ export class GuildPlayer {
       for (;;) {
         this.releaseSlot();
         this.destroyOpened();
+        this.firstAudio.clear();
         this.playing = false;
         this.startedAt = null;
         this.basePositionSec = 0;
@@ -1042,6 +1085,7 @@ export class GuildPlayer {
   }
 
   private stopInternal(): void {
+    this.firstAudio.clear();
     this.releaseSlot();
     this.destroyOpened();
     this.releaseCache();
@@ -1119,7 +1163,9 @@ export class GuildPlayer {
     this.pinnedTrackId = null;
 
     this.clearPrefetchTimer();
-    this.prefetchTargetId = null;
+    this.prefetchTargets = [];
+    this.prefetchRequested.clear();
+    this.prefetchSignature = "";
     this.prefetchSessionId = null;
     this.options.media.cancelPrefetch?.(sessionId);
     if (previous) {
@@ -1193,46 +1239,62 @@ export class GuildPlayer {
   }
 
   /**
-   * Keep the background download on the queue head. Called after every queue
-   * mutation and every start/end: the debounce collapses a burst of commands
-   * into one job, and a head that is no longer next is aborted.
+   * Keep background downloads on the next `PREFETCH_DEPTH` tracks. Called
+   * after every queue mutation and every start/end: the debounce collapses a
+   * burst of commands into one pass, and any track that leaves the window has
+   * its in-flight job aborted. Playback never waits for these jobs.
    */
   private refreshPrefetch(): void {
     const sessionId = this.sessionId;
-    const head = this.queue.current ? (this.queue.queue[0] ?? null) : null;
-    const targetId = head?.id ?? null;
+    const upcoming = this.queue.current ? this.queue.queue.slice(0, this.prefetchDepth) : [];
+    const ids = upcoming.map((track) => track.id);
+    const signature = ids.join("\u0000");
 
-    if (targetId === this.prefetchTargetId && sessionId === this.prefetchSessionId) return;
+    if (signature === this.prefetchSignature && sessionId === this.prefetchSessionId) return;
 
-    const previousId = this.prefetchTargetId;
+    const previousIds = this.prefetchTargets;
     const previousSession = this.prefetchSessionId;
-    // A track that just became current keeps its in-flight job; anything else
-    // is orphaned and must be aborted.
-    const keepPrevious =
-      previousId !== null && (previousId === targetId || previousId === this.queue.current?.id);
-
-    this.clearPrefetchTimer();
-    if (previousId && previousSession && !keepPrevious) {
-      this.options.media.cancelPrefetch?.(previousSession, previousId);
+    const keep = new Set(ids);
+    // A track that just became current keeps the job `open()` started for it.
+    const currentId = this.queue.current?.id ?? null;
+    if (previousSession) {
+      for (const id of previousIds) {
+        if (keep.has(id) || id === currentId) continue;
+        this.prefetchRequested.delete(id);
+        this.options.media.cancelPrefetch?.(previousSession, id);
+      }
     }
 
-    this.prefetchTargetId = targetId;
+    this.prefetchTargets = ids;
+    this.prefetchSignature = signature;
     this.prefetchSessionId = sessionId ?? null;
-    if (!sessionId || !head) return;
+
+    this.clearPrefetchTimer();
+    if (!sessionId || upcoming.length === 0) return;
 
     const timer = setTimeout(() => {
       this.prefetchTimer = null;
       if (this.sessionId !== sessionId || this.destroyed) return;
-      if (this.queue.current === null || this.queue.queue[0]?.id !== head.id) return;
-      void this.options.media
-        .prefetch?.(head, sessionId, this.options.downloads)
-        .catch((error: unknown) =>
+      if (this.queue.current === null) return;
+
+      // Sequential calls preserve queue order; the engine's semaphore and
+      // dedupe map bound the actual concurrency and collapse repeats.
+      for (const track of upcoming) {
+        const position = this.queue.queue.indexOf(track);
+        if (position < 0 || position >= this.prefetchDepth) continue;
+        if (this.prefetchRequested.has(track.id)) continue;
+        this.prefetchRequested.add(track.id);
+        void Promise.resolve(
+          this.options.media.prefetch?.(track, sessionId, this.options.downloads),
+        ).catch((error: unknown) => {
+          this.prefetchRequested.delete(track.id);
           logger.warn("prefetch failed", {
             guildId: this.guildId,
-            trackId: head.id,
+            trackId: track.id,
             error: error instanceof Error ? error.message : String(error),
-          }),
-        );
+          });
+        });
+      }
     }, this.prefetchDebounceMs);
     timer.unref?.();
     this.prefetchTimer = timer;

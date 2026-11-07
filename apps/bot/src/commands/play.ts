@@ -3,6 +3,7 @@ import { logger } from "../logger.js";
 import { checkCommandRateLimit } from "../media/limits.js";
 import { toQueueTracks } from "../media/track.js";
 import { getMedia, getPlayer } from "../player/registry.js";
+import { startPlayInParallel } from "./play-start.js";
 import { commandErrorMessage, getMemberVoiceChannel, requestor, respondError } from "./shared.js";
 import type { Command } from "./types.js";
 
@@ -43,11 +44,16 @@ export const playCommand: Command = {
       const player = await getPlayer(interaction.guildId);
       await player.ensureSettings();
       player.setTextChannel(interaction.channelId);
-      await player.ensureConnection(voiceChannel);
 
       const startedAt = Date.now();
-      const resolved = await getMedia().resolve(query, player.beginSession());
-      const resolveMs = Date.now() - startedAt;
+      // Publish the session id before resolving so the cache-first path can
+      // still hit, then join and resolve together.
+      const sessionId = player.beginSession();
+      const { resolved, resolveMs } = await startPlayInParallel({
+        join: () => player.ensureConnection(voiceChannel),
+        resolve: () => getMedia().resolve(query, sessionId),
+        onJoinFailure: () => player.endSession(),
+      });
 
       const tracks = toQueueTracks(resolved, requestor(interaction));
       if (tracks.length === 0) {

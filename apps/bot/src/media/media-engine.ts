@@ -15,6 +15,7 @@ import {
   toPcmFromFile,
 } from "./ffmpeg.js";
 import { QueuedSemaphore } from "./limits.js";
+import { type CachedResolution, ResolveCache } from "./resolve-cache.js";
 import {
   downloadAudio,
   openAudioStream,
@@ -28,11 +29,18 @@ import {
 
 export type { ResolvedTrack, TrackInfo } from "./ytdlp.js";
 
-/** 250 ms of 48 kHz stereo s16le; a local file needs almost no head start. */
-export const CACHE_PREBUFFER_BYTES = 48_000;
-/** ~1 s; yt-dlp has to reach the network before it can play. */
-export const STREAM_PREBUFFER_BYTES = 192_000;
+/** 48 kHz stereo s16le: 48 × 2 channels × 2 bytes per sample. */
+export const PCM_BYTES_PER_MS = 48 * 2 * 2;
+/** 250 ms of decoded PCM; a local file needs almost no head start. */
+export const CACHE_PREBUFFER_MS = 250;
+export const CACHE_PREBUFFER_BYTES = CACHE_PREBUFFER_MS * PCM_BYTES_PER_MS;
+/** Default start buffer for the yt-dlp pipe; overridable with STREAM_PREBUFFER_MS. */
+export const DEFAULT_STREAM_PREBUFFER_MS = 250;
+export const STREAM_PREBUFFER_BYTES = DEFAULT_STREAM_PREBUFFER_MS * PCM_BYTES_PER_MS;
 export const DEFAULT_PREBUFFER_TIMEOUT_MS = 15_000;
+
+/** A stream prebuffer that produces nothing within this multiple falls back to piping. */
+export const STREAM_PREBUFFER_TIMEOUT_FACTOR = 4;
 
 export interface MediaTrack {
   id?: string;
@@ -104,12 +112,20 @@ export interface YtdlpMediaEngineOptions {
   prefetchMaxConcurrent?: number;
   maxCacheFileBytes?: number;
   cachePrebufferBytes?: number;
-  streamPrebufferBytes?: number;
+  /** Default start buffer for the stream path, in milliseconds. */
+  streamPrebufferMs?: number;
   prebufferTimeoutMs?: number;
+  /** Shared across engines; injectable so a test can use a controlled clock. */
+  resolveCache?: ResolveCache;
   deps?: Partial<MediaEngineDeps>;
 }
 
-function readFirstChunks(stream: Readable, minBytes: number, timeoutMs: number): Promise<Buffer[]> {
+function readFirstChunks(
+  stream: Readable,
+  minBytes: number,
+  timeoutMs: number,
+  options: { fallbackOnTimeout?: boolean } = {},
+): Promise<Buffer[] | null> {
   return new Promise((resolvePromise, rejectPromise) => {
     const chunks: Buffer[] = [];
     let bytes = 0;
@@ -154,8 +170,18 @@ function readFirstChunks(stream: Readable, minBytes: number, timeoutMs: number):
     };
 
     const timer = setTimeout(() => {
-      if (bytes > 0) finish();
-      else fail(new MediaError("EXTRACTOR_FAILED", "Timed out waiting for audio."));
+      if (bytes > 0) {
+        finish();
+      } else if (options.fallbackOnTimeout) {
+        // A slow extractor must not fail the track: hand the pipe straight to
+        // the player and let it buffer there instead.
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolvePromise(null);
+      } else {
+        fail(new MediaError("EXTRACTOR_FAILED", "Timed out waiting for audio."));
+      }
     }, timeoutMs);
     timer.unref?.();
 
@@ -163,6 +189,29 @@ function readFirstChunks(stream: Readable, minBytes: number, timeoutMs: number):
     stream.on("end", onEnd);
     stream.on("error", onError);
   });
+}
+
+/**
+ * Rebuild a playable `ResolvedTrack` from cached metadata. Only the canonical
+ * video id is cached, so the page URL is derived here instead of a signed
+ * stream URL ever being persisted.
+ */
+function materializeResolvedTrack(entry: CachedResolution, fallbackUrl: string): ResolvedTrack {
+  const webpageUrl = entry.videoId
+    ? `https://www.youtube.com/watch?v=${entry.videoId}`
+    : fallbackUrl.trim();
+  const track: ResolvedTrack = {
+    videoId: entry.videoId,
+    title: entry.title,
+    webpageUrl,
+    durationSec: entry.durationSec,
+    thumbnailUrl: entry.thumbnailUrl,
+    isPlaylist: entry.isPlaylist,
+  };
+  if (entry.entries) {
+    track.entries = entry.entries.map((child) => materializeResolvedTrack(child, webpageUrl));
+  }
+  return track;
 }
 
 export class YtdlpMediaEngine implements MediaEngine {
@@ -176,8 +225,9 @@ export class YtdlpMediaEngine implements MediaEngine {
   private readonly prefetchSemaphore: QueuedSemaphore;
   private readonly maxCacheFileBytes: number;
   private readonly cachePrebufferBytes: number;
-  private readonly streamPrebufferBytes: number;
+  private readonly streamPrebufferMs: number;
   private readonly prebufferTimeoutMs: number;
+  private readonly resolveCache: ResolveCache;
   private readonly deps: MediaEngineDeps;
 
   private readonly preparing = new Map<string, Promise<void>>();
@@ -201,8 +251,9 @@ export class YtdlpMediaEngine implements MediaEngine {
     );
     this.maxCacheFileBytes = options.maxCacheFileBytes ?? 67_108_864;
     this.cachePrebufferBytes = options.cachePrebufferBytes ?? CACHE_PREBUFFER_BYTES;
-    this.streamPrebufferBytes = options.streamPrebufferBytes ?? STREAM_PREBUFFER_BYTES;
+    this.streamPrebufferMs = options.streamPrebufferMs ?? DEFAULT_STREAM_PREBUFFER_MS;
     this.prebufferTimeoutMs = options.prebufferTimeoutMs ?? DEFAULT_PREBUFFER_TIMEOUT_MS;
+    this.resolveCache = options.resolveCache ?? new ResolveCache();
     this.deps = {
       downloadAudio,
       openAudioStream,
@@ -217,8 +268,23 @@ export class YtdlpMediaEngine implements MediaEngine {
 
   async resolve(query: string, sessionId?: string): Promise<ResolvedTrack> {
     const cached = sessionId ? this.cachedResolution(query, sessionId) : null;
-    if (cached) return cached;
-    return this.deps.resolve(query, this.ytdlpOptions);
+    if (cached) {
+      logger.debug("resolve_source", { source: "cache" });
+      return cached;
+    }
+
+    const memoized = this.resolveCache.get(query);
+    logger.debug("resolve_cache", this.resolveCache.stats());
+    if (memoized) {
+      logger.debug("resolve_source", { source: "resolve_cache" });
+      return materializeResolvedTrack(memoized, query);
+    }
+
+    logger.debug("resolve_source", { source: "extractor" });
+    const resolved = await this.deps.resolve(query, this.ytdlpOptions);
+    // Failures are never cached: a transient extractor error must not stick.
+    this.resolveCache.set(query, resolved);
+    return resolved;
   }
 
   resolveSearch(query: string, limit: number): Promise<ResolvedTrack[]> {
@@ -504,6 +570,7 @@ export class YtdlpMediaEngine implements MediaEngine {
   async open(track: MediaTrack, options: OpenTrackOptions = {}): Promise<OpenedStream> {
     const startSec = options.startSec ?? 0;
     const id = this.trackId(track);
+    const openStartedAt = Date.now();
 
     if (this.cache && options.sessionId && !track.isLive) {
       if (this.cache.has(options.sessionId, id)) {
@@ -526,7 +593,13 @@ export class YtdlpMediaEngine implements MediaEngine {
               trackId: id,
               cachedBytes: this.cache.cachedBytes(options.sessionId, id) ?? undefined,
             });
-            return await this.openFile(target, startSec, selected.filter);
+            const opened = await this.openFile(target, startSec, selected.filter, id);
+            logger.debug("open_ms", {
+              ms: Date.now() - openStartedAt,
+              source: "cache",
+              trackId: id,
+            });
+            return opened;
           }
         } catch (error) {
           logger.warn("cached audio unavailable; streaming instead", {
@@ -544,8 +617,9 @@ export class YtdlpMediaEngine implements MediaEngine {
       source: "stream",
     });
     logger.debug("play_filter", { source: "stream", filter: selected.kind });
-    const opened = await this.openStream(track, startSec, selected.filter);
+    const opened = await this.openStream(track, startSec, selected.filter, id);
     logger.info("play_source", { source: "stream", trackId: id });
+    logger.debug("open_ms", { ms: Date.now() - openStartedAt, source: "stream", trackId: id });
 
     if (this.cache && options.sessionId) {
       void this.ensureCached(track, options.sessionId, options.downloads).catch(
@@ -565,6 +639,7 @@ export class YtdlpMediaEngine implements MediaEngine {
     target: string,
     startSec: number,
     filter: string | null,
+    trackId: string,
   ): Promise<OpenedStream> {
     const decoded = this.deps.toPcmFromFile(target, {
       ffmpegPath: this.ffmpegPath,
@@ -572,13 +647,22 @@ export class YtdlpMediaEngine implements MediaEngine {
       filter,
       normalization: this.normalization,
     });
-    return this.finishOpened(decoded.stream, decoded.kill, this.cachePrebufferBytes, "cache");
+    return this.finishOpened({
+      pcm: decoded.stream,
+      stopDecoder: decoded.kill,
+      prebufferBytes: this.cachePrebufferBytes,
+      source: "cache",
+      timeoutMs: this.prebufferTimeoutMs,
+      fallbackOnTimeout: false,
+      trackId,
+    });
   }
 
   private async openStream(
     track: MediaTrack,
     startSec: number,
     filter: string | null,
+    trackId: string,
   ): Promise<OpenedStream> {
     const ytdlp = await this.deps.openAudioStream(track, {
       startSec,
@@ -598,23 +682,31 @@ export class YtdlpMediaEngine implements MediaEngine {
         }
       }
     };
-    return this.finishOpened(
+    return this.finishOpened({
       pcm,
-      () => {
+      stopDecoder: () => {
         stopYtdlp();
         pcm.destroy();
       },
-      this.streamPrebufferBytes,
-      "stream",
-    );
+      prebufferBytes: Math.round(this.streamPrebufferMs * PCM_BYTES_PER_MS),
+      source: "stream",
+      timeoutMs: this.streamPrebufferMs * STREAM_PREBUFFER_TIMEOUT_FACTOR,
+      fallbackOnTimeout: true,
+      trackId,
+    });
   }
 
-  private async finishOpened(
-    pcm: Readable,
-    stopDecoder: () => void,
-    prebufferBytes: number,
-    source: "cache" | "stream",
-  ): Promise<OpenedStream> {
+  private async finishOpened(input: {
+    pcm: Readable;
+    stopDecoder: () => void;
+    prebufferBytes: number;
+    source: "cache" | "stream";
+    timeoutMs: number;
+    fallbackOnTimeout: boolean;
+    trackId: string;
+  }): Promise<OpenedStream> {
+    const { pcm, stopDecoder, prebufferBytes, source, timeoutMs, fallbackOnTimeout, trackId } =
+      input;
     const output = new PassThrough();
     let stopped = false;
 
@@ -633,9 +725,21 @@ export class YtdlpMediaEngine implements MediaEngine {
       if (!stopped) stop();
     });
 
+    const prebufferStartedAt = Date.now();
     try {
-      const chunks = await readFirstChunks(pcm, prebufferBytes, this.prebufferTimeoutMs);
-      for (const chunk of chunks) output.write(chunk);
+      const chunks = await readFirstChunks(pcm, prebufferBytes, timeoutMs, {
+        fallbackOnTimeout,
+      });
+      logger.debug("prebuffer_ms", {
+        ms: Date.now() - prebufferStartedAt,
+        source,
+        trackId,
+        ...(chunks === null ? { fellBack: true } : {}),
+      });
+      // `null` means the stream produced nothing within its window; piping it
+      // straight through is the pre-P1 behaviour and still plays once bytes
+      // arrive.
+      for (const chunk of chunks ?? []) output.write(chunk);
       pcm.pipe(output);
     } catch (error) {
       stop();
