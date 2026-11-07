@@ -115,6 +115,7 @@ async function main(): Promise<void> {
       lra: config.audioLra,
       dynFrameMs: config.audioDynFrameMs,
     },
+    streamFilter: config.audioStreamFilter,
     cache: audioCache,
     twoPass: config.audioTwoPass,
     maxGainDb: config.audioMaxGainDb,

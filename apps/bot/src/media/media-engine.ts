@@ -8,8 +8,11 @@ import {
   computeGainDb,
   DEFAULT_LOUDNESS_SETTINGS,
   DEFAULT_MAX_GAIN_DB,
+  DEFAULT_STREAM_FILTER,
   type LoudnessMeasurement,
   type LoudnessSettings,
+  type PlaybackAudioConfig,
+  type StreamFilterMode,
   selectPlaybackFilter,
   toPcm,
   toPcmFromFile,
@@ -148,6 +151,11 @@ export interface YtdlpMediaEngineOptions {
   ffmpegPath: string;
   /** Applied to every decoded track on both the stream and cached-file paths. */
   normalization?: LoudnessSettings;
+  /**
+   * Filter for the streamed first play (default `limiter`). A cached track
+   * with a measurement always overrides this with its exact gain.
+   */
+  streamFilter?: StreamFilterMode;
   /** Measure cached tracks once so replays use an exact gain (default on). */
   twoPass?: boolean;
   /** Symmetric bound on the measured gain, in dB. */
@@ -294,6 +302,7 @@ export class YtdlpMediaEngine implements MediaEngine {
   private readonly ytdlpOptions: YtdlpOptions;
   private readonly ffmpegPath: string;
   private readonly normalization: LoudnessSettings | undefined;
+  private readonly streamFilter: StreamFilterMode;
   private readonly twoPass: boolean;
   private readonly maxGainDb: number;
   private readonly cache: AudioCache | null;
@@ -326,6 +335,7 @@ export class YtdlpMediaEngine implements MediaEngine {
     this.ytdlpOptions = options.ytdlp;
     this.ffmpegPath = options.ffmpegPath;
     this.normalization = options.normalization;
+    this.streamFilter = options.streamFilter ?? DEFAULT_STREAM_FILTER;
     this.twoPass = options.twoPass ?? true;
     this.maxGainDb = options.maxGainDb ?? DEFAULT_MAX_GAIN_DB;
     this.cache = options.cache ?? null;
@@ -808,6 +818,14 @@ export class YtdlpMediaEngine implements MediaEngine {
     await this.cache?.releaseSession(sessionId);
   }
 
+  /** Loudness settings plus the stream mode, as the filter builder expects. */
+  private playbackConfig(): PlaybackAudioConfig {
+    return {
+      ...(this.normalization ?? DEFAULT_LOUDNESS_SETTINGS),
+      streamFilter: this.streamFilter,
+    };
+  }
+
   async open(track: MediaTrack, options: OpenTrackOptions = {}): Promise<OpenedStream> {
     const startSec = options.startSec ?? 0;
     const id = this.trackId(track);
@@ -823,8 +841,9 @@ export class YtdlpMediaEngine implements MediaEngine {
           if (target) {
             const measurement = this.measurementByKey.get(this.cacheKey(options.sessionId, track));
             const selected = selectPlaybackFilter({
-              settings: this.normalization ?? DEFAULT_LOUDNESS_SETTINGS,
+              config: this.playbackConfig(),
               source: "cache",
+              hasMeasurement: measurement !== undefined,
               gainDb: measurement?.gainDb,
             });
             logger.debug("play_filter", {
@@ -857,8 +876,9 @@ export class YtdlpMediaEngine implements MediaEngine {
     // Stream first, cache in the background: playback never waits for a
     // download and the live resource is never swapped mid-track.
     const selected = selectPlaybackFilter({
-      settings: this.normalization ?? DEFAULT_LOUDNESS_SETTINGS,
+      config: this.playbackConfig(),
       source: "stream",
+      hasMeasurement: false,
     });
     logger.debug("play_filter", { source: "stream", filter: selected.kind });
     const opened = await this.openStream(track, startSec, selected.filter, id, pending);

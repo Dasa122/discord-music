@@ -71,11 +71,12 @@ describe("loadConfig normalises pasted values", () => {
 });
 
 describe("loadConfig loudness normalization", () => {
-  test("defaults to one-pass loudnorm at -16 LUFS", () => {
+  test("defaults to limiter-only streams and loudnorm cached fallback at -14 LUFS", () => {
     const config = loadConfig(baseEnv());
     expect(config.audioNormalize).toBe("loudnorm");
-    expect(config.audioTargetLufs).toBe(-16);
-    expect(config.audioTruePeakDb).toBe(-1.5);
+    expect(config.audioStreamFilter).toBe("limiter");
+    expect(config.audioTargetLufs).toBe(-14);
+    expect(config.audioTruePeakDb).toBe(-1);
     expect(config.audioLra).toBe(11);
     expect(config.audioDynFrameMs).toBe(150);
     expect(config.audioTwoPass).toBe(true);
@@ -131,9 +132,23 @@ describe("loadConfig loudness normalization", () => {
     }
   });
 
+  test("accepts every AUDIO_STREAM_FILTER mode and trims it", () => {
+    for (const mode of ["limiter", "off", "loudnorm", "dynaudnorm"] as const) {
+      expect(loadConfig(baseEnv({ AUDIO_STREAM_FILTER: ` ${mode}\n` })).audioStreamFilter).toBe(
+        mode,
+      );
+    }
+  });
+
   test("rejects an unknown AUDIO_NORMALIZE mode", () => {
     expect(() => loadConfig(baseEnv({ AUDIO_NORMALIZE: "peak" }))).toThrow(
       /AUDIO_NORMALIZE: Invalid option/,
+    );
+  });
+
+  test("rejects an unknown AUDIO_STREAM_FILTER mode", () => {
+    expect(() => loadConfig(baseEnv({ AUDIO_STREAM_FILTER: "compress" }))).toThrow(
+      /AUDIO_STREAM_FILTER: Invalid option/,
     );
   });
 });
