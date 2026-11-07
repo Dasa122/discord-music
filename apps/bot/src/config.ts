@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { parseAllowedGuildIds } from "./guild-allowlist.js";
+import { DEFAULT_LOUDNESS_SETTINGS } from "./media/ffmpeg.js";
 
 /**
  * Pasted values routinely carry a trailing newline or surrounding quotes; both
@@ -56,6 +57,30 @@ const envSchema = z.object({
   PREFETCH_MAX_CONCURRENT: z.coerce.number().int().min(1).max(4).default(2),
   /** Refuse individual downloads larger than this. */
   AUDIO_CACHE_MAX_FILE_BYTES: z.coerce.number().int().min(1).default(67_108_864),
+  /** Perceived-volume levelling applied to decoded PCM before Discord. */
+  AUDIO_NORMALIZE: z
+    .enum(["loudnorm", "dynaudnorm", "off"])
+    .default(DEFAULT_LOUDNESS_SETTINGS.mode),
+  AUDIO_TARGET_LUFS: z.coerce
+    .number()
+    .min(-30, "must be between -30 and -5")
+    .max(-5, "must be between -30 and -5")
+    .default(DEFAULT_LOUDNESS_SETTINGS.targetLufs),
+  AUDIO_TRUE_PEAK_DB: z.coerce
+    .number()
+    .min(-6, "must be between -6 and 0")
+    .max(0, "must be between -6 and 0")
+    .default(DEFAULT_LOUDNESS_SETTINGS.truePeakDb),
+  AUDIO_LRA: z.coerce
+    .number()
+    .min(1, "must be between 1 and 20")
+    .max(20, "must be between 1 and 20")
+    .default(DEFAULT_LOUDNESS_SETTINGS.lra),
+  AUDIO_DYN_FRAME_MS: z.coerce
+    .number()
+    .min(10, "must be between 10 and 500")
+    .max(500, "must be between 10 and 500")
+    .default(DEFAULT_LOUDNESS_SETTINGS.dynFrameMs),
   S3_ENDPOINT: z.url().optional(),
   S3_REGION: z.string().trim().min(1).default("garage"),
   S3_BUCKET: z.string().trim().min(1).optional(),
@@ -102,6 +127,11 @@ export interface AppConfig {
   prefetchEnabled: boolean;
   prefetchMaxConcurrent: number;
   audioCacheMaxFileBytes: number;
+  audioNormalize: "loudnorm" | "dynaudnorm" | "off";
+  audioTargetLufs: number;
+  audioTruePeakDb: number;
+  audioLra: number;
+  audioDynFrameMs: number;
   s3Endpoint: string | undefined;
   s3Region: string;
   s3Bucket: string | undefined;
@@ -180,6 +210,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     prefetchEnabled: value.PREFETCH_ENABLED,
     prefetchMaxConcurrent: value.PREFETCH_MAX_CONCURRENT,
     audioCacheMaxFileBytes: value.AUDIO_CACHE_MAX_FILE_BYTES,
+    audioNormalize: value.AUDIO_NORMALIZE,
+    audioTargetLufs: value.AUDIO_TARGET_LUFS,
+    audioTruePeakDb: value.AUDIO_TRUE_PEAK_DB,
+    audioLra: value.AUDIO_LRA,
+    audioDynFrameMs: value.AUDIO_DYN_FRAME_MS,
     s3Endpoint: value.S3_ENDPOINT,
     s3Region: value.S3_REGION,
     s3Bucket: value.S3_BUCKET,

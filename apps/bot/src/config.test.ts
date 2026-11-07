@@ -70,6 +70,64 @@ describe("loadConfig normalises pasted values", () => {
   });
 });
 
+describe("loadConfig loudness normalization", () => {
+  test("defaults to one-pass loudnorm at -16 LUFS", () => {
+    const config = loadConfig(baseEnv());
+    expect(config.audioNormalize).toBe("loudnorm");
+    expect(config.audioTargetLufs).toBe(-16);
+    expect(config.audioTruePeakDb).toBe(-1.5);
+    expect(config.audioLra).toBe(11);
+    expect(config.audioDynFrameMs).toBe(150);
+  });
+
+  test("trims and accepts every mode and its knobs", () => {
+    const dynamic = loadConfig(
+      baseEnv({
+        AUDIO_NORMALIZE: " dynaudnorm\n",
+        AUDIO_DYN_FRAME_MS: " 300 ",
+      }),
+    );
+    expect(dynamic.audioNormalize).toBe("dynaudnorm");
+    expect(dynamic.audioDynFrameMs).toBe(300);
+
+    const custom = loadConfig(
+      baseEnv({
+        AUDIO_NORMALIZE: "loudnorm",
+        AUDIO_TARGET_LUFS: "-23",
+        AUDIO_TRUE_PEAK_DB: "-2",
+        AUDIO_LRA: "7",
+      }),
+    );
+    expect(custom.audioTargetLufs).toBe(-23);
+    expect(custom.audioTruePeakDb).toBe(-2);
+    expect(custom.audioLra).toBe(7);
+
+    expect(loadConfig(baseEnv({ AUDIO_NORMALIZE: "off" })).audioNormalize).toBe("off");
+  });
+
+  test("rejects out-of-range values and names the variable", () => {
+    const cases: Array<[Record<string, string>, RegExp]> = [
+      [{ AUDIO_TARGET_LUFS: "-31" }, /AUDIO_TARGET_LUFS: must be between -30 and -5/],
+      [{ AUDIO_TARGET_LUFS: "-4" }, /AUDIO_TARGET_LUFS: must be between -30 and -5/],
+      [{ AUDIO_TRUE_PEAK_DB: "-7" }, /AUDIO_TRUE_PEAK_DB: must be between -6 and 0/],
+      [{ AUDIO_TRUE_PEAK_DB: "1" }, /AUDIO_TRUE_PEAK_DB: must be between -6 and 0/],
+      [{ AUDIO_LRA: "0" }, /AUDIO_LRA: must be between 1 and 20/],
+      [{ AUDIO_LRA: "21" }, /AUDIO_LRA: must be between 1 and 20/],
+      [{ AUDIO_DYN_FRAME_MS: "9" }, /AUDIO_DYN_FRAME_MS: must be between 10 and 500/],
+      [{ AUDIO_DYN_FRAME_MS: "501" }, /AUDIO_DYN_FRAME_MS: must be between 10 and 500/],
+    ];
+    for (const [overrides, expected] of cases) {
+      expect(() => loadConfig(baseEnv(overrides))).toThrow(expected);
+    }
+  });
+
+  test("rejects an unknown AUDIO_NORMALIZE mode", () => {
+    expect(() => loadConfig(baseEnv({ AUDIO_NORMALIZE: "peak" }))).toThrow(
+      /AUDIO_NORMALIZE: Invalid option/,
+    );
+  });
+});
+
 describe("loadConfig audio storage", () => {
   test("defaults to a 60 s idle timeout and local storage", () => {
     const config = loadConfig(baseEnv());

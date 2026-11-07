@@ -108,6 +108,27 @@ the yt-dlp pipe. If a store read or download fails, playback degrades to that sa
 failing the track. Cache tuning lives in `AUDIO_CACHE_DIR`, `AUDIO_CACHE_MAX_BYTES`,
 `AUDIO_CACHE_MAX_FILE_BYTES`, `PREFETCH_ENABLED`, and `PREFETCH_MAX_CONCURRENT`.
 
+### Loudness normalization
+
+Every decoded track passes through a loudness filter before the 48 kHz stereo s16le PCM reaches
+Discord, so a quiet master and a loud one play at a similar perceived volume. The filter is applied
+on both playback paths: the yt-dlp stream (the first play of a track) and the cached file
+(local or presigned S3 URL).
+
+`AUDIO_NORMALIZE` selects the mode:
+
+- **`loudnorm`** (default) — one-pass EBU R128, targeting integrated loudness. Exact per-track
+  levelling with `AUDIO_TARGET_LUFS` (default `-16` LUFS, range `-30..-5`), `AUDIO_TRUE_PEAK_DB`
+  (default `-1.5` dBTP, range `-6..0`), and `AUDIO_LRA` (default `11`, range `1..20`).
+- **`dynaudnorm`** — a smoother, faster moving-average normaliser. It evens out a track that is
+  itself uneven, but is less exact at matching the target level across tracks. Its window is
+  `AUDIO_DYN_FRAME_MS` (default `150`, range `10..500`).
+- **`off`** — no filter at all; the decoder emits untouched PCM.
+
+`/volume` is applied after normalization on the AudioResource's inline volume, so it stays a live
+per-guild setting and is never baked into the ffmpeg filter. Normalization costs roughly a few
+percent of one CPU core per active stream, on top of decoding.
+
 ### Database
 
 ```bash

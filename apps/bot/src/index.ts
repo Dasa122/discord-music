@@ -71,6 +71,13 @@ async function main(): Promise<void> {
       cacheDir: config.ytdlpCacheDir,
     },
     ffmpegPath: config.ffmpegPath,
+    normalization: {
+      mode: config.audioNormalize,
+      targetLufs: config.audioTargetLufs,
+      truePeakDb: config.audioTruePeakDb,
+      lra: config.audioLra,
+      dynFrameMs: config.audioDynFrameMs,
+    },
     cache: audioCache,
     prefetchEnabled: config.prefetchEnabled,
     prefetchMaxConcurrent: config.prefetchMaxConcurrent,

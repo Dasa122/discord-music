@@ -1,14 +1,80 @@
 import { spawn } from "node:child_process";
 import type { Readable } from "node:stream";
 
+export type LoudnessMode = "loudnorm" | "dynaudnorm" | "off";
+
+export interface LoudnessSettings {
+  mode: LoudnessMode;
+  /** Integrated loudness target in LUFS (`loudnorm` only). */
+  targetLufs: number;
+  /** True-peak ceiling in dBTP (`loudnorm` only). */
+  truePeakDb: number;
+  /** Loudness range target (`loudnorm` only). */
+  lra: number;
+  /** Analysis window in milliseconds (`dynaudnorm` only). */
+  dynFrameMs: number;
+}
+
+/** Mirrors the config defaults so a caller that omits settings still normalises. */
+export const DEFAULT_LOUDNESS_SETTINGS: LoudnessSettings = {
+  mode: "loudnorm",
+  targetLufs: -16,
+  truePeakDb: -1.5,
+  lra: 11,
+  dynFrameMs: 150,
+};
+
+/**
+ * The single source of truth for the loudness filter. Returns `null` for
+ * `off`, which means the caller must not emit an `-af` argument at all.
+ */
+export function buildAudioFilter(settings: LoudnessSettings): string | null {
+  switch (settings.mode) {
+    case "loudnorm":
+      return `loudnorm=I=${settings.targetLufs}:TP=${settings.truePeakDb}:LRA=${settings.lra}`;
+    case "dynaudnorm":
+      return `dynaudnorm=f=${settings.dynFrameMs}:g=15:p=0.7`;
+    case "off":
+      return null;
+  }
+}
+
 export interface FfmpegOptions {
   ffmpegPath?: string;
+  /** Defaults to loudnorm so every decoded track is normalised. */
+  normalization?: LoudnessSettings;
 }
 
 export interface FfmpegFileStream {
   stream: Readable;
   /** Kill the decoder; destroying the stream is enough for the pipe. */
   kill(): void;
+}
+
+function appendOutputTail(args: string[], options: FfmpegOptions): void {
+  const filter = buildAudioFilter(options.normalization ?? DEFAULT_LOUDNESS_SETTINGS);
+  if (filter) args.push("-af", filter);
+  args.push("-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1");
+}
+
+/** Args for decoding a file: `-ss` stays before `-i` for a fast input seek. */
+export function toPcmFromFileArgs(
+  filePath: string,
+  options: FfmpegOptions & { startSec?: number } = {},
+): string[] {
+  const startSec = Math.max(0, Math.floor(options.startSec ?? 0));
+  const args = ["-hide_banner", "-loglevel", "error"];
+  if (startSec > 0) args.push("-ss", String(startSec));
+  args.push("-i", filePath);
+  appendOutputTail(args, options);
+  return args;
+}
+
+/** Args for decoding a stdin pipe (`pipe:0`). */
+export function toPcmArgs(options: FfmpegOptions = {}): string[] {
+  const args = ["-hide_banner", "-loglevel", "error", "-i", "pipe:0"];
+  appendOutputTail(args, options);
+  return args;
 }
 
 /**
@@ -20,12 +86,10 @@ export function toPcmFromFile(
   options: FfmpegOptions & { startSec?: number } = {},
 ): FfmpegFileStream {
   const ffmpegPath = options.ffmpegPath ?? process.env.FFMPEG_PATH?.trim() ?? "ffmpeg";
-  const startSec = Math.max(0, Math.floor(options.startSec ?? 0));
-  const args = ["-hide_banner", "-loglevel", "error"];
-  if (startSec > 0) args.push("-ss", String(startSec));
-  args.push("-i", filePath, "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1");
 
-  const child = spawn(ffmpegPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(ffmpegPath, toPcmFromFileArgs(filePath, options), {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
   const output = child.stdout;
   let stderr = "";
 
@@ -74,24 +138,7 @@ export function toPcmFromFile(
 export function toPcm(input: Readable, options: FfmpegOptions = {}): Readable {
   const ffmpegPath = options.ffmpegPath ?? process.env.FFMPEG_PATH?.trim() ?? "ffmpeg";
 
-  const child = spawn(
-    ffmpegPath,
-    [
-      "-hide_banner",
-      "-loglevel",
-      "error",
-      "-i",
-      "pipe:0",
-      "-f",
-      "s16le",
-      "-ar",
-      "48000",
-      "-ac",
-      "2",
-      "pipe:1",
-    ],
-    { stdio: ["pipe", "pipe", "pipe"] },
-  );
+  const child = spawn(ffmpegPath, toPcmArgs(options), { stdio: ["pipe", "pipe", "pipe"] });
 
   const output = child.stdout;
   let stderr = "";

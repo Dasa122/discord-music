@@ -2,7 +2,7 @@ import { PassThrough, type Readable } from "node:stream";
 import { MediaError } from "../errors.js";
 import { logger } from "../logger.js";
 import type { AudioCache } from "./audio-cache.js";
-import { toPcm, toPcmFromFile } from "./ffmpeg.js";
+import { type LoudnessSettings, toPcm, toPcmFromFile } from "./ffmpeg.js";
 import { QueuedSemaphore } from "./limits.js";
 import {
   downloadAudio,
@@ -72,6 +72,8 @@ export interface MediaEngineDeps {
 export interface YtdlpMediaEngineOptions {
   ytdlp: YtdlpOptions;
   ffmpegPath: string;
+  /** Applied to every decoded track on both the stream and cached-file paths. */
+  normalization?: LoudnessSettings;
   cache?: AudioCache | null;
   prefetchEnabled?: boolean;
   prefetchMaxConcurrent?: number;
@@ -141,6 +143,7 @@ function readFirstChunks(stream: Readable, minBytes: number, timeoutMs: number):
 export class YtdlpMediaEngine implements MediaEngine {
   private readonly ytdlpOptions: YtdlpOptions;
   private readonly ffmpegPath: string;
+  private readonly normalization: LoudnessSettings | undefined;
   private readonly cache: AudioCache | null;
   private readonly prefetchEnabled: boolean;
   private readonly prefetchSemaphore: QueuedSemaphore;
@@ -159,6 +162,7 @@ export class YtdlpMediaEngine implements MediaEngine {
   constructor(options: YtdlpMediaEngineOptions) {
     this.ytdlpOptions = options.ytdlp;
     this.ffmpegPath = options.ffmpegPath;
+    this.normalization = options.normalization;
     this.cache = options.cache ?? null;
     this.prefetchEnabled = options.prefetchEnabled ?? true;
     this.prefetchSemaphore = new QueuedSemaphore(
@@ -431,6 +435,7 @@ export class YtdlpMediaEngine implements MediaEngine {
     const decoded = this.deps.toPcmFromFile(target, {
       ffmpegPath: this.ffmpegPath,
       startSec,
+      normalization: this.normalization,
     });
     return this.finishOpened(decoded.stream, decoded.kill, this.cachePrebufferBytes, "cache");
   }
@@ -440,7 +445,10 @@ export class YtdlpMediaEngine implements MediaEngine {
       startSec,
       options: this.ytdlpOptions,
     });
-    const pcm = this.deps.toPcm(ytdlp.stream, { ffmpegPath: this.ffmpegPath });
+    const pcm = this.deps.toPcm(ytdlp.stream, {
+      ffmpegPath: this.ffmpegPath,
+      normalization: this.normalization,
+    });
     const stopYtdlp = (): void => {
       if (ytdlp.process.exitCode === null) {
         try {
