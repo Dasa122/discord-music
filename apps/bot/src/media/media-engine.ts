@@ -67,7 +67,8 @@ export interface MediaEngine {
   /** Fire-and-forget cache fill for a track that is currently streaming. */
   ensureCached?(track: MediaTrack, sessionId?: string, downloads?: DownloadReporter): Promise<void>;
   prefetch?(track: MediaTrack, sessionId?: string, downloads?: DownloadReporter): Promise<void>;
-  cancelPrefetch?(sessionId?: string): void;
+  /** `trackId` narrows the cancellation to one track's pending job. */
+  cancelPrefetch?(sessionId?: string, trackId?: string): void;
   pin?(sessionId: string, trackId: string): Promise<void>;
   unpin?(sessionId: string, trackId: string): Promise<void>;
   releaseSession?(sessionId: string): Promise<void>;
@@ -404,7 +405,14 @@ export class YtdlpMediaEngine implements MediaEngine {
         logger.debug("background_cache_completed", { trackId: id });
       }
     } catch (error) {
-      downloads?.fail(id, error instanceof MediaError ? error.code : "DOWNLOAD_FAILED");
+      downloads?.fail(
+        id,
+        controller.signal.aborted
+          ? "ABORTED"
+          : error instanceof MediaError
+            ? error.code
+            : "DOWNLOAD_FAILED",
+      );
       const message = error instanceof Error ? error.message : String(error);
       if (kind === "background") {
         logger.debug("background_cache_failed", { trackId: id, error: message });
@@ -453,9 +461,10 @@ export class YtdlpMediaEngine implements MediaEngine {
     return { gainDb, inputLufs: measurement.inputLufs };
   }
 
-  cancelPrefetch(sessionId?: string): void {
+  cancelPrefetch(sessionId?: string, trackId?: string): void {
     for (const [key, controller] of this.prefetchAborts) {
       if (sessionId && !key.startsWith(`${sessionId}:`)) continue;
+      if (trackId && !key.endsWith(`:${trackId}`)) continue;
       controller.abort();
     }
   }

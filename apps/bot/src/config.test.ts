@@ -176,3 +176,24 @@ describe("loadConfig audio storage", () => {
     expect(config.audioStore).toBe("local");
   });
 });
+
+describe("loadConfig opus bitrate", () => {
+  test("defaults to 96 kbps", () => {
+    expect(loadConfig(baseEnv()).audioBitrateKbps).toBe(96);
+  });
+
+  test("accepts the 16..256 kbps range and trims pasted input", () => {
+    expect(loadConfig(baseEnv({ AUDIO_BITRATE_KBPS: " 64\n" })).audioBitrateKbps).toBe(64);
+    expect(loadConfig(baseEnv({ AUDIO_BITRATE_KBPS: "16" })).audioBitrateKbps).toBe(16);
+    expect(loadConfig(baseEnv({ AUDIO_BITRATE_KBPS: "256" })).audioBitrateKbps).toBe(256);
+  });
+
+  test("rejects values outside the range", () => {
+    expect(() => loadConfig(baseEnv({ AUDIO_BITRATE_KBPS: "15" }))).toThrow(
+      /AUDIO_BITRATE_KBPS: must be between 16 and 256/,
+    );
+    expect(() => loadConfig(baseEnv({ AUDIO_BITRATE_KBPS: "257" }))).toThrow(
+      /AUDIO_BITRATE_KBPS: must be between 16 and 256/,
+    );
+  });
+});
