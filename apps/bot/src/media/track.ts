@@ -1,17 +1,33 @@
 import type { QueueTrack, RequestedBy, TrackSource } from "@music/shared";
 import type { ResolvedTrack, TrackInfo } from "./ytdlp.js";
 
+/**
+ * `hostname` is `domain` itself or a subdomain of it. String suffixes are not
+ * enough: `youtube.com.attacker.tld` and `notyoutube.com` are different hosts.
+ * A trailing dot (the absolute-DNS spelling of the same name) is ignored, the
+ * same way `isAllowedMediaHost` in `url-guard.ts` treats it.
+ */
+export function hostMatches(hostname: string, domain: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  return host === domain || host.endsWith(`.${domain}`);
+}
+
 function sourceFor(track: ResolvedTrack): TrackSource {
-  const url = track.webpageUrl.toLowerCase();
+  let url: URL;
+  try {
+    url = new URL(track.webpageUrl);
+  } catch {
+    return "unknown";
+  }
+
   if (
     track.videoId !== null ||
-    url.includes("youtube.com") ||
-    url.includes("youtu.be") ||
-    url.includes("music.youtube.com")
+    hostMatches(url.hostname, "youtube.com") ||
+    hostMatches(url.hostname, "youtu.be")
   ) {
     return "youtube";
   }
-  if (/\.(mp3|m4a|aac|ogg|oga|opus|wav|flac|webm)(?:[?#]|$)/i.test(url)) {
+  if (/\.(mp3|m4a|aac|ogg|oga|opus|wav|flac|webm)$/i.test(url.pathname)) {
     return "direct";
   }
   return "unknown";

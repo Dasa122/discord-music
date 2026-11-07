@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { QueueTrack } from "@music/shared";
-import { enrichTrack, titleLooksUnresolved } from "./track.js";
+import { enrichTrack, hostMatches, titleLooksUnresolved, toQueueTrack } from "./track.js";
 
 function track(overrides: Partial<QueueTrack> = {}): QueueTrack {
   return {
@@ -14,6 +14,83 @@ function track(overrides: Partial<QueueTrack> = {}): QueueTrack {
     ...overrides,
   };
 }
+
+function sourceOf(webpageUrl: string, videoId: string | null = null) {
+  return toQueueTrack(
+    {
+      videoId,
+      title: "A title",
+      webpageUrl,
+      durationSec: 30,
+      thumbnailUrl: null,
+      isPlaylist: false,
+    },
+    { id: "1", name: "Ada" },
+  ).source;
+}
+
+describe("hostMatches", () => {
+  test("matches the domain itself and its subdomains only", () => {
+    expect(hostMatches("youtube.com", "youtube.com")).toBe(true);
+    expect(hostMatches("www.youtube.com", "youtube.com")).toBe(true);
+    expect(hostMatches("notyoutube.com", "youtube.com")).toBe(false);
+    expect(hostMatches("youtube.com.attacker.tld", "youtube.com")).toBe(false);
+    expect(hostMatches("", "youtube.com")).toBe(false);
+  });
+});
+
+describe("sourceFor", () => {
+  test("classifies youtube.com, its subdomains and youtu.be as youtube", () => {
+    for (const url of [
+      "https://youtube.com/watch?v=x",
+      "https://www.youtube.com/watch?v=x",
+      "https://music.youtube.com/watch?v=x",
+      "https://m.youtube.com/watch?v=x",
+      "https://youtu.be/x",
+    ]) {
+      expect(sourceOf(url)).toBe("youtube");
+    }
+  });
+
+  test("does not classify look-alike hosts as youtube", () => {
+    for (const url of [
+      "https://evil.com/youtube.com",
+      "https://evil.com/?u=https://youtube.com/watch?v=x",
+      "https://youtube.com.evil.tld",
+      "https://notyoutube.com/x",
+      "https://youtu.be.evil.tld/x",
+    ]) {
+      expect(sourceOf(url)).toBe("unknown");
+    }
+  });
+
+  test("classifies direct media by pathname extension", () => {
+    expect(sourceOf("https://cdn.example.com/a.mp3")).toBe("direct");
+    expect(sourceOf("https://cdn.example.com/a.FLAC?token=1")).toBe("direct");
+    expect(sourceOf("https://cdn.example.com/a.opus#t=10")).toBe("direct");
+  });
+
+  test("does not treat a media extension outside the pathname as direct", () => {
+    expect(sourceOf("https://evil.com/page?x=.mp3")).toBe("unknown");
+    expect(sourceOf("https://evil.com/a.mp3/extra")).toBe("unknown");
+  });
+
+  test("returns unknown for malformed URLs instead of throwing", () => {
+    for (const url of ["not a url", "", "//youtube.com"]) {
+      expect(sourceOf(url)).toBe("unknown");
+    }
+  });
+
+  test("treats a resolved video id as authoritative", () => {
+    expect(sourceOf("https://example.com/x", "vid")).toBe("youtube");
+  });
+
+  // The trailing dot is the absolute-DNS spelling of the same name, so it is
+  // normalised away rather than treated as a look-alike.
+  test("treats a trailing-dot host as the same host", () => {
+    expect(sourceOf("https://youtube.com./watch")).toBe("youtube");
+  });
+});
 
 describe("titleLooksUnresolved", () => {
   test("recognises paste-shaped titles", () => {
