@@ -236,6 +236,38 @@ describe("GuildPlayer opus bitrate", () => {
     expect(applied).toEqual([96_000, 96_000]);
   });
 
+  test("logs the encoder ceiling once when the request exceeds 128 kbps", async () => {
+    const applied: number[] = [];
+    const writes: string[] = [];
+    const spy = spyOn(process.stdout, "write").mockImplementation(((chunk: string | Uint8Array) => {
+      writes.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write);
+
+    try {
+      const player = makePlayer(new StreamSemaphore(4), playingMedia, undefined, {
+        audioBitrateKbps: 256,
+        createResource: () => fakeResource({ setBitrate: (bps: number) => applied.push(bps) }),
+      });
+
+      await player.enqueue([track("a"), track("b")]);
+      await waitFor(() => player.getState().current?.id === "a");
+      await player.skip();
+      await waitFor(() => player.getState().current?.id === "b");
+    } finally {
+      spy.mockRestore();
+    }
+
+    const capped = writes.filter((line) => line.includes("audio_bitrate_capped"));
+    expect(capped).toHaveLength(1);
+    expect(JSON.parse(capped[0] ?? "{}")).toMatchObject({
+      requestedKbps: 256,
+      effectiveKbps: 128,
+      reason: "encoder_ceiling",
+    });
+    expect(applied).toEqual([128_000, 128_000]);
+  });
+
   test("warns once per session when the encoder has no bitrate control", async () => {
     const writes: string[] = [];
     const spy = spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {

@@ -168,6 +168,15 @@ caps the applied gain in both directions, and the true peak still cannot exceed
 per-guild setting and is never baked into the ffmpeg filter. Normalization costs roughly a few
 percent of one CPU core per active stream, on top of decoding.
 
+### Opus bitrate
+
+`AUDIO_BITRATE_KBPS` sets the outgoing Opus bitrate: default `96`, range `16..128`. Two ceilings
+apply. The encoder cannot exceed **128 kbps** (`prism-media`'s `setBitrate` clamps there, so a
+larger request would silently do nothing), and Discord also caps the stream at the voice channel's
+own bitrate — a 64 kbps channel gets 64 kbps even when 96 is configured. The effective value is
+re-applied to every new encoder, so it survives the streamed first track, cached playback, seeks
+and track changes.
+
 ### Database
 
 ```bash

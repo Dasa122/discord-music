@@ -11,8 +11,11 @@
 export const DEFAULT_AUDIO_BITRATE_KBPS = 96;
 /** Discord refuses voice channels below 8 kbps. */
 export const MIN_AUDIO_BITRATE_KBPS = 8;
-/** Highest voice channel bitrate Discord offers. */
-export const MAX_AUDIO_BITRATE_KBPS = 256;
+/**
+ * Hard ceiling of the outgoing encoder: `prism-media`'s `Opus.setBitrate`
+ * clamps to 128 000 bps, so asking for more is a silent no-op.
+ */
+export const MAX_AUDIO_BITRATE_KBPS = 128;
 /** `OPUS_SET_BITRATE` encoder control request id. */
 export const OPUS_SET_BITRATE_REQUEST = 4002;
 
@@ -21,8 +24,12 @@ function clampKbps(value: number): number {
 }
 
 /**
- * The bitrate actually usable in a channel: the configured value, capped by
- * the channel's own bitrate and Discord's 8..256 kbps range.
+ * The bitrate actually usable in a channel.
+ *
+ * Order matters: clamp the request to the encoder's 8..128 kbps range first,
+ * then apply the channel's cap, then the floor again — a channel below 8 kbps
+ * cannot push the result under what Opus accepts, and no channel can raise it
+ * above the encoder ceiling.
  */
 export function resolveEffectiveBitrateKbps(
   requestedKbps: number,

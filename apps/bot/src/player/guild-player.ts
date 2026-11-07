@@ -23,6 +23,8 @@ import { enrichTrack } from "../media/track.js";
 import {
   applyEncoderBitrate,
   DEFAULT_AUDIO_BITRATE_KBPS,
+  MAX_AUDIO_BITRATE_KBPS,
+  MIN_AUDIO_BITRATE_KBPS,
   resolveEffectiveBitrateKbps,
 } from "./audio-bitrate.js";
 import {
@@ -217,8 +219,8 @@ export class GuildPlayer {
   private pending: Promise<unknown> = Promise.resolve();
   /** The voice channel's own bitrate, read when the connection is created. */
   private channelBitrateBps: number | undefined;
-  /** Per-session log dedupe: one line each for applied/clamped/unsupported. */
-  private bitrateLogged = { applied: false, clamped: false, unsupported: false };
+  /** Per-session log dedupe: one line each for applied/capped/clamped/unsupported. */
+  private bitrateLogged = { applied: false, capped: false, clamped: false, unsupported: false };
   /** Queue-head track whose background download is scheduled or running. */
   private prefetchTargetId: string | null = null;
   private prefetchSessionId: string | null = null;
@@ -412,7 +414,7 @@ export class GuildPlayer {
   beginSession(): string {
     if (!this.sessionId) {
       this.sessionId = randomUUID();
-      this.bitrateLogged = { applied: false, clamped: false, unsupported: false };
+      this.bitrateLogged = { applied: false, capped: false, clamped: false, unsupported: false };
       this.options.downloads.setSession(this.sessionId);
     }
     return this.sessionId;
@@ -1135,11 +1137,27 @@ export class GuildPlayer {
    * so this is the one place the setting has to land.
    */
   private applyAudioBitrate(resource: AudioResource): void {
-    const requested = Math.min(256, Math.max(8, Math.trunc(this.audioBitrateKbps)));
+    const rawRequested = Number.isFinite(this.audioBitrateKbps)
+      ? Math.trunc(this.audioBitrateKbps)
+      : DEFAULT_AUDIO_BITRATE_KBPS;
+    const requested = Math.min(
+      MAX_AUDIO_BITRATE_KBPS,
+      Math.max(MIN_AUDIO_BITRATE_KBPS, rawRequested),
+    );
     const effective = resolveEffectiveBitrateKbps(this.audioBitrateKbps, this.channelBitrateBps);
     const channelKbps = this.channelBitrateBps
       ? Math.floor(this.channelBitrateBps / 1000)
       : undefined;
+
+    if (!this.bitrateLogged.capped && rawRequested > MAX_AUDIO_BITRATE_KBPS) {
+      this.bitrateLogged.capped = true;
+      logger.info("audio_bitrate_capped", {
+        guildId: this.guildId,
+        requestedKbps: rawRequested,
+        effectiveKbps: effective,
+        reason: "encoder_ceiling",
+      });
+    }
 
     if (!this.bitrateLogged.clamped && channelKbps !== undefined && effective < requested) {
       this.bitrateLogged.clamped = true;

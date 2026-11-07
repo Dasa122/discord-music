@@ -95,12 +95,12 @@ const envSchema = z.object({
     .min(0, "must be between 0 and 24")
     .max(24, "must be between 0 and 24")
     .default(DEFAULT_MAX_GAIN_DB),
-  /** Outgoing Opus bitrate; capped by the voice channel's own bitrate. */
+  /** Outgoing Opus bitrate; the encoder caps it at 128 and the channel may cap it lower. */
   AUDIO_BITRATE_KBPS: z.coerce
     .number()
     .int()
-    .min(16, "must be between 16 and 256")
-    .max(256, "must be between 16 and 256")
+    .min(16, "must be between 16 and 128")
+    .max(128, "must be between 16 and 128")
     .default(DEFAULT_AUDIO_BITRATE_KBPS),
   S3_ENDPOINT: z.url().optional(),
   S3_REGION: z.string().trim().min(1).default("garage"),

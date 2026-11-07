@@ -26,9 +26,10 @@ describe("resolveEffectiveBitrateKbps", () => {
     expect(resolveEffectiveBitrateKbps(96, 6_000)).toBe(8);
   });
 
-  test("applies the 256 kbps ceiling", () => {
-    expect(resolveEffectiveBitrateKbps(512, 512_000)).toBe(256);
-    expect(resolveEffectiveBitrateKbps(256, 384_000)).toBe(256);
+  test("applies the encoder's 128 kbps ceiling", () => {
+    expect(resolveEffectiveBitrateKbps(512, 512_000)).toBe(128);
+    expect(resolveEffectiveBitrateKbps(256, 384_000)).toBe(128);
+    expect(resolveEffectiveBitrateKbps(128, 384_000)).toBe(128);
   });
 });
 
