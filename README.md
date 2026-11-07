@@ -73,6 +73,41 @@ so port 3001 stays on the loopback interface.
 buttons from any other guild are ignored (and logged once); leave it empty to serve every guild
 the bot is invited to.
 
+### Audio storage
+
+Audio is cached only for the lifetime of one voice session. A session starts when the bot joins
+a channel and ends when it leaves (`/stop`, `/disconnect`, an empty channel, an empty queue after
+the 60 second idle timeout, a destroyed voice connection, or process shutdown). Session end deletes
+the session's cached audio; a restart wipes everything, because sessions do not survive a restart.
+`/data` therefore only needs to survive a session, not a host rebuild.
+
+Two backends are available:
+
+- **`AUDIO_STORE=local`** (default) — files live under `AUDIO_CACHE_DIR` (`/data/audio`). In the
+  container `/data` must be a writable volume owned by uid 1000 (`node`). This is the dev default
+  and the automatic fallback when S3 is unreachable.
+- **`AUDIO_STORE=s3`** — Garage/MinIO-compatible object storage. The bot uploads downloads from a
+  local temp directory and streams them back through presigned GET URLs (6 hour expiry, so seek
+  uses HTTP range requests). It needs no `/data` volume.
+
+Garage setup:
+
+1. Create a bucket (for example `music`) and an access key with read/write permission on it.
+2. Point `S3_ENDPOINT` at the **S3 API** endpoint (`http://garage:3900`), not the admin API
+   (`http://garage:3903`). The region is arbitrary for Garage (`S3_REGION=garage`).
+3. Keep `S3_FORCE_PATH_STYLE=true` and set `S3_BUCKET`, `S3_ACCESS_KEY_ID`,
+   `S3_SECRET_ACCESS_KEY`, and optionally `S3_PREFIX` (default `audio`).
+
+At boot the bot wipes all objects under `S3_PREFIX` (or the whole local cache directory), logging
+`cache_cleared`. If `health()` fails at boot it logs `audio_store_unavailable` and falls back to
+local storage instead of crashing.
+
+The byte cap (`AUDIO_CACHE_MAX_BYTES`, 1.5 GiB by default) is only an LRU safety net for one very
+long session. Live streams and tracks without a known duration are never cached; they always use
+the yt-dlp pipe. If a store read or download fails, playback degrades to that same pipe rather than
+failing the track. Cache tuning lives in `AUDIO_CACHE_DIR`, `AUDIO_CACHE_MAX_BYTES`,
+`AUDIO_CACHE_MAX_FILE_BYTES`, `PREFETCH_ENABLED`, and `PREFETCH_MAX_CONCURRENT`.
+
 ### Database
 
 ```bash

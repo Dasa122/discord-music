@@ -1,7 +1,10 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { mkdir, readdir, stat, unlink } from "node:fs/promises";
+import { join } from "node:path";
 import type { Readable } from "node:stream";
 import { MediaError } from "../errors.js";
+import { toCacheId } from "./audio-cache.js";
 import { QueuedSemaphore } from "./limits.js";
 import { assertSafeMediaQuery } from "./url-guard.js";
 
@@ -460,4 +463,226 @@ export async function openAudioStream(
   });
 
   return { process: child, stream: child.stdout };
+}
+
+export interface DownloadTrack {
+  id?: string;
+  videoId?: string | null;
+  url: string;
+  title?: string;
+  durationSec?: number | null;
+  isLive?: boolean;
+}
+
+export interface DownloadAudioOptions {
+  signal?: AbortSignal;
+  maxBytes?: number;
+  options?: YtdlpOptions;
+  /** Injection point for tests; production always uses the real spawn. */
+  spawn?: typeof spawn;
+}
+
+export const DEFAULT_DOWNLOAD_MAX_BYTES = 64 * 1024 * 1024;
+export const DOWNLOAD_TIMEOUT_MS = 300_000;
+
+function downloadId(track: DownloadTrack): string {
+  return toCacheId(track.videoId ?? track.id ?? track.url);
+}
+
+/** Args for one audio download; exported so the argv contract stays testable. */
+export function buildDownloadArgs(
+  track: DownloadTrack,
+  destDir: string,
+  options: YtdlpOptions,
+  maxBytes: number,
+): string[] {
+  return [
+    ...buildCommonArgs(options),
+    "-f",
+    "bestaudio[acodec=opus]/bestaudio/best",
+    "--max-filesize",
+    String(maxBytes),
+    "--output",
+    join(destDir, `${downloadId(track)}.%(ext)s`),
+    "--",
+    track.url,
+  ];
+}
+
+async function removeLeftovers(destDir: string, id: string, keep?: string): Promise<void> {
+  let names: string[] = [];
+  try {
+    names = await readdir(destDir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.startsWith(`${id}.`)) continue;
+    const path = join(destDir, name);
+    if (path === keep) continue;
+    try {
+      await unlink(path);
+    } catch {
+      // Best effort cleanup.
+    }
+  }
+}
+
+/**
+ * Download one track's audio into `destDir` and return the produced file.
+ * The caller owns the file from that point (the cache atomically renames it).
+ */
+export async function downloadAudio(
+  track: DownloadTrack,
+  destDir: string,
+  options: DownloadAudioOptions = {},
+): Promise<string> {
+  if (track.isLive) {
+    throw new MediaError("DOWNLOAD_FAILED", "Live streams cannot be cached.");
+  }
+  if (track.durationSec === null || track.durationSec === undefined) {
+    throw new MediaError("DOWNLOAD_FAILED", "The track has no known duration.");
+  }
+
+  await assertSafeMediaQuery(track.url);
+
+  const signal = options.signal;
+  if (signal?.aborted) {
+    throw new MediaError("DOWNLOAD_ABORTED", "The download was cancelled.");
+  }
+
+  const ytdlpOptions = options.options ?? ytdlpOptionsFromEnv();
+  const maxBytes = options.maxBytes ?? DEFAULT_DOWNLOAD_MAX_BYTES;
+  const id = downloadId(track);
+  await mkdir(destDir, { recursive: true });
+
+  const args = buildDownloadArgs(track, destDir, ytdlpOptions, maxBytes);
+  const spawnFn = options.spawn ?? spawn;
+
+  return new Promise<string>((resolve, reject) => {
+    const child = spawnFn(ytdlpOptions.path, args, {
+      stdio: ["ignore", "ignore", "pipe"],
+      shell: false,
+    });
+    const stderrLines: string[] = [];
+    let stderrRemainder = "";
+    let settled = false;
+
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+
+    const finish = (path: string): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(path);
+    };
+
+    const fail = (error: MediaError): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+
+    const onAbort = (): void => {
+      if (settled) return;
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already gone.
+      }
+      fail(new MediaError("DOWNLOAD_ABORTED", "The download was cancelled."));
+    };
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already gone.
+      }
+      fail(new MediaError("DOWNLOAD_FAILED", "The download timed out."));
+    }, DOWNLOAD_TIMEOUT_MS);
+    timer.unref?.();
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      const parts = `${stderrRemainder}${chunk}`.split(/\r?\n/);
+      stderrRemainder = parts.pop() ?? "";
+      for (const part of parts) {
+        if (!part.trim()) continue;
+        stderrLines.push(part);
+        if (stderrLines.length > 20) stderrLines.shift();
+      }
+    });
+
+    child.on("error", (error) => {
+      fail(
+        new MediaError(
+          "SPAWN_FAILED",
+          `Could not start yt-dlp at "${ytdlpOptions.path}": ${error.message}`,
+        ),
+      );
+    });
+
+    child.on("close", (code) => {
+      if (settled) return;
+      if (stderrRemainder.trim()) stderrLines.push(stderrRemainder);
+      const stderr = stderrLines.join("\n");
+
+      if (code !== 0) {
+        if (/max-filesize|larger than/i.test(stderr)) {
+          fail(new MediaError("DOWNLOAD_TOO_LARGE", "The track is larger than the cache limit."));
+          return;
+        }
+        const reason = lastStderrLine(stderr);
+        fail(
+          new MediaError(
+            "DOWNLOAD_FAILED",
+            `Could not download the track${reason ? `: ${reason}` : "."}`,
+            stderr,
+          ),
+        );
+        return;
+      }
+
+      void (async () => {
+        let names: string[] = [];
+        try {
+          names = await readdir(destDir);
+        } catch {
+          names = [];
+        }
+        const matches = names
+          .filter((name) => name.startsWith(`${id}.`) && !name.endsWith(".part"))
+          .sort();
+        const produced = matches[0];
+        if (!produced) {
+          fail(new MediaError("DOWNLOAD_FAILED", "yt-dlp produced no audio file."));
+          return;
+        }
+
+        const path = join(destDir, produced);
+        let size = 0;
+        try {
+          size = (await stat(path)).size;
+        } catch {
+          size = 0;
+        }
+        if (size > maxBytes) {
+          await removeLeftovers(destDir, id);
+          fail(new MediaError("DOWNLOAD_TOO_LARGE", "The track is larger than the cache limit."));
+          return;
+        }
+
+        await removeLeftovers(destDir, id, path);
+        finish(path);
+      })();
+    });
+  });
 }

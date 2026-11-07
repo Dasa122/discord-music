@@ -1,10 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import type { ChildProcess, spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import {
   buildCommonArgs,
   buildResolveArgs,
+  downloadAudio,
   MAX_EXTRACTION_STDOUT_BYTES,
   MAX_PLAYLIST_ENTRIES,
   stdoutExceedsLimit,
@@ -110,5 +114,91 @@ describe("stdoutExceedsLimit", () => {
     const emojiAtCap = MAX_EXTRACTION_STDOUT_BYTES / emoji;
     expect(stdoutExceedsLimit(emojiAtCap * emoji)).toBe(false);
     expect(stdoutExceedsLimit(emojiAtCap * emoji + 1)).toBe(true);
+  });
+});
+
+describe("buildDownloadArgs", () => {
+  test("includes the cache-specific flags and never a shell", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "music-bot-download-"));
+    const cookies = join(directory, "cookies.txt");
+    writeFileSync(cookies, "# Netscape HTTP Cookie File\n");
+
+    let captured: { path: string; args: string[]; options: unknown } | null = null;
+    const spawnFn = ((path: string, args: string[], options: unknown) => {
+      captured = { path, args, options };
+      const child = new EventEmitter() as unknown as ChildProcess;
+      Object.assign(child, {
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        kill: () => true,
+        exitCode: null,
+      });
+      queueMicrotask(() => child.emit("error", new Error("spawn stopped for the test")));
+      return child;
+    }) as unknown as typeof spawn;
+
+    try {
+      await expect(
+        downloadAudio(
+          {
+            id: "video123",
+            url: "https://www.youtube.com/watch?v=video123",
+            durationSec: 30,
+          },
+          directory,
+          {
+            spawn: spawnFn,
+            maxBytes: 123_456,
+            options: baseOptions({
+              cookiesFile: cookies,
+              proxy: "http://proxy.example:8080",
+            }),
+          },
+        ),
+      ).rejects.toThrow(/Could not start yt-dlp/);
+
+      expect(captured?.path).toBe("/usr/local/bin/yt-dlp");
+      expect(captured?.options).toMatchObject({ shell: false });
+      const args = captured?.args ?? [];
+      expect(args).toContain("--max-filesize");
+      expect(args[args.indexOf("--max-filesize") + 1]).toBe("123456");
+      expect(args).toContain("--js-runtimes");
+      expect(args).toContain("deno:/usr/local/bin/deno");
+      expect(args).toContain("--cookies");
+      expect(args).toContain(cookies);
+      expect(args).toContain("--proxy");
+      expect(args).toContain("http://proxy.example:8080");
+      expect(args).toContain("bestaudio[acodec=opus]/bestaudio/best");
+      expect(args[args.indexOf("--output") + 1]).toBe(join(directory, "video123.%(ext)s"));
+      expect(args[args.length - 1]).toBe("https://www.youtube.com/watch?v=video123");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses live or unknown-duration tracks before spawning", async () => {
+    let spawned = 0;
+    const spawnFn = (() => {
+      spawned += 1;
+      throw new Error("should not spawn");
+    }) as unknown as typeof spawn;
+
+    await expect(
+      downloadAudio(
+        { id: "a", url: "https://www.youtube.com/watch?v=a", durationSec: null },
+        "/tmp/music-audio-test",
+        { spawn: spawnFn },
+      ),
+    ).rejects.toThrow(/no known duration/);
+
+    await expect(
+      downloadAudio(
+        { id: "b", url: "https://www.youtube.com/watch?v=b", durationSec: 10, isLive: true },
+        "/tmp/music-audio-test",
+        { spawn: spawnFn },
+      ),
+    ).rejects.toThrow(/Live streams/);
+
+    expect(spawned).toBe(0);
   });
 });

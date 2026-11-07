@@ -111,7 +111,7 @@ export function getClientGuildCount(): number {
 export async function destroyAllPlayers(): Promise<void> {
   for (const [guildId, player] of players) {
     try {
-      player.destroy();
+      await player.destroy();
       forgetGuild(guildId);
     } catch {
       // Best effort during shutdown.

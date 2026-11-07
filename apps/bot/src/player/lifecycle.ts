@@ -6,6 +6,24 @@ export const SETTINGS_TTL_MS = 30_000;
 /** How long a disconnected voice connection may try to resume before we tear it down. */
 export const VOICE_DISCONNECT_GRACE_MS = 15_000;
 
+/** A voice session with nothing to play ends after this long. */
+export const SESSION_IDLE_TIMEOUT_SECONDS = 60;
+
+/**
+ * A voice session is not a cache library: it starts on join and ends on every
+ * teardown path. A channel move keeps the same session.
+ */
+export type SessionEndReason = "stop" | "disconnect" | "destroyed" | "idle" | "shutdown" | "move";
+
+export function endsSession(reason: SessionEndReason): boolean {
+  return reason !== "move";
+}
+
+/** A human in the channel with music queued cancels the idle countdown. */
+export function shouldCancelIdle(emptyQueue: boolean, humanCount: number | null): boolean {
+  return !emptyQueue && humanCount !== null && humanCount > 0;
+}
+
 export type VoiceTransitionAction = "teardown" | "schedule-teardown" | "cancel-teardown" | "none";
 
 /** Pure mapping from a voice connection status to the lifecycle work it requires. */

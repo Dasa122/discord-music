@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   type AudioPlayer,
   AudioPlayerStatus,
@@ -17,6 +18,7 @@ import { isTransientPlaybackError, MediaError, PlayerError } from "../errors.js"
 import { logger, sanitizeProcessOutput } from "../logger.js";
 import type { MediaEngine, OpenedStream } from "../media/media-engine.js";
 import {
+  endsSession,
   failureNotice,
   isSettingsStale,
   isSuppressedIdle,
@@ -120,7 +122,7 @@ export interface GuildPlayerOptions {
 
 const DEFAULT_SETTINGS_VOLUME = 100;
 const DEFAULT_MAX_QUEUE_LENGTH = 100;
-const DEFAULT_IDLE_TIMEOUT_SECONDS = 300;
+const DEFAULT_IDLE_TIMEOUT_SECONDS = 60;
 const FAILURE_WINDOW_MS = 60_000;
 const FAILURE_THRESHOLD = 3;
 const COOLDOWN_MS = 60_000;
@@ -161,6 +163,9 @@ export class GuildPlayer {
   private destroyed = false;
   private volumeValue = DEFAULT_SETTINGS_VOLUME;
   private maxQueueLength = DEFAULT_MAX_QUEUE_LENGTH;
+  /** One voice session; the audio cache is scoped to it. */
+  private sessionId: string | null = null;
+  private pinnedTrackId: string | null = null;
   /** Serializes every mutating command so two guild actions never interleave. */
   private pending: Promise<unknown> = Promise.resolve();
 
@@ -299,7 +304,7 @@ export class GuildPlayer {
         this.clearDisconnectTimer();
         if (this.connection === connection) {
           this.connection = null;
-          this.teardownVoice();
+          if (endsSession("destroyed")) void this.endSession();
         }
         return;
       }
@@ -324,11 +329,23 @@ export class GuildPlayer {
       throw new PlayerError("VOICE_CONNECT_FAILED", "Could not connect to the voice channel.");
     }
 
+    this.beginSession();
     this.emitState();
     this.scheduleIdle();
   }
 
   // ----------------------------------------------------------------- playback
+
+  /** Start (or reuse) the voice session that scopes the audio cache. */
+  beginSession(): string {
+    if (!this.sessionId) this.sessionId = randomUUID();
+    return this.sessionId;
+  }
+
+  /** The single teardown path: it also deletes this session's cached audio. */
+  endSession(): Promise<void> {
+    return this.serialized(() => this.endSessionInternal());
+  }
 
   enqueue(tracks: QueueTrack[]): Promise<number> {
     return this.serialized(() => this.enqueueInternal(tracks));
@@ -365,6 +382,7 @@ export class GuildPlayer {
     const added = this.queue.enqueue(tracks, this.maxQueueLength);
     if (added === 0) return 0;
 
+    this.clearIdleTimer();
     this.emitState();
 
     if (!this.queue.current && !this.paused) {
@@ -434,6 +452,7 @@ export class GuildPlayer {
     this.releaseSlot();
     this.destroyOpened();
     this.playing = false;
+    this.releaseCache();
 
     const removed = this.queue.skip(count);
     this.startedAt = null;
@@ -466,11 +485,8 @@ export class GuildPlayer {
   }
 
   private async performStop(): Promise<void> {
-    this.stopAudioPlayer();
-    this.stopInternal();
-    this.queue.stop();
-    this.scheduleIdle();
-    this.emitState();
+    // /stop ends the session, which also deletes this session's cached audio.
+    await this.endSessionInternal();
   }
 
   clear(): Promise<number> {
@@ -559,35 +575,13 @@ export class GuildPlayer {
   }
 
   private async performDisconnect(): Promise<void> {
-    this.stopAudioPlayer();
-    this.stopInternal();
-    this.queue.stop();
-    this.clearIdleTimer();
-    this.clearDisconnectTimer();
-
-    const connection = this.connection;
-    this.connection = null;
-    connection?.destroy();
-
-    this.voiceChannelId = null;
-    this.textChannelId = null;
-    this.emitState();
+    // /disconnect shares the session teardown path with idle and connection loss.
+    await this.endSessionInternal();
   }
 
-  destroy(): void {
+  async destroy(): Promise<void> {
     this.destroyed = true;
-    this.stopAudioPlayer();
-    this.stopInternal();
-    this.queue.stop();
-    this.clearIdleTimer();
-    this.clearDisconnectTimer();
-
-    const connection = this.connection;
-    this.connection = null;
-    connection?.destroy();
-
-    this.voiceChannelId = null;
-    this.textChannelId = null;
+    await this.endSession();
   }
 
   // ------------------------------------------------------------------ state
@@ -658,6 +652,23 @@ export class GuildPlayer {
       return;
     }
 
+    const sessionId = this.sessionId ?? this.beginSession();
+
+    // Preparation is required for playback: a failed download simply means the
+    // track streams instead.
+    logger.debug("preparing track", { guildId: this.guildId, trackId: track.id });
+    if (this.options.media.prepare) {
+      try {
+        await this.options.media.prepare(track, sessionId);
+      } catch (error) {
+        logger.warn("prepare failed; streaming instead", {
+          guildId: this.guildId,
+          trackId: track.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
     const slot = this.acquireSlot();
     if (slot === null) {
       throw new PlayerError(
@@ -668,7 +679,7 @@ export class GuildPlayer {
 
     let opened: OpenedStream;
     try {
-      opened = await this.options.media.open(track, { startSec });
+      opened = await this.options.media.open(track, { startSec, sessionId });
     } catch (error) {
       this.releaseSlot(slot);
       throw error;
@@ -705,6 +716,9 @@ export class GuildPlayer {
     this.pausedAt = null;
     this.playing = true;
     this.emitState();
+    this.scheduleIdle();
+
+    this.activateCache(sessionId, track);
 
     if (record && this.options.recordPlay) {
       void this.options.recordPlay(track).catch((error: unknown) => {
@@ -890,6 +904,7 @@ export class GuildPlayer {
   private stopInternal(): void {
     this.releaseSlot();
     this.destroyOpened();
+    this.releaseCache();
     this.playing = false;
     this.paused = false;
     this.pausedAt = null;
@@ -897,13 +912,90 @@ export class GuildPlayer {
     this.basePositionSec = 0;
   }
 
-  /** Full teardown after the voice connection is gone for good. */
-  private teardownVoice(): void {
+  /**
+   * The single session teardown path: stop playback, clear the queue, release
+   * cached audio and leave the channel. `stopInternal` never does this — a
+   * channel move keeps the session.
+   */
+  private async endSessionInternal(): Promise<void> {
+    const sessionId = this.sessionId;
+
+    this.clearIdleTimer();
+    this.clearDisconnectTimer();
+    this.stopAudioPlayer();
     this.stopInternal();
     this.queue.stop();
+    this.sessionId = null;
+
+    const connection = this.connection;
+    this.connection = null;
+    connection?.destroy();
+
     this.voiceChannelId = null;
-    this.clearIdleTimer();
+    this.textChannelId = null;
+    this.nowPlayingMessageId = null;
+
+    if (sessionId && this.options.media.releaseSession) {
+      try {
+        await this.options.media.releaseSession(sessionId);
+      } catch (error) {
+        logger.warn("failed to release audio cache session", {
+          guildId: this.guildId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
     this.emitState();
+  }
+
+  /** Pin the new current track, unpin the previous one, prefetch the next. */
+  private activateCache(sessionId: string, track: QueueTrack): void {
+    const previous = this.pinnedTrackId;
+    this.pinnedTrackId = track.id;
+
+    void this.options.media
+      .pin?.(sessionId, track.id)
+      .catch((error: unknown) =>
+        logger.debug("failed to pin cached track", { error: String(error) }),
+      );
+
+    if (previous && previous !== track.id) {
+      void this.options.media
+        .unpin?.(sessionId, previous)
+        .catch((error: unknown) =>
+          logger.debug("failed to unpin cached track", { error: String(error) }),
+        );
+    }
+
+    const next = this.queue.queue[0];
+    if (next) {
+      // Fire-and-forget: a failed prefetch never delays the command response.
+      void this.options.media.prefetch?.(next, sessionId).catch((error: unknown) =>
+        logger.warn("prefetch failed", {
+          guildId: this.guildId,
+          trackId: next.id,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    }
+  }
+
+  /** Cancel background work and drop pins; cached files are deleted by endSession. */
+  private releaseCache(): void {
+    const sessionId = this.sessionId;
+    if (!sessionId) return;
+    const previous = this.pinnedTrackId;
+    this.pinnedTrackId = null;
+
+    this.options.media.cancelPrefetch?.(sessionId);
+    if (previous) {
+      void this.options.media
+        .unpin?.(sessionId, previous)
+        .catch((error: unknown) =>
+          logger.debug("failed to unpin cached track", { error: String(error) }),
+        );
+    }
   }
 
   private scheduleDisconnectTeardown(connection: VoiceConnection): void {
@@ -917,7 +1009,7 @@ export class GuildPlayer {
       }
       if (this.connection !== connection) return;
       this.connection = null;
-      this.teardownVoice();
+      void this.endSession();
     }, VOICE_DISCONNECT_GRACE_MS);
     timer.unref?.();
     this.disconnectTimer = timer;
@@ -976,7 +1068,7 @@ export class GuildPlayer {
     }
 
     if (shouldIdleDisconnect(emptyQueue, humanCount)) {
-      await this.disconnect();
+      if (endsSession("idle")) await this.endSession();
       return;
     }
 

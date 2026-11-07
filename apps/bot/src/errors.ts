@@ -4,7 +4,10 @@ export type MediaErrorCode =
   | "SPAWN_FAILED"
   | "INVALID_URL"
   | "EXTRACTION_BUSY"
-  | "OUTPUT_TOO_LARGE";
+  | "OUTPUT_TOO_LARGE"
+  | "DOWNLOAD_FAILED"
+  | "DOWNLOAD_TOO_LARGE"
+  | "DOWNLOAD_ABORTED";
 
 export class MediaError extends Error {
   readonly code: MediaErrorCode;

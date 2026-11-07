@@ -1,10 +1,13 @@
 import type { Server } from "node:http";
+import { join } from "node:path";
 import type { Client } from "discord.js";
 import { createDiscordClient } from "./client.js";
 import { config } from "./config.js";
 import { closeControlServer, createControlServer, startControlServer } from "./control/server.js";
 import { closeDb, pingDb } from "./db/client.js";
 import { logger, setLogLevel } from "./logger.js";
+import { AudioCache } from "./media/audio-cache.js";
+import { selectAudioStore } from "./media/audio-store.js";
 import { YtdlpMediaEngine } from "./media/media-engine.js";
 import { destroyAllPlayers } from "./player/registry.js";
 
@@ -18,16 +21,51 @@ async function main(): Promise<void> {
   await pingDb();
   logger.info("database connection verified");
 
-  const media = new YtdlpMediaEngine(
-    {
+  const selection = await selectAudioStore({
+    mode: config.audioStore,
+    localDir: config.audioCacheDir,
+    s3:
+      config.audioStore === "s3" &&
+      config.s3Endpoint &&
+      config.s3Bucket &&
+      config.s3AccessKeyId &&
+      config.s3SecretAccessKey
+        ? {
+            endpoint: config.s3Endpoint,
+            region: config.s3Region,
+            bucket: config.s3Bucket,
+            accessKeyId: config.s3AccessKeyId,
+            secretAccessKey: config.s3SecretAccessKey,
+            forcePathStyle: config.s3ForcePathStyle,
+          }
+        : undefined,
+  });
+
+  const audioCache = new AudioCache({
+    store: selection.store,
+    mode: selection.mode,
+    maxBytes: config.audioCacheMaxBytes,
+    prefix: selection.mode === "s3" ? config.s3Prefix : "",
+    cacheDir: config.audioCacheDir,
+    tempRoot: join(process.env.TMPDIR?.trim() || "/tmp", "music-audio"),
+  });
+  await audioCache.init();
+  logger.info("audio store ready", { store: selection.mode });
+
+  const media = new YtdlpMediaEngine({
+    ytdlp: {
       path: config.ytdlpPath,
       denoPath: config.denoPath,
       cookiesFile: config.ytdlpCookiesFile,
       proxy: config.ytdlpProxy,
       potProviderUrl: config.potProviderUrl,
     },
-    config.ffmpegPath,
-  );
+    ffmpegPath: config.ffmpegPath,
+    cache: audioCache,
+    prefetchEnabled: config.prefetchEnabled,
+    prefetchMaxConcurrent: config.prefetchMaxConcurrent,
+    maxCacheFileBytes: config.audioCacheMaxFileBytes,
+  });
 
   client = createDiscordClient(media);
   server = createControlServer(client);
