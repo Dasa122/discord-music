@@ -11,6 +11,11 @@ import { AudioCache } from "./media/audio-cache.js";
 import { selectAudioStore } from "./media/audio-store.js";
 import { YtdlpMediaEngine } from "./media/media-engine.js";
 import { destroyAllPlayers } from "./player/registry.js";
+import {
+  assertDaveAvailable,
+  detectVoiceCapabilities,
+  logVoiceCapabilities,
+} from "./voice-capabilities.js";
 
 setLogLevel(config.logLevel);
 
@@ -19,6 +24,19 @@ let server: Server | null = null;
 let shuttingDown = false;
 
 async function main(): Promise<void> {
+  // Discord requires DAVE/E2EE for voice. A bot without it still connects and
+  // reports "playing" while Discord drops every frame — refuse to start instead.
+  const capabilities = await detectVoiceCapabilities();
+  logVoiceCapabilities(capabilities);
+  try {
+    assertDaveAvailable(capabilities);
+  } catch (error) {
+    logger.error("voice_dave_missing", {
+      hint: error instanceof Error ? error.message : String(error),
+    });
+    process.exit(1);
+  }
+
   await pingDb();
   logger.info("database connection verified");
 

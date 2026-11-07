@@ -32,6 +32,31 @@ import {
 } from "./lifecycle.js";
 import { isRealAdvance, QueueController } from "./queue-ops.js";
 
+/** The subset of a voice state a log line needs. */
+export interface VoiceStateLike {
+  status: string;
+  reason?: unknown;
+}
+
+/**
+ * Log payload for a voice connection transition. `reason` only exists on a
+ * disconnected state, so it is carried over defensively.
+ */
+export function voiceStateLogFields(
+  oldState: VoiceStateLike,
+  newState: VoiceStateLike,
+): { from: string; to: string; reason?: number | string } {
+  const fields: { from: string; to: string; reason?: number | string } = {
+    from: oldState.status,
+    to: newState.status,
+  };
+  const reason = newState.reason;
+  if (reason !== undefined && reason !== null) {
+    fields.reason = typeof reason === "number" ? reason : String(reason);
+  }
+  return fields;
+}
+
 export class StreamSemaphore {
   private active = 0;
   private limit: number;
@@ -194,6 +219,7 @@ export class GuildPlayer {
       behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
     });
     this.audioPlayer.on("stateChange", (oldState, newState) => {
+      logger.debug("audio_player_state", { from: oldState.status, to: newState.status });
       const previousResource = "resource" in oldState ? (oldState.resource ?? null) : null;
       this.onPlayerStateChange(oldState.status, newState.status, previousResource);
     });
@@ -297,13 +323,20 @@ export class GuildPlayer {
     connection.subscribe(this.audioPlayer);
 
     connection.on("error", (error) => {
-      logger.error("voice connection error", {
+      logger.error("voice_connection_error", {
         guildId: this.guildId,
-        error: error.message,
+        error: { name: error.name, message: error.message },
       });
     });
 
-    connection.on("stateChange", (_oldState, newState) => {
+    connection.on("stateChange", (oldState, newState) => {
+      const fields: Record<string, unknown> = voiceStateLogFields(oldState, newState);
+      if (newState.status === VoiceConnectionStatus.Ready) {
+        const ping = connection.ping;
+        fields.ping = { ws: ping.ws ?? null, udp: ping.udp ?? null };
+      }
+      logger.info("voice_state", fields);
+
       const action = voiceTransitionAction(newState.status);
 
       if (action === "teardown") {
