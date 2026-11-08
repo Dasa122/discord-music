@@ -41,11 +41,13 @@ export class QueueController {
     return track;
   }
 
-  onTrackEnd(): TrackEndAction {
+  onTrackEnd(loop = true): TrackEndAction {
     if (!this.current) return { type: "empty" };
 
-    if (this.loop === "track") return { type: "replay" };
-    if (this.loop === "queue") this.queue.push(this.current);
+    // `loop = false` means the track did not finish: it must not be replayed
+    // from 0 or requeued, only skipped past.
+    if (loop && this.loop === "track") return { type: "replay" };
+    if (loop && this.loop === "queue") this.queue.push(this.current);
 
     const next = this.queue.shift() ?? null;
     this.current = next;

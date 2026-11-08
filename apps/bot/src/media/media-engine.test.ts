@@ -1540,3 +1540,60 @@ describe("media engine truncation resume", () => {
     expect(engine.cachedBytes(track, "s")).toBe(10);
   });
 });
+
+describe("media engine cached file readiness", () => {
+  test("is false before anything is cached and without a session", async () => {
+    const engine = makeEngine({ cache: makeCache(new MemoryStore()) });
+    expect(engine.cachedFileReady(track, "s")).toBe(false);
+    expect(engine.cachedFileReady(track, undefined)).toBe(false);
+  });
+
+  test("is false while the download registry reports an unfinished entry", async () => {
+    const store = new MemoryStore();
+    const cache = makeCache(store);
+    const engine = makeEngine({ cache });
+    const registry = new DownloadRegistry({ maxBytes: 1_000_000, store: "local" });
+
+    await engine.ensureCached(track, "s", registry);
+    // The bytes are on disk, but only the registry knows whether they are whole.
+    expect(engine.cachedBytes(track, "s")).toBe(10);
+    expect(engine.cachedFileReady(track, "s")).toBe(true);
+
+    for (const state of ["queued", "downloading", "failed"] as const) {
+      registry.begin("s", "vid", "Track");
+      if (state === "downloading") registry.progress("vid", { bytes: 5, totalBytes: 10 });
+      if (state === "failed") registry.fail("vid", "DOWNLOAD_FAILED");
+      expect(engine.cachedBytes(track, "s")).toBe(10);
+      expect(engine.cachedFileReady(track, "s")).toBe(false);
+    }
+
+    registry.ready("vid", { bytes: 10, gainDb: null });
+    expect(engine.cachedFileReady(track, "s")).toBe(true);
+  });
+
+  test("falls back to the announced size when no registry entry exists", async () => {
+    const makeProgressEngine = (totalBytes: number) => {
+      const cache = makeCache(new MemoryStore());
+      const engine = makeEngine({
+        cache,
+        deps: {
+          downloadAudio: async (_track, _dir, options) => {
+            options?.onProgress?.({ downloadedBytes: totalBytes, totalBytes });
+            return { path: "/tmp/produced", info: null };
+          },
+        },
+      });
+      return engine;
+    };
+
+    const whole = makeProgressEngine(10);
+    await whole.ensureCached(track, "s");
+    expect(whole.cachedBytes(track, "s")).toBe(10);
+    expect(whole.cachedFileReady(track, "s")).toBe(true);
+
+    const cutShort = makeProgressEngine(20);
+    await cutShort.ensureCached(track, "s");
+    expect(cutShort.cachedBytes(track, "s")).toBe(10);
+    expect(cutShort.cachedFileReady(track, "s")).toBe(false);
+  });
+});

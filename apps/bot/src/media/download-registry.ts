@@ -16,6 +16,8 @@ export interface DownloadReporter {
   ready(trackId: string, result: { bytes: number; gainDb: number | null }): void;
   fail(trackId: string, code: string): void;
   setGain(trackId: string, gainDb: number): void;
+  /** Current state for a track, when the reporter keeps one. */
+  entry?(trackId: string): DownloadEntry | null;
 }
 
 export interface DownloadRegistryOptions {
@@ -127,6 +129,14 @@ export class DownloadRegistry implements DownloadReporter {
     entry.state = "failed";
     entry.error = code;
     entry.finishedAt = new Date(this.now()).toISOString();
+  }
+
+  /** A copy of one track's entry, without the internal bookkeeping fields. */
+  entry(trackId: string): DownloadEntry | null {
+    const record = this.entries.get(trackId);
+    if (!record) return null;
+    const { seq: _seq, startedMs: _startedMs, lastUpdateMs: _lastUpdateMs, ...entry } = record;
+    return entry;
   }
 
   snapshot(): DownloadsResponse {
