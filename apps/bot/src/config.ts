@@ -119,6 +119,22 @@ const envSchema = z.object({
     .min(100, "must be between 100 and 2000")
     .max(2000, "must be between 100 and 2000")
     .default(250),
+  /**
+   * A stream that ends well before its known duration is treated as truncated
+   * and resumed. Off makes the player behave exactly as before.
+   */
+  STREAM_TRUNCATION_GUARD: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .default("true")
+    .transform((value) => !["false", "0", "no", "off"].includes(value)),
+  /** Fraction of the duration that counts as "finished" (0.5..1, default 0.9). */
+  STREAM_TRUNCATION_RATIO: z.coerce
+    .number()
+    .min(0.5, "must be between 0.5 and 1")
+    .max(1, "must be between 0.5 and 1")
+    .default(0.9),
   /** Refuse individual downloads larger than this. */
   AUDIO_CACHE_MAX_FILE_BYTES: z.coerce.number().int().min(1).default(67_108_864),
   /** Perceived-volume levelling applied to decoded PCM before Discord. */
@@ -230,6 +246,8 @@ export interface AppConfig {
   prefetchMaxConcurrent: number;
   prefetchDepth: number;
   streamPrebufferMs: number;
+  streamTruncationGuard: boolean;
+  streamTruncationRatio: number;
   audioCacheMaxFileBytes: number;
   audioNormalize: "loudnorm" | "dynaudnorm" | "off";
   audioStreamFilter: StreamFilterMode;
@@ -332,6 +350,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     prefetchMaxConcurrent: value.PREFETCH_MAX_CONCURRENT,
     prefetchDepth: value.PREFETCH_DEPTH,
     streamPrebufferMs: value.STREAM_PREBUFFER_MS,
+    streamTruncationGuard: value.STREAM_TRUNCATION_GUARD,
+    streamTruncationRatio: value.STREAM_TRUNCATION_RATIO,
     audioCacheMaxFileBytes: value.AUDIO_CACHE_MAX_FILE_BYTES,
     audioNormalize: value.AUDIO_NORMALIZE,
     audioStreamFilter: value.AUDIO_STREAM_FILTER,

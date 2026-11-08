@@ -41,11 +41,24 @@ import {
 } from "./lifecycle.js";
 import { pendingCollections } from "./pending-collection.js";
 import { isRealAdvance, QueueController } from "./queue-ops.js";
+import {
+  DEFAULT_TRUNCATION_RATIO,
+  isStreamTruncated,
+  planTruncationRecovery,
+} from "./stream-truncation.js";
 
 /** The subset of a voice state a log line needs. */
 export interface VoiceStateLike {
   status: string;
   reason?: unknown;
+}
+
+/** What the player needs to know about a track that just reported Idle. */
+interface EndedPlayback {
+  track: QueueTrack;
+  positionSec: number;
+  durationSec: number | null;
+  source: "cache" | "stream";
 }
 
 /**
@@ -165,6 +178,10 @@ export interface GuildPlayerOptions {
   prefetchDebounceMs?: number;
   /** How many upcoming queue tracks to prefetch (1..3). Defaults to 2. */
   prefetchDepth?: number;
+  /** Recover from a stream that ends before its duration (default on). */
+  truncationGuard?: boolean;
+  /** Fraction of the duration a track must reach to count as finished (0.5..1). */
+  truncationRatio?: number;
 }
 
 const DEFAULT_SETTINGS_VOLUME = 100;
@@ -195,6 +212,8 @@ export class GuildPlayer {
   private readonly createResource: (stream: Readable) => AudioResource;
   private readonly prefetchDebounceMs: number;
   private readonly prefetchDepth: number;
+  private readonly truncationGuard: boolean;
+  private readonly truncationRatio: number;
 
   private settings: GuildSettings;
   private settingsLoadedAt: number | null = null;
@@ -237,6 +256,9 @@ export class GuildPlayer {
   private prefetchTimer: NodeJS.Timeout | null = null;
   /** Per-track marker for the first `Playing` transition; never outlives its track. */
   private readonly firstAudio = new FirstAudioTimer();
+  /** Truncation recoveries attempted for the current track (max 2). */
+  private recoveries = 0;
+  private recoveryTrackId: string | null = null;
 
   constructor(options: GuildPlayerOptions) {
     this.options = options;
@@ -253,6 +275,11 @@ export class GuildPlayer {
     this.prefetchDepth = Math.max(
       1,
       Math.min(MAX_PREFETCH_DEPTH, options.prefetchDepth ?? DEFAULT_PREFETCH_DEPTH),
+    );
+    this.truncationGuard = options.truncationGuard ?? true;
+    this.truncationRatio = Math.max(
+      0.5,
+      Math.min(1, options.truncationRatio ?? DEFAULT_TRUNCATION_RATIO),
     );
     this.createResource =
       options.createResource ??
@@ -805,12 +832,23 @@ export class GuildPlayer {
     return Math.round(position * 10) / 10;
   }
 
-  private async startCurrent(startSec: number, record = true): Promise<void> {
+  private async startCurrent(
+    startSec: number,
+    record = true,
+    refreshStreamUrl = false,
+  ): Promise<void> {
     const track = this.queue.current;
     if (!track) {
       this.firstAudio.clear();
       this.handleEmpty();
       return;
+    }
+
+    // A different track starts its own recovery budget; a resume or seek of
+    // the same track keeps the count so the loop guard still applies.
+    if (this.recoveryTrackId !== track.id) {
+      this.recoveryTrackId = track.id;
+      this.recoveries = 0;
     }
 
     // Time the whole start, from the first byte of work to the first audio.
@@ -835,6 +873,7 @@ export class GuildPlayer {
         startSec,
         sessionId,
         downloads: this.options.downloads,
+        ...(refreshStreamUrl ? { refreshStreamUrl: true } : {}),
       });
     } catch (error) {
       this.releaseSlot(slot);
@@ -923,7 +962,10 @@ export class GuildPlayer {
         return;
       }
       if (!this.queue.current) return;
-      void this.serialized(() => this.advanceAfterEnd()).catch((error: unknown) => {
+      // Position must be read now: by the time the serialized work runs, the
+      // clock has moved on (or a command has replaced the track).
+      const ended = this.endedPlayback();
+      void this.serialized(() => this.afterPlaybackEnded(ended)).catch((error: unknown) => {
         void this.serialized(() => this.handlePlaybackFailure(error, true));
       });
       return;
@@ -939,13 +981,115 @@ export class GuildPlayer {
     }
   }
 
-  private async advanceAfterEnd(): Promise<void> {
+  /** The stream that just ended, captured synchronously on the Idle event. */
+  private endedPlayback(): EndedPlayback | null {
+    const track = this.queue.current;
+    if (!track) return null;
+    return {
+      track,
+      positionSec: this.positionSeconds(),
+      durationSec: track.durationSec ?? null,
+      source: this.opened?.source ?? "stream",
+    };
+  }
+
+  private async afterPlaybackEnded(ended: EndedPlayback | null): Promise<void> {
+    if (!ended) {
+      await this.advanceAfterEnd();
+      return;
+    }
+    // A skip or stop that landed between the event and this task owns the
+    // state now; recovering would restart a track the user already moved on
+    // from.
+    if (this.queue.current !== ended.track) return;
+
+    if (this.shouldRecoverTruncation(ended)) {
+      await this.recoverTruncation(ended);
+      return;
+    }
+
+    await this.advanceAfterEnd();
+  }
+
+  /**
+   * A truncated stream is not a media failure: the extractor worked, the
+   * transfer stopped. Only a track with a known duration that ended well
+   * before it qualifies, and loop=track keeps its own replay semantics.
+   */
+  private shouldRecoverTruncation(ended: EndedPlayback): boolean {
+    if (!this.truncationGuard) return false;
+    if (this.queue.loop === "track") return false;
+    return isStreamTruncated({
+      positionSec: ended.positionSec,
+      durationSec: ended.durationSec,
+      ratio: this.truncationRatio,
+    });
+  }
+
+  private async recoverTruncation(ended: EndedPlayback): Promise<void> {
+    const sessionId = this.sessionId ?? undefined;
+    const cachedBytes = this.options.media.cachedBytes?.(ended.track, sessionId) ?? null;
+    const hasCache = cachedBytes !== null && cachedBytes > 0;
+    const hasUrl = this.options.media.providesStreamUrls?.() === true;
+
+    logger.warn("stream_truncated", {
+      trackId: ended.track.id,
+      positionSec: ended.positionSec,
+      durationSec: ended.durationSec,
+      source: ended.source,
+      cachedBytes: cachedBytes ?? 0,
+    });
+
+    this.teardownEndedTrack();
+
+    for (;;) {
+      const plan = planTruncationRecovery({
+        positionSec: ended.positionSec,
+        durationSec: ended.durationSec,
+        hasCache,
+        hasUrl,
+        recoveries: this.recoveries,
+      });
+      if (plan.action === "advance") break;
+
+      this.recoveries += 1;
+      logger.info("stream_truncation_recovery", {
+        trackId: ended.track.id,
+        action: plan.action,
+        startSec: plan.startSec,
+        recoveries: this.recoveries,
+      });
+
+      try {
+        await this.startCurrent(plan.startSec, false, plan.action === "retry-url");
+        return;
+      } catch (error) {
+        logger.warn("stream_truncation_recovery_failed", {
+          trackId: ended.track.id,
+          action: plan.action,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        this.teardownEndedTrack();
+      }
+    }
+
+    await this.advanceAfterEnd();
+    // One notice per track, only when every resume attempt failed.
+    this.notifyError(`Playback of "${ended.track.title}" stopped early and could not be resumed.`);
+  }
+
+  /** Stop the stream that ended without advancing the queue. */
+  private teardownEndedTrack(): void {
     this.firstAudio.clear();
     this.releaseSlot();
     this.destroyOpened();
     this.playing = false;
     this.startedAt = null;
     this.basePositionSec = 0;
+  }
+
+  private async advanceAfterEnd(): Promise<void> {
+    this.teardownEndedTrack();
 
     const previous = this.queue.current;
     const action = this.queue.onTrackEnd();

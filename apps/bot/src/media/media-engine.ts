@@ -100,6 +100,11 @@ export interface OpenTrackOptions {
   sessionId?: string;
   /** Receives download state for the background cache job this open starts. */
   downloads?: DownloadReporter;
+  /**
+   * Mint a fresh stream URL instead of the one-shot pending one. Used by
+   * truncation recovery, where the original URL stopped mid-track.
+   */
+  refreshStreamUrl?: boolean;
 }
 
 export interface MediaEngine {
@@ -118,6 +123,10 @@ export interface MediaEngine {
   pin?(sessionId: string, trackId: string): Promise<void>;
   unpin?(sessionId: string, trackId: string): Promise<void>;
   releaseSession?(sessionId: string): Promise<void>;
+  /** Bytes of the complete cached file, or `null` when it is not cached. */
+  cachedBytes?(track: MediaTrack, sessionId?: string): number | null;
+  /** Whether `open(..., { refreshStreamUrl: true })` can mint a new URL. */
+  providesStreamUrls?(): boolean;
 }
 
 export interface MediaEngineDeps {
@@ -543,6 +552,39 @@ export class YtdlpMediaEngine implements MediaEngine {
   }
 
   /**
+   * Mint a fresh URL for a track whose transfer stopped mid-play. Failure is
+   * not fatal: `openStream` falls back to the yt-dlp pipe, which is the next
+   * step of the truncation recovery anyway.
+   */
+  private async refreshStream(track: MediaTrack): Promise<PendingStream | null> {
+    if (!this.providesStreamUrls()) return null;
+    try {
+      const resolved = await this.resolver.resolve(track.url);
+      if (!resolved.streamUrl) return null;
+      logger.debug("stream_url_refreshed", { trackId: this.trackId(track) });
+      return {
+        url: resolved.streamUrl,
+        ...(resolved.headers ? { headers: resolved.headers } : {}),
+      };
+    } catch (error) {
+      logger.warn("stream_url_refresh_failed", {
+        trackId: this.trackId(track),
+        reason: (error instanceof Error ? error.message : String(error)).slice(0, 240),
+      });
+      return null;
+    }
+  }
+
+  cachedBytes(track: MediaTrack, sessionId?: string): number | null {
+    if (!this.cache || !sessionId) return null;
+    return this.cache.cachedBytes(sessionId, this.trackId(track));
+  }
+
+  providesStreamUrls(): boolean {
+    return this.resolver.providesStreamUrls === true;
+  }
+
+  /**
    * A YouTube URL whose audio is already in this session's cache needs no
    * extractor run: the download that stored it printed authoritative metadata.
    */
@@ -881,7 +923,11 @@ export class YtdlpMediaEngine implements MediaEngine {
       hasMeasurement: false,
     });
     logger.debug("play_filter", { source: "stream", filter: selected.kind });
-    const opened = await this.openStream(track, startSec, selected.filter, id, pending);
+    // A truncation resume asks for a fresh URL; everything else uses the
+    // one-shot URL handed over by resolve().
+    const streamPending =
+      pending ?? (options.refreshStreamUrl ? await this.refreshStream(track) : null);
+    const opened = await this.openStream(track, startSec, selected.filter, id, streamPending);
     logger.info("play_source", { source: "stream", trackId: id });
     logger.debug("open_ms", { ms: Date.now() - openStartedAt, source: "stream", trackId: id });
 

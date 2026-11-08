@@ -13,6 +13,12 @@ export interface ResolveOptions {
 export interface TrackResolver {
   resolve(query: string, opts?: ResolveOptions): Promise<ResolvedTrack>;
   resolveSearch(query: string, limit: number): Promise<ResolvedTrack[]>;
+  /**
+   * True when `resolve()` may return a signed `streamUrl` that can be played
+   * without yt-dlp. The media engine uses this to decide whether re-resolving
+   * a truncated track can resume it at an offset.
+   */
+  readonly providesStreamUrls?: boolean;
 }
 
 /**

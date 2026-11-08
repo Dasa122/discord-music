@@ -64,6 +64,8 @@ export async function getPlayer(guildId: string): Promise<GuildPlayer> {
     idleTimeoutSeconds: config.idleTimeoutSeconds,
     audioBitrateKbps: config.audioBitrateKbps,
     prefetchDepth: config.prefetchDepth,
+    truncationGuard: config.streamTruncationGuard,
+    truncationRatio: config.streamTruncationRatio,
     loadSettings: () => getGuildSettings(guildId),
     recordPlay: (track) =>
       recordPlay({

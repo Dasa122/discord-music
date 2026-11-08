@@ -1436,3 +1436,107 @@ describe("media engine music links", () => {
     expect(providerCalls).toBe(1);
   });
 });
+
+describe("media engine truncation resume", () => {
+  test("refreshStreamUrl mints a new URL and resumes at the offset", async () => {
+    let resolveCalls = 0;
+    let capturedUrl = "";
+    let capturedStartSec: number | undefined;
+    let ytdlpStreams = 0;
+
+    const resolver: TrackResolver = {
+      providesStreamUrls: true,
+      async resolve() {
+        resolveCalls += 1;
+        return {
+          videoId: "vid",
+          title: "Track",
+          webpageUrl: track.url,
+          durationSec: 600,
+          thumbnailUrl: null,
+          isPlaylist: false,
+          streamUrl: GOOGLEVIDEO,
+          headers: { "User-Agent": "com.google.visionos" },
+        };
+      },
+      async resolveSearch() {
+        return [];
+      },
+    };
+
+    const engine = makeEngine({
+      resolver,
+      deps: {
+        toPcmFromUrl: (url, _headers, options) => {
+          capturedUrl = url;
+          capturedStartSec = options?.startSec;
+          return { stream: pcmStream(200_000), kill: () => undefined };
+        },
+        openAudioStream: async () => {
+          ytdlpStreams += 1;
+          return { process: fakeProcess(), stream: pcmStream(200_000) };
+        },
+      },
+    });
+
+    // No resolve() first: recovery opens the track directly with a fresh URL.
+    const opened = await engine.open(track, {
+      sessionId: "s",
+      startSec: 60,
+      refreshStreamUrl: true,
+    });
+    opened.stop();
+
+    expect(resolveCalls).toBe(1);
+    expect(capturedUrl).toBe(GOOGLEVIDEO);
+    expect(capturedStartSec).toBe(60);
+    expect(ytdlpStreams).toBe(0);
+    expect(engine.providesStreamUrls()).toBe(true);
+  });
+
+  test("a resolver without stream URLs resumes through the yt-dlp pipe", async () => {
+    let ytdlpStartSec: number | undefined;
+    let resolveCalls = 0;
+
+    const engine = makeEngine({
+      resolver: {
+        async resolve() {
+          resolveCalls += 1;
+          throw new Error("the yt-dlp resolver must not be asked for a URL");
+        },
+        async resolveSearch() {
+          return [];
+        },
+      },
+      deps: {
+        openAudioStream: async (_track, options) => {
+          ytdlpStartSec = options?.startSec;
+          return { process: fakeProcess(), stream: pcmStream(200_000) };
+        },
+      },
+    });
+
+    const opened = await engine.open(track, {
+      sessionId: "s",
+      startSec: 60,
+      refreshStreamUrl: true,
+    });
+    opened.stop();
+
+    expect(engine.providesStreamUrls()).toBe(false);
+    expect(resolveCalls).toBe(0);
+    expect(ytdlpStartSec).toBe(60);
+  });
+
+  test("cachedBytes reports a complete entry and null before one exists", async () => {
+    const store = new MemoryStore();
+    const cache = makeCache(store);
+    const engine = makeEngine({ cache });
+
+    expect(engine.cachedBytes(track, "s")).toBeNull();
+    expect(engine.cachedBytes(track, undefined)).toBeNull();
+
+    await cache.storeFile("s", "vid", "/tmp/produced");
+    expect(engine.cachedBytes(track, "s")).toBe(10);
+  });
+});
