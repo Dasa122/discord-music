@@ -45,6 +45,7 @@ function thumbnailUrl(
  * the bot) never waits on YouTube.
  */
 export class InnertubeResolver implements TrackResolver {
+  readonly providesStreamUrls = true;
   private readonly client: InnertubeClientType;
   private searchPromise: Promise<Innertube> | null = null;
   private playerPromise: Promise<Innertube> | null = null;

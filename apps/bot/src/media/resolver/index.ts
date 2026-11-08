@@ -42,6 +42,7 @@ export interface ResolverOverrides {
  * open every call goes straight there.
  */
 export class FallbackResolver implements TrackResolver {
+  readonly providesStreamUrls: boolean;
   private readonly primary: TrackResolver;
   private readonly fallback: TrackResolver;
   private readonly breaker: CircuitBreaker;
@@ -58,6 +59,9 @@ export class FallbackResolver implements TrackResolver {
   ) {
     this.primary = primary;
     this.fallback = fallback;
+    // The primary decides: when the breaker routes to yt-dlp, `resolve` simply
+    // returns no streamUrl and the engine falls through to the pipe.
+    this.providesStreamUrls = primary.providesStreamUrls === true;
     this.breaker = breaker;
     this.cooldownMs = options.cooldownMs;
     this.log = options.log;

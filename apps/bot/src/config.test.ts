@@ -249,6 +249,36 @@ describe("loadConfig fast-start tuning", () => {
   });
 });
 
+describe("loadConfig truncation guard", () => {
+  test("defaults to on with a 0.9 ratio", () => {
+    const config = loadConfig(baseEnv());
+    expect(config.streamTruncationGuard).toBe(true);
+    expect(config.streamTruncationRatio).toBe(0.9);
+  });
+
+  test("accepts the documented range and the falsey switches", () => {
+    expect(loadConfig(baseEnv({ STREAM_TRUNCATION_RATIO: "0.5" })).streamTruncationRatio).toBe(0.5);
+    expect(loadConfig(baseEnv({ STREAM_TRUNCATION_RATIO: " 1 " })).streamTruncationRatio).toBe(1);
+    for (const value of ["false", "0", "no", "off", " OFF "]) {
+      expect(loadConfig(baseEnv({ STREAM_TRUNCATION_GUARD: value })).streamTruncationGuard).toBe(
+        false,
+      );
+    }
+    expect(loadConfig(baseEnv({ STREAM_TRUNCATION_GUARD: "true" })).streamTruncationGuard).toBe(
+      true,
+    );
+  });
+
+  test("rejects out-of-range ratios and names the variable", () => {
+    expect(() => loadConfig(baseEnv({ STREAM_TRUNCATION_RATIO: "0.4" }))).toThrow(
+      /STREAM_TRUNCATION_RATIO: must be between 0.5 and 1/,
+    );
+    expect(() => loadConfig(baseEnv({ STREAM_TRUNCATION_RATIO: "1.1" }))).toThrow(
+      /STREAM_TRUNCATION_RATIO: must be between 0.5 and 1/,
+    );
+  });
+});
+
 describe("loadConfig resolver selection", () => {
   test("defaults to the yt-dlp resolver, so deploying changes nothing", () => {
     const config = loadConfig(baseEnv());
