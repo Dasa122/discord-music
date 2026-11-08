@@ -125,6 +125,11 @@ export interface MediaEngine {
   releaseSession?(sessionId: string): Promise<void>;
   /** Bytes of the complete cached file, or `null` when it is not cached. */
   cachedBytes?(track: MediaTrack, sessionId?: string): number | null;
+  /**
+   * Whether the session cache holds the **complete** file. A cache entry that
+   * is still downloading must never be resumed: it would hit EOF immediately.
+   */
+  cachedFileReady?(track: MediaTrack, sessionId?: string): boolean;
   /** Whether `open(..., { refreshStreamUrl: true })` can mint a new URL. */
   providesStreamUrls?(): boolean;
 }
@@ -339,6 +344,13 @@ export class YtdlpMediaEngine implements MediaEngine {
    * googlevideo URL is IP/UA-bound and expires.
    */
   private readonly pendingStreams = new Map<string, PendingStream>();
+  /**
+   * The download state the cache jobs report into, per session. Recovery reads
+   * the entry's state so an entry that is still downloading is never resumed.
+   */
+  private readonly reporters = new Map<string, DownloadReporter>();
+  /** Total bytes the last download for a key announced (local-store fallback). */
+  private readonly downloadTotals = new Map<string, number>();
 
   constructor(options: YtdlpMediaEngineOptions) {
     this.ytdlpOptions = options.ytdlp;
@@ -580,6 +592,25 @@ export class YtdlpMediaEngine implements MediaEngine {
     return this.cache.cachedBytes(sessionId, this.trackId(track));
   }
 
+  /**
+   * Is the cached file whole? The download registry knows: `ready` is written
+   * only after the file was stored. Without a registry entry (a local store
+   * populated outside a reported job) the size the download announced is the
+   * only evidence, so equal sizes count and anything else does not.
+   */
+  cachedFileReady(track: MediaTrack, sessionId?: string): boolean {
+    if (!this.cache || !sessionId) return false;
+    const id = this.trackId(track);
+    const bytes = this.cache.cachedBytes(sessionId, id);
+    if (bytes === null || bytes <= 0) return false;
+
+    const entry = this.reporters.get(sessionId)?.entry?.(id) ?? null;
+    if (entry) return entry.state === "ready";
+
+    const totalBytes = this.downloadTotals.get(this.cacheKey(sessionId, track)) ?? 0;
+    return totalBytes > 0 && bytes === totalBytes;
+  }
+
   providesStreamUrls(): boolean {
     return this.resolver.providesStreamUrls === true;
   }
@@ -633,6 +664,7 @@ export class YtdlpMediaEngine implements MediaEngine {
         const produced = await this.deps.downloadAudio(track, dir, {
           signal: controller.signal,
           maxBytes: this.maxCacheFileBytes,
+          onProgress: (progress) => this.recordTotalBytes(key, progress.totalBytes),
         });
         // Best-effort: a failed/garbled print only costs the metadata.
         if (produced.info) this.preparedInfoByKey.set(key, produced.info);
@@ -722,6 +754,7 @@ export class YtdlpMediaEngine implements MediaEngine {
     downloads?: DownloadReporter,
   ): Promise<void> {
     let release: (() => void) | null = null;
+    if (downloads) this.reporters.set(sessionId, downloads);
     downloads?.begin(sessionId, id, track.title ?? track.url);
     try {
       release = await this.prefetchSemaphore.acquire(
@@ -744,13 +777,13 @@ export class YtdlpMediaEngine implements MediaEngine {
       const produced = await this.deps.downloadAudio(track, dir, {
         signal: controller.signal,
         maxBytes: this.maxCacheFileBytes,
-        onProgress: downloads
-          ? (progress) =>
-              downloads.progress(id, {
-                bytes: progress.downloadedBytes,
-                totalBytes: progress.totalBytes,
-              })
-          : undefined,
+        onProgress: (progress) => {
+          this.recordTotalBytes(key, progress.totalBytes);
+          downloads?.progress(id, {
+            bytes: progress.downloadedBytes,
+            totalBytes: progress.totalBytes,
+          });
+        },
       });
       if (produced.info) this.preparedInfoByKey.set(key, produced.info);
       const measurement = await this.measureTrack(produced.path, id);
@@ -856,6 +889,10 @@ export class YtdlpMediaEngine implements MediaEngine {
     }
     for (const key of [...this.measurementByKey.keys()]) {
       if (key.startsWith(`${sessionId}:`)) this.measurementByKey.delete(key);
+    }
+    this.reporters.delete(sessionId);
+    for (const key of [...this.downloadTotals.keys()]) {
+      if (key.startsWith(`${sessionId}:`)) this.downloadTotals.delete(key);
     }
     await this.cache?.releaseSession(sessionId);
   }
@@ -1173,6 +1210,11 @@ export class YtdlpMediaEngine implements MediaEngine {
 
   private trackId(track: MediaTrack): string {
     return track.videoId ?? track.id ?? track.url;
+  }
+
+  /** Remember the size a download announced, for the local-store completeness check. */
+  private recordTotalBytes(key: string, totalBytes: number | null): void {
+    if (totalBytes !== null && totalBytes > 0) this.downloadTotals.set(key, totalBytes);
   }
 
   private cacheKey(sessionId: string, track: MediaTrack): string {

@@ -697,6 +697,9 @@ export class GuildPlayer {
     this.paused = false;
     this.pausedAt = null;
 
+    // A seek starts a new playback attempt, so the recovery budget restarts.
+    this.recoveries = 0;
+
     try {
       await this.startCurrent(target, false);
     } catch (error) {
@@ -1014,11 +1017,12 @@ export class GuildPlayer {
   /**
    * A truncated stream is not a media failure: the extractor worked, the
    * transfer stopped. Only a track with a known duration that ended well
-   * before it qualifies, and loop=track keeps its own replay semantics.
+   * before it qualifies. A truncated track is recovered in every loop mode:
+   * replaying it from 0 would truncate at the same place again, so only a
+   * track that genuinely reached its end keeps its loop semantics.
    */
   private shouldRecoverTruncation(ended: EndedPlayback): boolean {
     if (!this.truncationGuard) return false;
-    if (this.queue.loop === "track") return false;
     return isStreamTruncated({
       positionSec: ended.positionSec,
       durationSec: ended.durationSec,
@@ -1029,7 +1033,7 @@ export class GuildPlayer {
   private async recoverTruncation(ended: EndedPlayback): Promise<void> {
     const sessionId = this.sessionId ?? undefined;
     const cachedBytes = this.options.media.cachedBytes?.(ended.track, sessionId) ?? null;
-    const hasCache = cachedBytes !== null && cachedBytes > 0;
+    const hasCache = this.options.media.cachedFileReady?.(ended.track, sessionId) === true;
     const hasUrl = this.options.media.providesStreamUrls?.() === true;
 
     logger.warn("stream_truncated", {
@@ -1039,6 +1043,16 @@ export class GuildPlayer {
       source: ended.source,
       cachedBytes: cachedBytes ?? 0,
     });
+
+    // A partial file is not resumable: the next read hits its EOF and cuts the
+    // track again. Say so once, then let the plan pick the URL/yt-dlp path.
+    if (!hasCache && cachedBytes !== null && cachedBytes > 0) {
+      logger.debug("cache_incomplete", {
+        trackId: ended.track.id,
+        bytes: cachedBytes,
+        totalBytes: this.options.downloads.entry(ended.track.id)?.totalBytes ?? 0,
+      });
+    }
 
     this.teardownEndedTrack();
 
@@ -1073,7 +1087,7 @@ export class GuildPlayer {
       }
     }
 
-    await this.advanceAfterEnd();
+    await this.advanceAfterEnd(false);
     // One notice per track, only when every resume attempt failed.
     this.notifyError(`Playback of "${ended.track.title}" stopped early and could not be resumed.`);
   }
@@ -1088,11 +1102,11 @@ export class GuildPlayer {
     this.basePositionSec = 0;
   }
 
-  private async advanceAfterEnd(): Promise<void> {
+  private async advanceAfterEnd(replayOnLoop = true): Promise<void> {
     this.teardownEndedTrack();
 
     const previous = this.queue.current;
-    const action = this.queue.onTrackEnd();
+    const action = this.queue.onTrackEnd(replayOnLoop);
 
     if (action.type === "replay") {
       // loop=track: the same track replays, so this is not a new play.
